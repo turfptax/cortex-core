@@ -1,0 +1,7 @@
+# Cortex Core — Pi Zero 2 W dependencies
+# Install on Pi: pip install -r requirements.txt
+
+bleak>=0.21.0
+Pillow>=9.0.0
+pyaudio>=0.2.11
+vosk>=0.3.44

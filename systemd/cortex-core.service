@@ -1,0 +1,17 @@
+[Unit]
+Description=Cortex Core — Wearable AI Memory
+After=bluetooth.target sound.target
+Wants=bluetooth.target sound.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/turfptax/cortex-core/src
+ExecStart=/usr/bin/python3 /home/turfptax/cortex-core/src/main.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
