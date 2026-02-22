@@ -27,8 +27,10 @@ import subprocess
 from datetime import datetime
 
 # Add WhisPlay driver and app source to path
+# Derive user home from app location (service runs as root, so ~ = /root)
 _app_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.expanduser("~/Whisplay/Driver"))
+_user_home = os.path.dirname(os.path.dirname(_app_dir))  # cortex-core/src -> cortex-core -> home
+sys.path.insert(0, os.path.join(_user_home, "Whisplay", "Driver"))
 sys.path.insert(0, _app_dir)
 
 from WhisPlay import WhisPlayBoard

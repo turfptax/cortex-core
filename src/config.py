@@ -9,9 +9,11 @@ CHANNELS = 1
 SAMPLE_FORMAT = "S16_LE"
 SEGMENT_SECONDS = 900  # 15 minutes
 
-# Paths
-HOME = os.path.expanduser("~")
-APP_DIR = os.path.join(HOME, "cortex-core", "src")
+# Paths — derived from this file's location so it works when running as root
+# config.py lives at ~/cortex-core/src/config.py
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+HOME = os.path.dirname(os.path.dirname(_THIS_DIR))  # src -> cortex-core -> home
+APP_DIR = _THIS_DIR
 RECORDING_DIR = os.path.join(HOME, "recordings")
 LOG_DIR = os.path.join(HOME, "logs")
 WHISPLAY_DRIVER = os.path.join(HOME, "Whisplay", "Driver")

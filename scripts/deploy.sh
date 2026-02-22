@@ -5,6 +5,8 @@
 #   bash scripts/deploy.sh              # deploy + restart service
 #   bash scripts/deploy.sh --no-restart # deploy only (no service restart)
 #   bash scripts/deploy.sh --install    # first-time install (creates dirs, installs service)
+#
+# Works from Git Bash on Windows (uses scp, no rsync needed).
 
 set -e
 
@@ -21,21 +23,24 @@ echo "=== Cortex Core Deploy ==="
 echo "  Source: ${REPO_DIR}"
 echo "  Target: ${PI}:${PI_TARGET}"
 
+deploy_src() {
+    echo ""
+    echo "--- Deploying source files ---"
+    ssh "${PI}" "mkdir -p ${PI_TARGET}/src"
+    scp "${REPO_DIR}"/src/*.py "${PI}:${PI_TARGET}/src/"
+    echo "  Files deployed."
+}
+
 # First-time install
 if [ "$1" = "--install" ]; then
     echo ""
     echo "--- First-time install ---"
-    ssh "${PI}" "mkdir -p ${PI_TARGET}/src"
 
-    # Sync source code
-    rsync -avz --delete \
-        --exclude '__pycache__' \
-        --exclude '*.pyc' \
-        --exclude '.git' \
-        "${REPO_DIR}/src/" "${PI}:${PI_TARGET}/src/"
+    deploy_src
 
     # Install systemd service
-    echo "Installing systemd service..."
+    echo ""
+    echo "--- Installing systemd service ---"
     scp "${REPO_DIR}/systemd/cortex-core.service" "${PI}:/tmp/cortex-core.service"
     ssh "${PI}" "sudo mv /tmp/cortex-core.service /etc/systemd/system/cortex-core.service && \
                  sudo systemctl daemon-reload && \
@@ -48,14 +53,8 @@ if [ "$1" = "--install" ]; then
     exit 0
 fi
 
-# Regular deploy: sync source files
-echo ""
-echo "--- Syncing source files ---"
-rsync -avz --delete \
-    --exclude '__pycache__' \
-    --exclude '*.pyc' \
-    --exclude '.git' \
-    "${REPO_DIR}/src/" "${PI}:${PI_TARGET}/src/"
+# Regular deploy
+deploy_src
 
 if [ "$1" = "--no-restart" ]; then
     echo ""
@@ -69,7 +68,7 @@ echo "--- Restarting service ---"
 ssh "${PI}" "sudo systemctl restart cortex-core"
 
 # Brief wait then check status
-sleep 2
+sleep 3
 echo ""
 echo "--- Service status ---"
 ssh "${PI}" "sudo systemctl status cortex-core --no-pager -l" || true
