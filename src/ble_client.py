@@ -7,8 +7,10 @@ Protocol: newline-delimited UTF-8 messages (\n terminated).
 """
 
 import asyncio
+import json
 import logging
 import queue
+import socket
 import threading
 import time
 
@@ -17,9 +19,42 @@ from bleak import BleakClient, BleakScanner
 from config import (
     BLE_DEVICE_NAME, BLE_SERVICE_UUID, BLE_TX_UUID, BLE_RX_UUID,
     BLE_RECONNECT_INTERVAL_S, BLE_MAX_MESSAGE_LEN,
+    HTTP_ENABLED, HTTP_PORT, HTTP_TOKEN_PATH,
 )
 
 log = logging.getLogger("ble_client")
+
+
+def _get_local_ip():
+    """Get the Pi's local IP address (wlan0 preferred)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0)
+        s.connect(("10.255.255.255", 1))  # doesn't actually send anything
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
+
+
+def _build_discovery_payload():
+    """Build DISCOVER: message with Pi's IP, HTTP port, and auth token."""
+    if not HTTP_ENABLED:
+        return None
+    ip = _get_local_ip()
+    if not ip:
+        return None
+    token = ""
+    try:
+        with open(HTTP_TOKEN_PATH, "r") as f:
+            token = f.read().strip()
+    except (FileNotFoundError, OSError):
+        pass
+    payload = {"ip": ip, "port": HTTP_PORT}
+    if token:
+        payload["token"] = token
+    return "DISCOVER:" + json.dumps(payload, separators=(",", ":"))
 
 
 class BLEClient:
@@ -178,6 +213,9 @@ class BLEClient:
                 log.warning("MTU acquire failed: %s (using default)", e)
             await client.start_notify(BLE_TX_UUID, self._on_notify)
 
+            # Send discovery info so the computer auto-configures WiFi bridge
+            await self._send_discovery(client)
+
             try:
                 # Communication loop
                 while self._running and client.is_connected:
@@ -213,6 +251,21 @@ class BLEClient:
                     await client.stop_notify(BLE_TX_UUID)
                 except Exception:
                     pass
+
+    async def _send_discovery(self, client):
+        """Send DISCOVER: message to computer via BLE → ESP32 → USB serial."""
+        try:
+            msg = _build_discovery_payload()
+            if not msg:
+                return
+            data = (msg + "\n").encode("utf-8")
+            mtu_payload = max(client.mtu_size - 3, 20)
+            for i in range(0, len(data), mtu_payload):
+                chunk = data[i:i + mtu_payload]
+                await client.write_gatt_char(BLE_RX_UUID, chunk, response=True)
+            log.info("Sent discovery to computer")
+        except Exception as e:
+            log.warning("Discovery send failed: %s", e)
 
     def _on_notify(self, sender, data):
         """Handle incoming BLE notification — buffer and split on newlines."""

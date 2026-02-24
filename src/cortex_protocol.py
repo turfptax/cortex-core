@@ -7,6 +7,9 @@ Handles CHUNK:n/N:data reassembly for messages exceeding BLE MTU.
 """
 
 import json
+import os
+import socket
+import subprocess
 import time
 
 from cortex_db import CortexDB
@@ -148,6 +151,9 @@ class CortexProtocol:
             "computer_reg": self._cmd_computer_reg,
             "people_upsert": self._cmd_people_upsert,
             "query": self._cmd_query,
+            "wifi_scan": self._cmd_wifi_scan,
+            "wifi_config": self._cmd_wifi_config,
+            "wifi_status": self._cmd_wifi_status,
         }
         handler = handlers.get(cmd)
         if handler is None:
@@ -331,3 +337,157 @@ class CortexProtocol:
         rows = self._db._conn.execute(sql, params).fetchall()
         results = [dict(r) for r in rows]
         return "RSP:query:" + json.dumps(results, separators=(",", ":"), default=str)
+
+    # --- WiFi provisioning (headless setup via BLE) ---
+
+    @staticmethod
+    def _get_local_ip():
+        """Get the Pi's local IP address."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0)
+            s.connect(("10.255.255.255", 1))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return None
+
+    def _cmd_wifi_status(self, payload, context):
+        """Return current WiFi connection status."""
+        info = {"ip": self._get_local_ip()}
+
+        # Try nmcli for SSID and signal
+        try:
+            r = subprocess.run(
+                ["nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL,FREQ", "dev", "wifi"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in r.stdout.strip().split("\n"):
+                parts = line.split(":")
+                if len(parts) >= 2 and parts[0] == "yes":
+                    info["ssid"] = parts[1]
+                    if len(parts) >= 3:
+                        info["signal"] = int(parts[2])
+                    break
+        except (FileNotFoundError, Exception):
+            # Fallback: try iwgetid
+            try:
+                r = subprocess.run(
+                    ["iwgetid", "-r"], capture_output=True, text=True, timeout=5,
+                )
+                ssid = r.stdout.strip()
+                if ssid:
+                    info["ssid"] = ssid
+            except Exception:
+                pass
+
+        # Get hostname
+        try:
+            info["hostname"] = socket.gethostname()
+        except Exception:
+            pass
+
+        return "RSP:wifi_status:" + json.dumps(info, separators=(",", ":"))
+
+    def _cmd_wifi_scan(self, payload, context):
+        """Scan for available WiFi networks."""
+        networks = []
+
+        # Try nmcli
+        try:
+            subprocess.run(
+                ["nmcli", "dev", "wifi", "rescan"],
+                capture_output=True, timeout=10,
+            )
+            time.sleep(2)
+            r = subprocess.run(
+                ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi", "list"],
+                capture_output=True, text=True, timeout=10,
+            )
+            seen = set()
+            for line in r.stdout.strip().split("\n"):
+                parts = line.split(":")
+                if len(parts) >= 2 and parts[0] and parts[0] not in seen:
+                    seen.add(parts[0])
+                    entry = {"ssid": parts[0]}
+                    if len(parts) >= 2:
+                        try:
+                            entry["signal"] = int(parts[1])
+                        except ValueError:
+                            pass
+                    if len(parts) >= 3:
+                        entry["security"] = parts[2]
+                    networks.append(entry)
+            return "RSP:wifi_scan:" + json.dumps(networks, separators=(",", ":"))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            return "ERR:wifi_scan:{}".format(e)
+
+        # Fallback: iwlist
+        try:
+            r = subprocess.run(
+                ["sudo", "iwlist", "wlan0", "scan"],
+                capture_output=True, text=True, timeout=15,
+            )
+            import re
+            for match in re.finditer(r'ESSID:"([^"]*)"', r.stdout):
+                ssid = match.group(1)
+                if ssid and ssid not in [n["ssid"] for n in networks]:
+                    networks.append({"ssid": ssid})
+            return "RSP:wifi_scan:" + json.dumps(networks, separators=(",", ":"))
+        except Exception as e:
+            return "ERR:wifi_scan:{}".format(e)
+
+    def _cmd_wifi_config(self, payload, context):
+        """Connect to a WiFi network (headless provisioning via BLE).
+
+        Payload: {"ssid": "...", "password": "..."}
+        """
+        data = json.loads(payload) if payload else {}
+        ssid = data.get("ssid", "")
+        password = data.get("password", "")
+        if not ssid:
+            return "ERR:wifi_config:missing ssid"
+
+        # Try nmcli (Raspberry Pi OS Bookworm+)
+        try:
+            cmd = ["nmcli", "dev", "wifi", "connect", ssid]
+            if password:
+                cmd += ["password", password]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if r.returncode == 0:
+                time.sleep(2)
+                ip = self._get_local_ip()
+                return "RSP:wifi_config:" + json.dumps(
+                    {"ok": True, "ssid": ssid, "ip": ip}, separators=(",", ":"))
+            else:
+                return "ERR:wifi_config:{}".format(r.stderr.strip())
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            return "ERR:wifi_config:nmcli failed: {}".format(e)
+
+        # Fallback: wpa_cli
+        try:
+            def wpa(args):
+                return subprocess.run(
+                    ["wpa_cli", "-i", "wlan0"] + args,
+                    capture_output=True, text=True, timeout=10,
+                )
+            r = wpa(["add_network"])
+            net_id = r.stdout.strip()
+            wpa(["set_network", net_id, "ssid", '"{}"'.format(ssid)])
+            if password:
+                wpa(["set_network", net_id, "psk", '"{}"'.format(password)])
+            else:
+                wpa(["set_network", net_id, "key_mgmt", "NONE"])
+            wpa(["enable_network", net_id])
+            wpa(["save_config"])
+            time.sleep(3)
+            ip = self._get_local_ip()
+            return "RSP:wifi_config:" + json.dumps(
+                {"ok": True, "ssid": ssid, "ip": ip}, separators=(",", ":"))
+        except Exception as e:
+            return "ERR:wifi_config:wpa_cli failed: {}".format(e)
