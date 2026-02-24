@@ -129,7 +129,7 @@ SQLite database at `~/cortex.db` with WAL mode. 8 tables:
 ## Related Repos
 
 - [cortex](https://github.com/turfptax/cortex) — MCP server, CLI, and daemon (runs on PC)
-- [esp32-keymaster](https://github.com/turfptax/esp32-keymaster) — ESP32-S3 USB-BLE bridge firmware
+- [cortex-link](https://github.com/turfptax/cortex-link) — ESP32-S3 USB-BLE bridge firmware
 
 ## License
 
