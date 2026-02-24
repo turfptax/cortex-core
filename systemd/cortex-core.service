@@ -1,7 +1,7 @@
 [Unit]
 Description=Cortex Core — Wearable AI Memory
-After=bluetooth.target sound.target
-Wants=bluetooth.target sound.target
+After=bluetooth.target sound.target network-online.target
+Wants=bluetooth.target sound.target network-online.target
 
 [Service]
 Type=simple

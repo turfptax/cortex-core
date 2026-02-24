@@ -73,3 +73,9 @@ BLE_MAX_MESSAGE_LEN = 512
 # Cortex Database
 CORTEX_DB_PATH = os.path.join(HOME, "cortex.db")
 CORTEX_CHUNK_TIMEOUT_S = 30.0
+
+# HTTP API Server (WiFi transport)
+HTTP_ENABLED = True
+HTTP_PORT = 8420
+HTTP_TOKEN_PATH = os.path.join(HOME, "cortex-http.secret")
+UPLOADS_DIR = os.path.join(HOME, "uploads")

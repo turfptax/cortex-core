@@ -40,7 +40,7 @@ import json
 from config import (
     DISPLAY_TIMEOUT_S, BACKLIGHT_BRIGHTNESS, DISPLAY_UPDATE_HZ,
     STT_LISTEN_TIMEOUT_S, STT_NOTE_SILENCE_S, NOTES_DIR,
-    CORTEX_DB_PATH,
+    CORTEX_DB_PATH, HTTP_ENABLED,
 )
 from recorder import Recorder
 from display import Display
@@ -70,6 +70,18 @@ def main():
     # Cortex database and protocol handler
     cortex_db = CortexDB(CORTEX_DB_PATH)
     cortex = CortexProtocol(cortex_db)
+
+    # HTTP API server (WiFi transport -- direct from computers, bypasses BLE)
+    http_server = None
+    if HTTP_ENABLED:
+        try:
+            from http_server import start_http_server
+            _http_thread, http_server, _http_token = start_http_server(
+                cortex_protocol=cortex,
+                context_fn=lambda: _get_cortex_context(),
+            )
+        except Exception as e:
+            print("HTTP server failed to start: {}".format(e))
 
     # BLE client for ESP32 KeyMaster bridge
     def _on_ble_connect(address):
@@ -233,6 +245,8 @@ def main():
     def on_shutdown():
         nonlocal app_state
         # Stop everything
+        if http_server:
+            http_server.shutdown()
         ble.stop()
         stt.stop_listening()
         recorder.stop()
@@ -449,6 +463,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if http_server:
+            http_server.shutdown()
         ble.stop()
         stt.stop_listening()
         stt.cleanup()

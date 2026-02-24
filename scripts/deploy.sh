@@ -38,6 +38,11 @@ if [ "$1" = "--install" ]; then
 
     deploy_src
 
+    # Create directories
+    echo ""
+    echo "--- Creating directories ---"
+    ssh "${PI}" "mkdir -p /home/${PI_USER}/uploads"
+
     # Install systemd service
     echo ""
     echo "--- Installing systemd service ---"
@@ -72,6 +77,18 @@ sleep 3
 echo ""
 echo "--- Service status ---"
 ssh "${PI}" "sudo systemctl status cortex-core --no-pager -l" || true
+
+# Fetch HTTP API token (generated on first run)
+echo ""
+echo "--- HTTP API token ---"
+TOKEN=$(ssh "${PI}" "cat /home/${PI_USER}/cortex-http.secret 2>/dev/null")
+if [ -n "$TOKEN" ]; then
+    echo "$TOKEN" > "${HOME}/.cortex-wifi.token"
+    echo "  Token saved to ~/.cortex-wifi.token"
+    echo "  WiFi API: http://${PI_HOST}:8420/health"
+else
+    echo "  (token will be generated on first service start)"
+fi
 
 echo ""
 echo "Deploy complete!"
