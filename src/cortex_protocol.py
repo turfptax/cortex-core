@@ -151,6 +151,10 @@ class CortexProtocol:
             "computer_reg": self._cmd_computer_reg,
             "people_upsert": self._cmd_people_upsert,
             "query": self._cmd_query,
+            "file_register": self._cmd_file_register,
+            "file_list": self._cmd_file_list,
+            "file_search": self._cmd_file_search,
+            "file_delete": self._cmd_file_delete,
             "wifi_scan": self._cmd_wifi_scan,
             "wifi_config": self._cmd_wifi_config,
             "wifi_status": self._cmd_wifi_status,
@@ -303,7 +307,7 @@ class CortexProtocol:
         data = json.loads(payload) if payload else {}
         table = data.get("table", "")
         if table not in ("notes", "activities", "searches", "sessions",
-                         "projects", "computers", "people"):
+                         "projects", "computers", "people", "files"):
             return "ERR:query:invalid or missing table"
         filters = data.get("filters", {})
         limit = min(data.get("limit", 20), 100)
@@ -337,6 +341,56 @@ class CortexProtocol:
         rows = self._db._conn.execute(sql, params).fetchall()
         results = [dict(r) for r in rows]
         return "RSP:query:" + json.dumps(results, separators=(",", ":"), default=str)
+
+    # --- File metadata ---
+
+    def _cmd_file_register(self, payload, context):
+        data = json.loads(payload) if payload else {}
+        filename = data.get("filename", "")
+        if not filename:
+            return "ERR:file_register:missing filename"
+        row_id = self._db.insert_file(
+            filename=filename,
+            category=data.get("category", "uploads"),
+            description=data.get("description", ""),
+            tags=data.get("tags", ""),
+            project=data.get("project", ""),
+            mime_type=data.get("mime_type", ""),
+            size_bytes=data.get("size_bytes", 0),
+            source=data.get("source", "upload"),
+            session_id=self._active_session_id,
+        )
+        return "ACK:file_register:{}".format(row_id)
+
+    def _cmd_file_list(self, payload, context):
+        data = json.loads(payload) if payload else {}
+        files = self._db.list_files(
+            category=data.get("category"),
+            project=data.get("project"),
+            limit=min(data.get("limit", 50), 100),
+        )
+        return "RSP:file_list:" + json.dumps(files, separators=(",", ":"), default=str)
+
+    def _cmd_file_search(self, payload, context):
+        data = json.loads(payload) if payload else {}
+        query = data.get("query", "")
+        if not query:
+            return "ERR:file_search:missing query"
+        files = self._db.search_files(
+            query=query,
+            limit=min(data.get("limit", 20), 100),
+        )
+        return "RSP:file_search:" + json.dumps(files, separators=(",", ":"), default=str)
+
+    def _cmd_file_delete(self, payload, context):
+        data = json.loads(payload) if payload else {}
+        file_id = data.get("id")
+        if not file_id:
+            return "ERR:file_delete:missing id"
+        ok = self._db.delete_file(file_id)
+        if ok:
+            return "ACK:file_delete:{}".format(file_id)
+        return "ERR:file_delete:not found"
 
     # --- WiFi provisioning (headless setup via BLE) ---
 

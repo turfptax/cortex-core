@@ -230,7 +230,7 @@ class CortexHTTPHandler(BaseHTTPRequestHandler):
             self._error(404, "Not found")
 
     def _list_files(self, category):
-        """GET /files/<category> -- list files with name, size, mtime."""
+        """GET /files/<category> -- list files with name, size, mtime, and DB metadata."""
         dir_path = _FILE_DIRS.get(category)
         if not dir_path:
             self._error(404, "Unknown category: {}".format(category))
@@ -240,16 +240,32 @@ class CortexHTTPHandler(BaseHTTPRequestHandler):
             self._json({"ok": True, "category": category, "files": []})
             return
 
+        # Get DB metadata for this category (keyed by filename)
+        db_meta = {}
+        try:
+            db = self.server.cortex_protocol._db
+            for row in db.list_files(category=category, limit=500):
+                db_meta[row["filename"]] = row
+        except Exception:
+            pass
+
         files = []
         for name in sorted(os.listdir(dir_path)):
             filepath = os.path.join(dir_path, name)
             if os.path.isfile(filepath):
                 st = os.stat(filepath)
-                files.append({
+                entry = {
                     "name": name,
                     "size": st.st_size,
                     "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(),
-                })
+                }
+                meta = db_meta.get(name)
+                if meta:
+                    entry["description"] = meta.get("description", "")
+                    entry["tags"] = meta.get("tags", "")
+                    entry["project"] = meta.get("project", "")
+                    entry["file_id"] = meta.get("id")
+                files.append(entry)
 
         self._json({"ok": True, "category": category, "files": files})
 
@@ -355,11 +371,29 @@ class CortexHTTPHandler(BaseHTTPRequestHandler):
                 f.write(data)
                 remaining -= len(data)
 
+        # Register file metadata in database
+        file_id = None
+        try:
+            db = self.server.cortex_protocol._db
+            file_id = db.insert_file(
+                filename=safe_name,
+                category="uploads",
+                description=self.headers.get("X-Description", ""),
+                tags=self.headers.get("X-Tags", ""),
+                project=self.headers.get("X-Project", ""),
+                mime_type=_mime_type(safe_name),
+                size_bytes=length,
+                source="http",
+            )
+        except Exception:
+            pass
+
         self._json({
             "ok": True,
             "filename": safe_name,
             "size": length,
             "path": dest,
+            "file_id": file_id,
         })
 
     def _handle_delete(self, path):

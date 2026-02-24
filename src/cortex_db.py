@@ -1,7 +1,7 @@
 """Cortex Core — SQLite persistence layer.
 
-Manages the Cortex knowledge database with 7 tables:
-sessions, notes, activities, searches, projects, computers, people.
+Manages the Cortex knowledge database with 8 tables:
+sessions, notes, activities, searches, projects, computers, people, files.
 
 Uses WAL mode for safe concurrent reads during writes.
 All timestamps are ISO 8601 UTC via SQLite datetime('now').
@@ -93,6 +93,21 @@ CREATE TABLE IF NOT EXISTS people (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename TEXT NOT NULL,
+    category TEXT DEFAULT 'uploads',
+    description TEXT DEFAULT '',
+    tags TEXT DEFAULT '',
+    project TEXT DEFAULT '',
+    mime_type TEXT DEFAULT '',
+    size_bytes INTEGER DEFAULT 0,
+    source TEXT DEFAULT 'upload',
+    session_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_notes_project ON notes(project);
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at);
 CREATE INDEX IF NOT EXISTS idx_notes_session ON notes(session_id);
@@ -101,6 +116,9 @@ CREATE INDEX IF NOT EXISTS idx_activities_project ON activities(project);
 CREATE INDEX IF NOT EXISTS idx_activities_created ON activities(created_at);
 CREATE INDEX IF NOT EXISTS idx_searches_project ON searches(project);
 CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(ended_at);
+CREATE INDEX IF NOT EXISTS idx_files_project ON files(project);
+CREATE INDEX IF NOT EXISTS idx_files_category ON files(category);
+CREATE INDEX IF NOT EXISTS idx_files_created ON files(created_at);
 """
 
 
@@ -216,6 +234,52 @@ class CortexDB:
         self._conn.commit()
         return hostname
 
+    # --- Files ---
+
+    def insert_file(self, filename, category="uploads", description="",
+                    tags="", project="", mime_type="", size_bytes=0,
+                    source="upload", session_id=None):
+        cur = self._conn.execute(
+            "INSERT INTO files (filename, category, description, tags, project, "
+            "mime_type, size_bytes, source, session_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (filename, category, description, tags, project,
+             mime_type, size_bytes, source, session_id),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    def list_files(self, category=None, project=None, limit=50):
+        sql = "SELECT * FROM files"
+        params = []
+        wheres = []
+        if category:
+            wheres.append("category = ?")
+            params.append(category)
+        if project:
+            wheres.append("project = ?")
+            params.append(project)
+        if wheres:
+            sql += " WHERE " + " AND ".join(wheres)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def search_files(self, query, limit=20):
+        rows = self._conn.execute(
+            "SELECT * FROM files WHERE filename LIKE ? OR description LIKE ? "
+            "OR tags LIKE ? ORDER BY created_at DESC LIMIT ?",
+            ("%{}%".format(query), "%{}%".format(query),
+             "%{}%".format(query), limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_file(self, file_id):
+        cur = self._conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
     # --- People ---
 
     def upsert_person(self, person_id, name="", role="", email="",
@@ -241,7 +305,8 @@ class CortexDB:
             "(SELECT COUNT(*) FROM searches) AS searches_total, "
             "(SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL) AS active_sessions, "
             "(SELECT COUNT(*) FROM sessions) AS sessions_total, "
-            "(SELECT COUNT(*) FROM projects) AS projects_total"
+            "(SELECT COUNT(*) FROM projects) AS projects_total, "
+            "(SELECT COUNT(*) FROM files) AS files_total"
         ).fetchone()
         return dict(row)
 
@@ -290,5 +355,6 @@ class CortexDB:
                 limit=10, note_type="decision",
             ),
             "open_bugs": self.get_recent_notes(limit=20, note_type="bug"),
+            "recent_files": self.list_files(limit=10),
             "stats": self.get_stats(),
         }
