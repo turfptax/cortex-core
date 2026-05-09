@@ -14,5 +14,14 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
+# Slice 12 (2026-05-09): keep cortex-core alive under memory pressure
+# on the Pi Zero 2W companion device (.132 has only ~416 MB RAM).
+# Negative oom_score_adj tells the kernel to prefer killing OTHER
+# processes first when a global OOM event hits. Verified live —
+# process oom_score went from 668 → 475 with this setting. Don't
+# add MemoryMax/MemoryHigh here — those would actively throttle/kill
+# cortex-core, which is the OPPOSITE of intent.
+OOMScoreAdjust=-500
+
 [Install]
 WantedBy=multi-user.target
