@@ -181,6 +181,17 @@ def main():
     button.on("long_press", sm.handle_long_press)
     button.on("shutdown", sm.shutdown)
 
+    # Slice 12: kick off the notification watcher (best-effort).
+    # Polls /plugins/overseer/status every 30s for unread-count
+    # delta. State machine's tick() will read pending_preview and
+    # render to LCD/LED on next frame.
+    try:
+        from overseer_companion import NotificationWatcher
+        sm.notification_watcher = NotificationWatcher(poll_interval_s=30.0)
+        sm.notification_watcher.start()
+    except Exception as _nw_err:
+        sm.notification_watcher = None
+
     def _on_any_press():
         # Slice 12: any_press both wakes the display AND starts the
         # AudioCapture for companion mode. The capture is canceled
