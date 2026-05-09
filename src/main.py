@@ -46,14 +46,11 @@ from config import (
     BLE_ENABLED, PLUGINS_ENABLED,
 )
 from recorder import Recorder
-# TODO(slice-11-followup): this lives in cortex-pet now. Replace with a
-# generic Display protocol (or stub None) so main.py can boot without
-# the pet plugin. Left as-is in this excision commit so the diff stays
-# focused on the deletion, not on display refactoring.
-try:
-    from tamagotchi_display import TamagotchiDisplay  # noqa: F401
-except ImportError:
-    TamagotchiDisplay = None  # type: ignore[assignment]
+# Slice 12: cortex-core uses the in-tree `Display` class (PIL-rendered
+# 240x280 RGB565 frames blitted via WhisPlayBoard.draw_image). The pet's
+# TamagotchiDisplay went with cortex-pet; that's fine because Display
+# was always the lower-level renderer the pet wrapped.
+from display import Display
 from button import ButtonHandler
 from led import LEDManager
 from logger import ActivityLogger
@@ -72,13 +69,7 @@ def main():
     board.set_backlight(BACKLIGHT_BRIGHTNESS)  # temporary default until StateManager loads
 
     recorder = Recorder()
-    # See Slice 11 note above: TamagotchiDisplay was extracted into
-    # cortex-pet. Until the generic-display refactor lands, this falls
-    # back to None when the cortex-pet plugin isn't installed; downstream
-    # display.* calls need to guard against that. Boot will still print
-    # to the LCD via WhisPlayBoard's lower-level draw API even without
-    # a high-level display object.
-    display = TamagotchiDisplay(board) if TamagotchiDisplay else None
+    display = Display(board)
     button = ButtonHandler(board)
     led = LEDManager(board)
     logger = ActivityLogger()
