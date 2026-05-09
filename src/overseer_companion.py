@@ -382,6 +382,15 @@ def chat_overseer(text: str) -> dict:
                        timeout=180)
 
 
+def journal_queue_depth() -> int:
+    """Count of locally-queued (unflushed) journal entries on disk.
+    Cheap call — used by the LCD render loop."""
+    try:
+        return len(list(QUEUE_DIR.glob("*.json")))
+    except Exception:
+        return 0
+
+
 def flush_journal_queue() -> int:
     """Try to flush any spooled journal entries. Returns count flushed."""
     flushed = 0
@@ -518,6 +527,14 @@ class NotificationWatcher:
         self._last_unread = 0
         self.pending_preview: list[dict] = []
         self.lock = threading.Lock()
+        # Slice 12: cache of latest /status snapshot for the LCD
+        self.last_digest: dict = {
+            "loop_running": False,
+            "last_tick_at": "",
+            "notes_total": 0,
+            "notifications_unread": 0,
+            "pending_review": 0,
+        }
 
     def start(self):
         if self._thread is not None:
@@ -540,25 +557,42 @@ class NotificationWatcher:
             self.pending_preview = []
 
     def _loop(self):
+        # Run an immediate first poll so the LCD has data before the
+        # 30s interval ticks for the first time.
+        self._poll_once()
         while not self._stop.is_set():
-            try:
-                req = urllib.request.Request(
-                    f"{CORTEX_API}/plugins/overseer/status",
-                    headers={"Authorization": f"Basic {CORTEX_AUTH}"},
-                    method="GET",
-                )
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    data = json.loads(resp.read())
-                unread = data.get("overseer_db", {}).get(
-                    "notifications_unread", 0)
-                if unread > self._last_unread:
-                    # Fetch the new ones
-                    delta = unread - self._last_unread
-                    self._fetch_recent(delta)
-                self._last_unread = unread
-            except Exception as e:
-                log.debug("notification poll error: %s", e)
             self._stop.wait(self.poll_interval_s)
+            if self._stop.is_set():
+                break
+            self._poll_once()
+
+    def _poll_once(self):
+        try:
+            req = urllib.request.Request(
+                f"{CORTEX_API}/plugins/overseer/status",
+                headers={"Authorization": f"Basic {CORTEX_AUTH}"},
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+            db = data.get("overseer_db", {})
+            unread = db.get("notifications_unread", 0)
+            with self.lock:
+                self.last_digest = {
+                    "loop_running": data.get("loop_running", False),
+                    "last_tick_at": data.get("last_tick_at", ""),
+                    "notes_total": data.get(
+                        "core_stats", {}).get("notes_total", 0),
+                    "notifications_unread": unread,
+                    "pending_review": db.get(
+                        "pending_interpretations_pending", 0),
+                }
+            if unread > self._last_unread:
+                delta = unread - self._last_unread
+                self._fetch_recent(delta)
+            self._last_unread = unread
+        except Exception as e:
+            log.debug("notification poll error: %s", e)
 
     def _fetch_recent(self, n: int):
         """Pull the N most recent unread notifications for preview."""

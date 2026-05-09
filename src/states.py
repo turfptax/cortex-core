@@ -117,8 +117,11 @@ class StateManager:
             and os.environ.get("CORTEX_COMPANION_MODE", "1") != "0"
         )
         self.companion_status = ""  # short status string for LED/LCD
+        self.companion_message = ""  # last reply / journal text for LCD
+        self.companion_routed = ""  # "journal" | "overseer-chat" | "flag-moment"
         self._oc_audio = oc.AudioCapture() if _OC_AVAILABLE else None
         self._oc_busy = False  # True while a flag/hold thread is running
+        self.notification_watcher = None  # set later in main.py boot
 
     # ── Helpers ──────────────────────────────────────────────────
 
@@ -492,23 +495,33 @@ class StateManager:
     def _companion_run_flag(self):
         """Run the flag-moment flow on a background thread so the
         button callback returns immediately."""
+        result = {}
         try:
             self._oc_busy = True
             self.companion_status = "flag-recording"
+            self.companion_routed = "flag-moment"
             self.ctx.board.set_rgb(220, 140, 0)  # solid amber
             result = oc.handle_flag_moment(
                 self._oc_audio,
                 on_state=lambda s: setattr(self, "companion_status", s),
             )
+            self.companion_message = (result.get("transcript") or
+                                       "(silent flag)")
             self.ctx.logger.log("flag_moment", {
                 "ok": result.get("ok"),
                 "transcript_chars": len(result.get("transcript", "") or ""),
                 "stt_backend": result.get("stt_backend"),
                 "error": result.get("error"),
             })
+            # Hold the "FLAG SAVED" screen for a couple seconds
+            self.companion_status = "flag-saved"
+            self.ctx.board.set_rgb(0, 200, 0)
+            time.sleep(2.0)
         finally:
             self._oc_busy = False
             self.companion_status = ""
+            self.companion_message = ""
+            self.companion_routed = ""
             self.ctx.board.set_rgb(0, 0, 0)
 
     def _companion_run_hold(self, wav_path, duration):
@@ -532,17 +545,35 @@ class StateManager:
 
             result = oc.handle_hold_release(
                 wav_path, duration, on_state=_state_cb)
+            routed = result.get("routed", "")
+            self.companion_routed = routed
+            # Pick the message to show:
+            # - overseer chat → the assistant's reply
+            # - journal       → the transcript itself
+            if routed == "overseer-chat":
+                self.companion_message = (result.get("reply") or
+                                           "(empty reply)")
+            else:
+                self.companion_message = (result.get("transcript") or
+                                           "(silent journal)")
             self.ctx.logger.log("hold_release", {
                 "ok": result.get("ok"),
-                "routed": result.get("routed"),
+                "routed": routed,
                 "transcript_chars": len(result.get("transcript", "") or ""),
+                "reply_chars": len(result.get("reply", "") or ""),
                 "stt_backend": result.get("stt_backend"),
                 "duration_s": round(duration, 1),
                 "error": result.get("error"),
             })
+            # Hold the completion screen for ~3 seconds so the user
+            # can read the result.
+            self.companion_status = "saved" if routed != "overseer-chat" else "reply-speaking"
+            time.sleep(3.0)
         finally:
             self._oc_busy = False
             self.companion_status = ""
+            self.companion_message = ""
+            self.companion_routed = ""
             self.ctx.board.set_rgb(0, 0, 0)
 
     def handle_short_press(self):
@@ -875,6 +906,38 @@ class StateManager:
             state.menu_items = items
             state.menu_cursor = cursor
             state.menu_breadcrumb = ctx.menu.get_breadcrumb()
+
+        # ── Slice 12: companion-mode digest into the LCD frame ───
+        if self.companion_mode:
+            state.companion_status = self.companion_status or ""
+            state.companion_message = getattr(
+                self, "companion_message", "") or ""
+            state.companion_routed = getattr(
+                self, "companion_routed", "") or ""
+            try:
+                state.journal_queue_depth = oc.journal_queue_depth()
+            except Exception:
+                state.journal_queue_depth = 0
+            nw = getattr(self, "notification_watcher", None)
+            if nw is not None:
+                with nw.lock:
+                    digest = dict(nw.last_digest)
+                    preview_items = list(nw.pending_preview)
+                state.overseer_loop_running = digest.get(
+                    "loop_running", False)
+                state.overseer_last_tick = digest.get("last_tick_at", "")
+                state.overseer_notes_total = digest.get("notes_total", 0)
+                state.overseer_unread = digest.get(
+                    "notifications_unread", 0)
+                state.overseer_pending = digest.get("pending_review", 0)
+                if preview_items:
+                    first = preview_items[0]
+                    title = (first.get("title") or "").strip()
+                    body = (first.get("body") or "").strip()
+                    state.notification_preview = (
+                        f"{title}: {body}" if title and body
+                        else (title or body or "")
+                    )
 
         # Settings / Info screen data
         if self.app_state == "SETTING_ADJUST":

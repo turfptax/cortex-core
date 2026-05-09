@@ -73,26 +73,205 @@ class Display:
     def render(self, state):
         """Render full frame from application state dict.
 
-        Dispatches to the appropriate screen renderer based on app_state.
+        Dispatches to the appropriate screen renderer based on app_state
+        + Slice 12 companion_status. The HOME / STT_IDLE branch is now
+        the companion-aware home (overseer status digest + button hint),
+        and four new screens cover the recording / processing / done
+        states of the voice flows.
         """
         self.draw.rectangle([0, 0, self.W, self.H], fill=COLOR_BG)
 
         app = state.get("app_state", "STT_IDLE")
-        if app == "STT_IDLE":
-            self._render_stt_idle(state)
+        cstatus = state.get("companion_status", "") or ""
+
+        # Slice 12: companion-mode dispatch — when the StateManager is
+        # running an overseer flow, the companion_status overrides the
+        # app_state-based render.
+        if cstatus in ("armed", "flag-recording", "flag-transcribing"):
+            self._render_companion_recording(state)
+        elif cstatus in ("transcribing", "asking-overseer"):
+            self._render_companion_processing(state)
+        elif cstatus in ("reply-speaking", "saving-journal", "saved",
+                         "flag-saved"):
+            self._render_companion_done(state)
+        elif app in ("HOME", "STT_IDLE"):
+            self._render_companion_home(state)
         elif app == "STT_LISTENING":
             self._render_stt_listening(state)
         elif app == "NOTE_TAKING":
             self._render_note_taking(state)
         elif app in ("RECORDING", "PAUSED", "IDLE"):
-            # Existing recording UI
             self._draw_status_bar(state)
             self._draw_segment_info(state)
             self._draw_progress_bar(state)
             self._draw_session_stats(state)
             self._draw_footer(state)
+        else:
+            # Unknown app_state — fall back to companion home so the
+            # screen is never blank.
+            self._render_companion_home(state)
 
         self._flush()
+
+    # ---- Slice 12: companion-mode screens ----
+
+    def _render_companion_home(self, state):
+        """Idle home screen for the overseer companion role.
+        Layout (240×280 portrait):
+          - Top bar: clock + connectivity dot + queue depth
+          - Hero: 'OVERSEER' badge + status digest (notes/review)
+          - Middle: button-vocabulary hint (hold/tap/wake-phrase)
+          - Bottom: latest notification preview OR last-tick stamp
+        """
+        time_str = state.get("time_str", "--:--")
+        notes_total = state.get("overseer_notes_total", 0)
+        unread = state.get("overseer_unread", 0)
+        pending = state.get("overseer_pending", 0)
+        loop_running = state.get("overseer_loop_running", False)
+        last_tick = state.get("overseer_last_tick", "")
+        queue_depth = state.get("journal_queue_depth", 0)
+        notif = state.get("notification_preview", "")
+
+        # Top bar
+        self.draw.text((10, 6), time_str,
+                       fill=COLOR_TEXT, font=self.font_md)
+        dot_color = COLOR_GREEN if loop_running else COLOR_DIM
+        cx = self.W - 18
+        self.draw.ellipse([cx - 5, 12, cx + 5, 22], fill=dot_color)
+        if queue_depth > 0:
+            self.draw.text((cx - 50, 8), f"q{queue_depth}",
+                           fill=COLOR_YELLOW, font=self.font_sm)
+
+        # Hero badge
+        y = 38
+        badge = "OVERSEER"
+        bbox = self.font_lg.getbbox(badge)
+        bw = bbox[2] - bbox[0]
+        bx = (self.W - bw) // 2 - 6
+        self.draw.rectangle(
+            [bx, y, bx + bw + 12, y + 30],
+            outline=COLOR_CYAN, width=2,
+        )
+        self.draw.text((bx + 6, y + 4), badge,
+                       fill=COLOR_CYAN, font=self.font_lg)
+
+        # Status digest line
+        y = 80
+        digest = f"{notes_total} notes · {pending} review"
+        if unread:
+            digest = f"{unread} new · " + digest
+        bw = self.font_sm.getbbox(digest)[2]
+        self.draw.text(((self.W - bw) // 2, y), digest,
+                       fill=COLOR_DIM, font=self.font_sm)
+
+        # Button vocabulary hint
+        y = 116
+        self.draw.text((14, y), "Hold: record + route",
+                       fill=COLOR_TEXT, font=self.font_md)
+        y += 26
+        self.draw.text((14, y), "Tap:  flag this moment",
+                       fill=COLOR_TEXT, font=self.font_md)
+        y += 26
+        self.draw.text((14, y), 'Say "hey overseer" to chat',
+                       fill=COLOR_CYAN, font=self.font_sm)
+
+        # Bottom strip — notification preview OR last tick
+        y = 210
+        self.draw.line([(14, y), (self.W - 14, y)],
+                       fill=COLOR_DIM, width=1)
+        y += 6
+        if notif:
+            wrapped = _word_wrap(notif, self.font_sm, self.W - 28)
+            for line in wrapped[:3]:
+                self.draw.text((14, y), line,
+                               fill=COLOR_YELLOW, font=self.font_sm)
+                y += 16
+        elif last_tick:
+            ts = last_tick[11:16] if len(last_tick) >= 16 else last_tick
+            self.draw.text((14, y), f"Last tick: {ts}Z",
+                           fill=COLOR_DIM, font=self.font_sm)
+
+    def _render_companion_recording(self, state):
+        """Big REC screen — visible from across a room."""
+        time_str = state.get("time_str", "--:--")
+        cstatus = state.get("companion_status", "") or ""
+        self.draw.text((10, 6), time_str,
+                       fill=COLOR_DIM, font=self.font_sm)
+
+        cx, cy, r = self.W // 2, 90, 36
+        self.draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=COLOR_RED)
+        self.draw.text((cx - 22, cy - 14), "REC",
+                       fill=COLOR_BG, font=self.font_md)
+
+        label_map = {
+            "armed": "ARMED — release to confirm",
+            "flag-recording": "FLAGGING — 5 sec",
+            "flag-transcribing": "Transcribing flag…",
+        }
+        label = label_map.get(cstatus, cstatus.upper())
+        bw = self.font_md.getbbox(label)[2]
+        self.draw.text(((self.W - bw) // 2, 160), label,
+                       fill=COLOR_TEXT, font=self.font_md)
+
+        hint = "Release to save"
+        bw = self.font_sm.getbbox(hint)[2]
+        self.draw.text(((self.W - bw) // 2, 240), hint,
+                       fill=COLOR_DIM, font=self.font_sm)
+
+    def _render_companion_processing(self, state):
+        """'Thinking' screen — bold label + dots."""
+        time_str = state.get("time_str", "--:--")
+        cstatus = state.get("companion_status", "")
+        self.draw.text((10, 6), time_str,
+                       fill=COLOR_DIM, font=self.font_sm)
+
+        label_map = {
+            "transcribing": "TRANSCRIBING",
+            "asking-overseer": "ASKING OVERSEER",
+        }
+        label = label_map.get(cstatus, cstatus.upper())
+        bw = self.font_lg.getbbox(label)[2]
+        self.draw.text(((self.W - bw) // 2, 100), label,
+                       fill=COLOR_BLUE, font=self.font_lg)
+
+        dots = "..." if (int(time.time()) % 2 == 0) else "."
+        bw = self.font_lg.getbbox(dots)[2]
+        self.draw.text(((self.W - bw) // 2, 150), dots,
+                       fill=COLOR_BLUE, font=self.font_lg)
+
+    def _render_companion_done(self, state):
+        """Completion screen — reply text or save confirmation."""
+        time_str = state.get("time_str", "--:--")
+        cstatus = state.get("companion_status", "")
+        message = state.get("companion_message", "")
+        routed = state.get("companion_routed", "")
+        self.draw.text((10, 6), time_str,
+                       fill=COLOR_DIM, font=self.font_sm)
+
+        title_map = {
+            "saving-journal": "JOURNAL SAVED",
+            "saved": "SAVED",
+            "flag-saved": "FLAG SAVED",
+            "reply-speaking": "OVERSEER",
+        }
+        title = title_map.get(cstatus, cstatus.upper())
+        title_color = (COLOR_CYAN if routed == "overseer-chat"
+                       else COLOR_GREEN)
+        self.draw.text((14, 28), title,
+                       fill=title_color, font=self.font_lg)
+
+        if message:
+            wrapped = _word_wrap(message, self.font_sm, self.W - 28)
+            y = 70
+            for line in wrapped[:10]:
+                self.draw.text((14, y), line,
+                               fill=COLOR_TEXT, font=self.font_sm)
+                y += 18
+                if y > 240:
+                    break
+        else:
+            self.draw.text((14, 80), "entry persisted",
+                           fill=COLOR_TEXT, font=self.font_md)
 
     # ---- STT_IDLE Screen ----
 

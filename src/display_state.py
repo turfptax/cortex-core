@@ -80,6 +80,22 @@ class DisplayState:
     info_title: str = ""               # screen title
     info_lines: list = field(default_factory=list)  # list of (label, value) tuples
 
+    # ── Slice 12: overseer companion ────────────────────────────
+    companion_status: str = ""         # "" | "armed" | "flag-recording" |
+                                       # "flag-transcribing" | "flag-saved" |
+                                       # "transcribing" | "asking-overseer" |
+                                       # "reply-speaking" | "saving-journal" |
+                                       # "saved" | "idle"
+    companion_message: str = ""        # last reply / journal text to show on screen
+    companion_routed: str = ""         # "journal" | "overseer-chat" | "flag-moment"
+    overseer_notes_total: int = 0      # core_stats.notes_total via /plugins/overseer/status
+    overseer_unread: int = 0           # overseer_db.notifications_unread
+    overseer_pending: int = 0          # overseer_db.pending_interpretations_pending
+    overseer_last_tick: str = ""       # last_tick_at, e.g. "2026-05-09T17:23Z"
+    overseer_loop_running: bool = False
+    notification_preview: str = ""     # latest unread notification preview text
+    journal_queue_depth: int = 0       # local queue depth (offline degrade)
+
     def get(self, key: str, default: Any = None) -> Any:
         """Dict-style access for backward compat with tamagotchi_display.py."""
         try:
