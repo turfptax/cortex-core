@@ -21,9 +21,9 @@ WHISPLAY_DRIVER = os.path.join(HOME, "Whisplay", "Driver")
 # Display
 DISPLAY_WIDTH = 240
 DISPLAY_HEIGHT = 280
-DISPLAY_TIMEOUT_S = 30  # backlight off after this many seconds of inactivity
+DISPLAY_TIMEOUT_S = 60  # backlight off after this many seconds of inactivity (Slice 12: bumped from 30 — companion flows can run 5-15s)
 BACKLIGHT_BRIGHTNESS = 100  # 0-100
-DISPLAY_UPDATE_HZ = 2  # frames per second
+DISPLAY_UPDATE_HZ = 8  # frames per second (Slice 12: bumped from 2 — button-press feedback was lagging up to 500ms)
 
 # Fonts
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"

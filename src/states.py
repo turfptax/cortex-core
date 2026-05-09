@@ -476,7 +476,14 @@ class StateManager:
 
     def companion_press_start(self):
         """Any-press hook: kick off AudioCapture for the held duration.
-        Wired in main.py via button.on('any_press', ...)."""
+        Wired in main.py via button.on('any_press', ...).
+
+        Slice 12 force-render: after setting companion_status, push an
+        immediate frame to the LCD so the user sees REC within ~50ms
+        instead of waiting up to 1/DISPLAY_UPDATE_HZ for the next tick.
+        Without this, on the previous 2Hz config the press was visibly
+        unresponsive (up to 500ms of "nothing happened").
+        """
         if not self.companion_mode or not _OC_AVAILABLE:
             return
         if self._oc_busy:
@@ -486,8 +493,17 @@ class StateManager:
         try:
             self._oc_audio.start()
             self.companion_status = "armed"
+            self.last_interaction = time.monotonic()
             # LED yellow during armed/recording for visible feedback
             self.ctx.board.set_rgb(180, 180, 0)
+            # Force-render the LCD now (don't wait for next tick)
+            try:
+                state = self.build_display_state()
+                if state is not None:
+                    self.ctx.display.render(state)
+            except Exception as _re:
+                logging.getLogger("states.companion").debug(
+                    "force-render after press_start failed: %s", _re)
         except Exception as e:
             logging.getLogger("states.companion").exception(
                 "companion_press_start failed: %s", e)
@@ -856,6 +872,14 @@ class StateManager:
                     logger.log("ble_error", {"error": str(e), "raw": msg[:200]})
 
         # ── Display auto-off ─────────────────────────────────────
+        # Slice 12: keep the screen awake while a companion flow is
+        # in progress (recording / transcribing / asking-overseer /
+        # speaking). Otherwise the 60s timeout can blank the LCD
+        # mid-flow on a long overseer reply.
+        if self.companion_mode and (
+            self.companion_status or self._oc_busy
+        ):
+            self.last_interaction = time.monotonic()
         if self.backlight_on and (time.monotonic() - self.last_interaction > DISPLAY_TIMEOUT_S):
             ctx.board.set_backlight(0)
             self.backlight_on = False
