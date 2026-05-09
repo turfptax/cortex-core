@@ -8,11 +8,29 @@ callbacks, and per-frame tick logic.
 
 import glob
 import json
+import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
+
+# Slice 12: overseer companion mode wires the on-device button to
+# Record-Journal / Talk-to-Overseer / Flag-this-moment flows. This
+# import is best-effort — if the companion module fails to load
+# (e.g., missing arecord), the device falls back to legacy memory-mode
+# behavior (HOME → STT_LISTENING) without breaking boot.
+try:
+    import overseer_companion as oc
+    _OC_AVAILABLE = True
+except Exception as _oc_err:
+    logging.getLogger("states").warning(
+        "overseer_companion unavailable; falling back to legacy HOME flow: %s",
+        _oc_err,
+    )
+    oc = None
+    _OC_AVAILABLE = False
 
 from config import (
     BACKLIGHT_BRIGHTNESS, DISPLAY_TIMEOUT_S, DISPLAY_UPDATE_HZ,
@@ -89,6 +107,18 @@ class StateManager:
         self.pong_renderer = None
         self.pong_last_tick = 0.0
         self.loop_interval = 1.0 / max(1, self.display_hz)
+
+        # ── Slice 12: overseer companion mode ────────────────────
+        # When True, button events on HOME route to overseer flows
+        # (flag-moment / hold-record-route) instead of legacy STT.
+        # Defaults True if the module loaded; override-able via env var.
+        self.companion_mode = (
+            _OC_AVAILABLE
+            and os.environ.get("CORTEX_COMPANION_MODE", "1") != "0"
+        )
+        self.companion_status = ""  # short status string for LED/LCD
+        self._oc_audio = oc.AudioCapture() if _OC_AVAILABLE else None
+        self._oc_busy = False  # True while a flag/hold thread is running
 
     # ── Helpers ──────────────────────────────────────────────────
 
@@ -430,11 +460,116 @@ class StateManager:
 
     # ── Button callbacks ─────────────────────────────────────────
 
+    # Slice 12: companion-mode button vocabulary.
+    #
+    # On press start (any_press):  begin AudioCapture immediately.
+    # On release < short_press_max: tap → flag-this-moment (5s post-press).
+    # On release > short_press_max:  hold → transcribe + route (chat | journal).
+    #
+    # Implementation: button.py already fires any_press / short_press /
+    # long_press. companion_press_start() hooks any_press; the existing
+    # handle_short_press / handle_long_press branch on companion_mode
+    # at the top of their HOME-state arm.
+
+    def companion_press_start(self):
+        """Any-press hook: kick off AudioCapture for the held duration.
+        Wired in main.py via button.on('any_press', ...)."""
+        if not self.companion_mode or not _OC_AVAILABLE:
+            return
+        if self._oc_busy:
+            return  # already processing a previous turn
+        if self.app_state != "HOME":
+            return  # don't override menu / recording / shutdown states
+        try:
+            self._oc_audio.start()
+            self.companion_status = "armed"
+            # LED yellow during armed/recording for visible feedback
+            self.ctx.board.set_rgb(180, 180, 0)
+        except Exception as e:
+            logging.getLogger("states.companion").exception(
+                "companion_press_start failed: %s", e)
+
+    def _companion_run_flag(self):
+        """Run the flag-moment flow on a background thread so the
+        button callback returns immediately."""
+        try:
+            self._oc_busy = True
+            self.companion_status = "flag-recording"
+            self.ctx.board.set_rgb(220, 140, 0)  # solid amber
+            result = oc.handle_flag_moment(
+                self._oc_audio,
+                on_state=lambda s: setattr(self, "companion_status", s),
+            )
+            self.ctx.logger.log("flag_moment", {
+                "ok": result.get("ok"),
+                "transcript_chars": len(result.get("transcript", "") or ""),
+                "stt_backend": result.get("stt_backend"),
+                "error": result.get("error"),
+            })
+        finally:
+            self._oc_busy = False
+            self.companion_status = ""
+            self.ctx.board.set_rgb(0, 0, 0)
+
+    def _companion_run_hold(self, wav_path, duration):
+        """Run the hold-release flow on a background thread."""
+        try:
+            self._oc_busy = True
+
+            def _state_cb(name):
+                self.companion_status = name
+                # LED state mapping
+                if name == "transcribing":
+                    self.ctx.board.set_rgb_fade(0, 100, 200, 200)  # blue
+                elif name == "asking-overseer":
+                    self.ctx.board.set_rgb_fade(0, 60, 220, 200)
+                elif name == "reply-speaking":
+                    self.ctx.board.set_rgb_fade(0, 200, 0, 300)  # green
+                elif name in ("saving-journal", "saved"):
+                    self.ctx.board.set_rgb_fade(0, 220, 80, 300)
+                elif name == "idle":
+                    self.ctx.board.set_rgb(0, 0, 0)
+
+            result = oc.handle_hold_release(
+                wav_path, duration, on_state=_state_cb)
+            self.ctx.logger.log("hold_release", {
+                "ok": result.get("ok"),
+                "routed": result.get("routed"),
+                "transcript_chars": len(result.get("transcript", "") or ""),
+                "stt_backend": result.get("stt_backend"),
+                "duration_s": round(duration, 1),
+                "error": result.get("error"),
+            })
+        finally:
+            self._oc_busy = False
+            self.companion_status = ""
+            self.ctx.board.set_rgb(0, 0, 0)
+
     def handle_short_press(self):
         self.wake_display()
         logger = self.ctx.logger
         stt = self.ctx.stt
         recorder = self.ctx.recorder
+
+        # Slice 12: in companion mode + HOME, short press = flag-moment.
+        # Cancel the in-progress AudioCapture (started in any_press)
+        # because flag-moment does its own 5s post-press capture.
+        if (
+            self.companion_mode
+            and _OC_AVAILABLE
+            and self.app_state == "HOME"
+            and self._oc_audio is not None
+        ):
+            try:
+                self._oc_audio.stop()  # discard the brief tap audio
+            except Exception:
+                pass
+            threading.Thread(
+                target=self._companion_run_flag,
+                name="oc-flag", daemon=True,
+            ).start()
+            logger.log("companion_flag_press")
+            return
 
         if self.app_state == "HOME":
             stt.start_listening()
@@ -487,6 +622,34 @@ class StateManager:
 
     def handle_long_press(self):
         self.wake_display()
+
+        # Slice 12: in companion mode + HOME, long press = the user
+        # held the button to record. The AudioCapture was started by
+        # any_press (companion_press_start). Stop it now and run the
+        # transcribe + route logic.
+        if (
+            self.companion_mode
+            and _OC_AVAILABLE
+            and self.app_state == "HOME"
+            and self._oc_audio is not None
+        ):
+            wav, dur = self._oc_audio.stop()
+            if not wav:
+                self.ctx.board.set_rgb(0, 0, 0)
+                self.ctx.logger.log("companion_hold_empty", {
+                    "duration_s": round(dur, 1),
+                })
+                return
+            threading.Thread(
+                target=self._companion_run_hold,
+                args=(wav, dur),
+                name="oc-hold", daemon=True,
+            ).start()
+            self.ctx.logger.log("companion_hold_release", {
+                "duration_s": round(dur, 1),
+            })
+            return
+
         if self.app_state in ("RECORDING", "PAUSED"):
             elapsed = round(self.ctx.recorder.get_session_elapsed(), 1)
             seg_count = self.ctx.recorder.get_segment_count()

@@ -180,7 +180,16 @@ def main():
     button.on("short_press", sm.handle_short_press)
     button.on("long_press", sm.handle_long_press)
     button.on("shutdown", sm.shutdown)
-    button.on("any_press", sm.wake_display)
+
+    def _on_any_press():
+        # Slice 12: any_press both wakes the display AND starts the
+        # AudioCapture for companion mode. The capture is canceled
+        # (via stop+discard) by handle_short_press if the release fires
+        # the tap path; or stopped+routed by handle_long_press if the
+        # release fires the hold path.
+        sm.wake_display()
+        sm.companion_press_start()
+    button.on("any_press", _on_any_press)
 
     led.set_state("stt_idle")
     logger.log("app_started", {
