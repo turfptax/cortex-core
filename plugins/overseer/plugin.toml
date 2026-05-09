@@ -1,0 +1,238 @@
+[plugin]
+name = "overseer"
+version = "0.1.0"
+description = "Memory upkeep agent — summarization, consolidation, working memory"
+author = "turfptax"
+entrypoint = "overseer"
+enabled = true
+
+[capabilities]
+db = true                       # owns plugins/overseer/data/overseer.db (drop-and-rebuild safe)
+display_screens = false         # background-only; no display surface
+mcp_tools = true                # extends cortex_get_context with working_memory (slice 3d)
+http_routes = true              # /plugins/overseer/* for Hub queries (later slice)
+background_tasks = true         # consolidation loop (slice 3c)
+core_memory_read = true         # reads notes/sessions/projects from cortex.db
+core_memory_write = false       # LOCKED — overseer never writes to cortex.db
+llm = true                      # uses LLMRouter (3 backends)
+
+[llm]
+# Per-plugin default backend; per-call override allowed.
+# Fallback chain when the requested backend is unreachable:
+#   openrouter (cloud, smart) → lmstudio (network, free smart) → ondevice (Pi, free slow).
+# Per locked design (2026-05-02): three backends; never block; degrade gracefully.
+backend = "openrouter"
+model = "anthropic/claude-opus-4.7"
+fallback = ["lmstudio", "ondevice"]
+
+# Endpoints — LLMRouter reads these from the manifest.
+openrouter_url   = "https://openrouter.ai/api/v1"
+lmstudio_url     = "http://10.0.0.102:1234/v1"
+lmstudio_model   = "auto"        # let LM Studio pick the loaded model
+ondevice_url     = "http://127.0.0.1:8081/v1"
+ondevice_model   = "auto"        # llama-server has one model loaded
+
+# Per-call connect/read timeouts (seconds). Cloud is generous; ondevice is patient.
+openrouter_timeout_s = 60
+lmstudio_timeout_s   = 60
+ondevice_timeout_s   = 120
+
+# Secrets search paths (first-found wins). Per locked design the canonical
+# install is the user's ~/.cortex/secrets.toml — but the cortex-core
+# service on Pi runs as root, so Path.home() resolves to /root. We list
+# multiple candidates to keep "user home" ergonomics while supporting the
+# root-owned service. CORTEX_SECRETS env var (if set) overrides this list.
+secrets_paths = [
+  "/home/turfptax/.cortex/secrets.toml",
+  "/root/.cortex/secrets.toml",
+  "/etc/cortex/secrets.toml",
+  "~/.cortex/secrets.toml",
+]
+
+# Per-task model overrides — when LLMRouter.complete() is called with
+# a `purpose=` and no explicit `model=`, look up the model here. Falls
+# back to [llm].model if the purpose isn't listed. Cheaper models for
+# small structured tasks; Opus for the high-stakes interpretive work.
+[llm.model_overrides]
+"summarize-session" = "anthropic/claude-opus-4.7"
+"summarize-recent"  = "anthropic/claude-opus-4.7"
+"working-memory"    = "anthropic/claude-opus-4.7"
+"auto-tag-notes"    = "anthropic/claude-sonnet-4.6"
+"overseer-chat"     = "anthropic/claude-opus-4.7"
+# Slice 3f: dialectic checker. Paired-generation runs Opus + this in
+# parallel on every interpretive artifact; the diff is captured in
+# dialectic_open. Cheap (~10x less than Opus) so doubling generation
+# is still affordable.
+"dialectic-check"   = "google/gemma-3-27b-it"
+# Slice 3f.5: overseer journal. Sonnet by default — the journal is
+# honest reflection, not literary work, and at 5min ticks the cost
+# stays trivial. Override to Opus for deeper introspection if desired.
+"overseer-journal"  = "anthropic/claude-sonnet-4.6"
+# Slice 3f.5 #2: question-centered routing. Each new gist gets routed
+# (or "unfiled") against active open_questions via Sonnet. Cheap +
+# structured task; ~$0.005 per gist.
+"evidence-routing"  = "anthropic/claude-sonnet-4.6"
+# Slice 3h: insight scan. Sonnet reads recent gist arcs per project
+# and proposes new theme/pattern/drift candidates to the pending
+# queue. Conservative single-call-per-scan budget (~$0.005-0.01/scan).
+"insight-scan"      = "anthropic/claude-sonnet-4.6"
+# Slice 3i CP2: distill corrections → blindspot proposals.
+# Same model as insight-scan; cheap clustering of small text rows.
+"distill-corrections" = "anthropic/claude-sonnet-4.6"
+
+[hooks]
+subscribe = [
+  "note.created",               # auto-tag / auto-summarize new notes
+  "session.ended",              # consolidate session into a summary
+  "tick.300s",                  # background upkeep cadence
+]
+
+[config]
+# Tick interval for the consolidation loop (seconds).
+# Configurable per locked design — different machines/workloads vary.
+# Slice 5.5 (cadence calibration): bumped 300 → 900 (5min → 15min).
+# At 5min the journal step alone burned ~17 calls/day = ~70% of the
+# 25-call daily budget BEFORE the temporal step's 22:00-local trigger
+# could fire. 15min gives ~96 ticks/day — enough cadence for fresh
+# data without starving downstream Sonnet steps.
+tick_interval_s = 900
+
+# When Hub is unreachable for an LLM call, queue this many seconds
+# before degrading to ondevice (with quality-reduced flag in output).
+# Never block — overseer must never become a reason notes can't land.
+hub_offline_degrade_after_s = 600
+
+# Working-memory caps (used by the loop's _build_working_memory).
+working_memory_top_projects = 5         # by relevance, not just recency
+working_memory_top_projects_recency_days = 30
+working_memory_recent_decisions = 10
+working_memory_open_todos = 20
+working_memory_open_questions = 10      # long-running, not actionable
+working_memory_last_week_days = 7
+working_memory_recent_themes = 5
+working_memory_recent_episode_titles = 10
+# Slice 3g — depth: surface signal that already lives in the DB so
+# every working_memory read carries patterns/drift/notes/rollups, not
+# just questions+gists. Zero LLM cost, pure aggregation.
+working_memory_recent_patterns = 5
+working_memory_recent_drift = 5
+working_memory_recent_future_notes = 3   # newest institutional memory
+working_memory_recent_rollups = 5         # daily automation rollups
+
+# ── Background consolidation loop (slice 3c) ──────────────────────
+# Per-tick, the overseer:
+#   1. Auto-summarizes any sessions ended-but-not-yet-processed
+#   2. Auto-tags any new untagged notes (using the cheaper model)
+#   3. Rebuilds the working_memory artifact and caches it in overseer_state
+# Cost guards prevent a runaway loop from burning credits.
+loop_enabled = true
+loop_first_tick_delay_s = 30            # don't hammer the LLM at startup
+loop_max_llm_calls_per_tick = 20      # bumped from 10 in 3f: each
+                                       # interpretive artifact now does
+                                       # paired generation = 2 calls
+loop_max_cost_usd_per_tick = 0.50     # cost cap unchanged — Gemma is
+                                       # cheap so doubling calls barely
+                                       # moves the cost dial
+loop_auto_summarize_sessions = true
+loop_auto_tag_notes = true
+loop_build_working_memory = true
+loop_session_summary_max_notes = 50     # truncate per-session prompt to N notes
+loop_tag_batch_size = 10                # how many notes per tag-batch LLM call
+loop_tag_max_per_note = 3
+
+# Slice 3h: insight scan caps + auto-loop policy.
+# Per-scan cap is a sanity ceiling; daily budget always applies on top.
+insight_scan_max_cost_usd_per_scan = 0.05
+insight_scan_default_days = 7
+
+# Slice 3h CP2: auto-loop insight scanning.
+# Manual /insight/scan-now ignores all of these and works on any project.
+# The loop is conservative by design — opt-in to broader scans.
+insight_loop_enabled = true
+insight_loop_scan_interval_hours = 24      # per-project cadence
+insight_loop_max_projects_per_tick = 2     # ceiling per tick
+# Project policy options:
+#   "active+human"  — default; human-classified + still-unclassified ('auto')
+#   "all"           — also scan automation-classified projects
+#   "never"         — disable the auto-loop entirely (manual still works)
+insight_loop_project_policy = "active+human"
+
+# Slice 3h CP2: chat-snippet candidate extraction.
+# When the overseer chat reply contains ```insight {...}``` blocks,
+# parse them out (invisible to the user) and queue as pending
+# interpretations. Free — no extra LLM call; the chat call already runs.
+insight_chat_snippet_enabled = true
+
+# Polish CP2: notification auto-archive policy.
+# stale_active_project notifications older than this get auto-archived
+# during evaluate_rules, even if the underlying staleness still holds.
+# At some point the signal stops being actionable.
+notification_stale_archive_days = 60
+
+# Slice 3i CP2: correction-feedback loop.
+# Periodic distill pass clusters uncondidated corrections into blindspot
+# proposals. Conservative defaults: only fires if there are at least
+# `loop_distill_min_corrections` undistilled corrections AND the last
+# distill ran more than `loop_distill_interval_hours` ago.
+distill_loop_enabled = true
+distill_loop_min_corrections = 3
+distill_loop_interval_hours = 24
+
+# Slice 3d: imported third-party sessions (Claude Code .jsonl files).
+# Loop processes unprocessed imports each tick (subject to budget).
+# No high-water mark for imports — every import is an explicit user
+# action so there's no day-zero backlog.
+loop_summarize_imports = true
+loop_import_transcript_chars = 30000    # head+tail truncate beyond this
+
+# Slice 3f: paired-generation dialectic checker. When true, every
+# interpretive artifact (gist, theme, episode, question identification)
+# is generated by BOTH Opus and Gemma in parallel; the diff is
+# captured in dialectic_open. Cost: ~10% per artifact (Gemma is much
+# cheaper than Opus). Disable for cost-sensitive deployments.
+loop_paired_generation = true
+
+# Slice 3f.5: overseer journal — first-person reflection at end of
+# each notable tick. Skips empty ticks; respects budget; uses Sonnet
+# by default (~$0.005 per entry; ~$0.01-0.05/day depending on activity).
+loop_journal_enabled = true
+loop_journal_boot_read_n = 5      # how many recent entries to log on plugin load
+
+# Slice 5.5 (cadence calibration): hard caps on journaling. Without
+# these, the journal wrote on nearly every notable tick (215 entries
+# in 3 days, eating 70-80% of the daily LLM budget before the
+# temporal cadence step could fire its 22:00-local trigger). The cap
+# is per LOCAL day (matches the user's calendar). The cooldown
+# prevents a flurry of rapid ticks from each generating an entry.
+loop_journal_max_per_local_day = 0  # 0 = unlimited (Slice 8); cooldown is the floor
+loop_journal_min_minutes_between = 90
+
+# Slice 3f.5 #2: question-centered routing. Every new gist is routed
+# via Sonnet against active open_questions. Most are "unfiled" — that's
+# correct, the routing is conservative by design.
+loop_evidence_routing = true
+
+# ── Slice 3e: classification + rollups ────────────────────────────
+# Auto-classify projects with imports each tick. Heuristic: count >= 10
+# AND avg duration < 2min → "automation". Otherwise "human". User can
+# override via POST /plugins/overseer/projects/setting (sets
+# manual_override=1; auto-classifier won't touch).
+loop_auto_classify = true
+loop_run_rollups = true
+loop_rollups_max_per_tick = 5           # cheap (Sonnet) but still bound
+
+# ── Slice 3e: daily budget (UTC midnight rollover) ────────────────
+# Composes with loop_max_*_per_tick. Manual /backfill bypasses this.
+# At default $1.00/day = ~20 Opus summaries OR ~250 Sonnet calls.
+loop_daily_budget_usd = 2.00  # raised for Slice 8 night-work runway
+loop_daily_budget_calls = 100  # raised for Slice 8 night-work runway
+
+# ── Slice 3e: notifications rules ─────────────────────────────────
+loop_run_notifications = true
+notify_stale_project_days = 14          # warn after N days untouched
+notify_stale_project_important_days = 30
+notify_backlog_imports = 50             # info if backlog larger
+
+[dependencies]
+core_min = "0.1.0"
+plugins = []

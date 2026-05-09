@@ -1,0 +1,37 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.db
+*.db-shm
+*.db-wal
+*.wav
+*.jsonl
+.env
+.venv/
+
+# Personal artifacts — each Cortex instance has its own seed; not meant to be shared
+plugins/overseer/assets/session_0_seed.md
+
+# Backup files
+*.bak
+*.bak.*
+
+# Personal data / data dirs (kept out of repo, structure-only via .gitkeep)
+plugins/overseer/data/*
+!plugins/overseer/data/.gitkeep
+plugins/pet/data/*
+!plugins/pet/data/.gitkeep
+plugins/*/imports/
+
+# Wheel binaries — installed via pip, no need to track
+wheels/
+
+# Personal-data import scripts (reference specific organization names);
+# kept locally for the user, not part of the public framework
+scripts/browser_to_json.py
+scripts/import_browser_history.py
+scripts/import_from_torylife.py

@@ -1,0 +1,26 @@
+[Unit]
+Description=llama-server (Cortex Pet LLM inference)
+After=network.target
+Before=cortex-core.service
+
+[Service]
+Type=simple
+User=turfptax
+# NOTE: The --model path is updated automatically by the dream cycle
+# (06_export_deploy.py) when a new merged model is deployed via SCP.
+ExecStart=/usr/local/bin/llama-server \
+    --model /home/turfptax/models/qwen3.5-0.8b-q4_k_m.gguf \
+    --host 127.0.0.1 \
+    --port 8081 \
+    --ctx-size 2048 \
+    --threads 3 \
+    --n-predict 128 \
+    --reasoning-budget 0 \
+    --chat-template-kwargs '{"enable_thinking":false}' \
+    --log-disable
+Restart=on-failure
+RestartSec=5
+Environment=GGML_NTHREADS=3
+
+[Install]
+WantedBy=multi-user.target
