@@ -224,8 +224,17 @@ loop_rollups_max_per_tick = 5           # cheap (Sonnet) but still bound
 # ── Slice 3e: daily budget (UTC midnight rollover) ────────────────
 # Composes with loop_max_*_per_tick. Manual /backfill bypasses this.
 # At default $1.00/day = ~20 Opus summaries OR ~250 Sonnet calls.
-loop_daily_budget_usd = 2.00  # raised for Slice 8 night-work runway
-loop_daily_budget_calls = 100  # raised for Slice 8 night-work runway
+# Slice 9.2 raise (2026-05-12): bumped calls 100→250 + cost $2→$5 so the
+# overseer can drain its ingest backlog (1,242 unprocessed sessions after
+# the Slice 9.1 grok-com + grok-twitter + tweet imports). The earlier
+# "Slice 8 night-work runway" 100/$2 was a self-imposed safety rail per
+# Tory; not an Anthropic tier limit. With auto-tag-notes eating ~94 calls
+# from the 1,546 imported tweets and the gist queue starving as a result,
+# 250/day puts gist work back inside the daily budget. Dollar cap raised
+# proportionally so calls stay the single binding control surface (today's
+# call mix would have hit $2 at ~175 calls otherwise).
+loop_daily_budget_usd = 5.00
+loop_daily_budget_calls = 250
 
 # ── Slice 3e: notifications rules ─────────────────────────────────
 loop_run_notifications = true
