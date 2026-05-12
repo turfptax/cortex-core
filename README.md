@@ -258,18 +258,24 @@ Execute shell commands on the Pi remotely via the protocol. Useful for deploying
 
 ## Database
 
-SQLite database at `~/cortex.db` with WAL mode. 10 tables:
+Cortex stores state in two SQLite files:
+
+- **`~/cortex.db`** (user-owned) — core memory the user authored: sessions, notes, activities, searches, projects, computers, people, files.
+- **`~/cortex-core/plugins/overseer/data/overseer.db`** (root-owned, plugin-managed) — the overseer plugin's own working memory: imported AI conversation history (ChatGPT, Claude Code, Grok), gist + temporal summaries, the overseer's journal, dialectic questions, biometric streams, phone/voicemail logs.
+
+A full walkthrough — including the source taxonomy (which `source=` values exist for ChatGPT vs Claude Code vs Twitter vs Grok), the per-conversation `.jsonl` import pattern, and a recipe for adding a new data source — lives in **[docs/DATA_ARCHITECTURE.md](docs/DATA_ARCHITECTURE.md)**. Read that first if you're forking cortex-core to import your own data.
+
+### `cortex.db` tables (user-owned, ~/cortex.db)
 
 - **sessions** — AI conversation sessions (id, platform, hostname, started_at, summary)
-- **notes** — Timestamped notes with tags, project, and type (note/decision/bug/reminder/idea/todo/context)
+- **notes** — Timestamped notes with tags, project, and type (note/decision/bug/reminder/idea/todo/context/tweet/tweet-reply/tweet-retweet/voice)
 - **activities** — Program and file tracking (what was being worked on)
 - **searches** — Research query history
 - **projects** — Project registry (tag, status, priority, description)
 - **computers** — Registered machines (hostname, OS, hardware)
 - **people** — Collaborator directory
 - **files** — File metadata for AI-discoverable sharing (filename, category, description, tags)
-- **pet_state** — Key-value store for pet configuration and state
-- **pet_interactions** — Pet chat history (prompt, response, sentiment, inference time, stage, mood)
+- **time_entries**, **organizations**, **training_examples**, **training_ledger** — supporting tables
 
 ## Related Repos
 
