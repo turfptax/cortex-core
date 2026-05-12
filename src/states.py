@@ -39,10 +39,11 @@ from config import (
     RECORDING_DIR,
     HTTP_PORT, HTTP_USERNAME, HTTP_PASSWORD,
     BLE_ENABLED, DISPLAY_WIDTH, DISPLAY_HEIGHT,
-    HOME,
+    HOME, SHORT_PRESS_MAX_MS,
 )
 from note_utils import save_note
 from display_state import DisplayState, BLEInfo
+from debug import dbg
 
 SETTINGS_FILE = os.path.join(HOME, "cortex-settings.json")
 
@@ -122,6 +123,21 @@ class StateManager:
         self._oc_audio = oc.AudioCapture() if _OC_AVAILABLE else None
         self._oc_busy = False  # True while a flag/hold thread is running
         self.notification_watcher = None  # set later in main.py boot
+        # Slice 12.1 wake-on-press: when the user presses while the
+        # backlight is off, that press is treated as a screen-wake only
+        # — no audio capture, no state transition, the matching release
+        # is swallowed. This flag is set by main._on_any_press based on
+        # backlight state, then consumed by handle_short_press.
+        self._oc_wake_only_press = False
+        # Slice 12.1.2 toggle-record state: True from the moment the
+        # user taps to START a recording until the moment they tap to
+        # STOP it. The recording continues regardless of button state
+        # (no need to keep finger down). _oc_record_start_mono drives
+        # the on-screen timer; auto-capped at OC_MAX_RECORD_S in tick().
+        self._oc_recording = False
+        self._oc_record_start_mono = None
+        self.OC_MAX_RECORD_S = 300.0  # 5 min cap — auto-stop + save
+        self.OC_MIN_RECORD_S = 0.4    # below this, discard (probably misclick)
 
     # ── Helpers ──────────────────────────────────────────────────
 
@@ -461,111 +477,203 @@ class StateManager:
         lines.append(("API", f":{HTTP_PORT}"))
         self._populate_info("WiFi Info", lines)
 
-    # ── Button callbacks ─────────────────────────────────────────
+    # ── Button callbacks (Slice 12.1 redesign) ───────────────────
+    #
+    # Companion-mode button vocabulary (single physical button):
+    #
+    #   press                          → any_press → companion_press_start()
+    #                                    starts arecord + status="pressed"
+    #                                    + yellow LED + force-render
+    #
+    #   release before SHORT_PRESS_MAX  → short_press → handle_short_press()
+    #                                    discards audio + INSTANT flag
+    #                                    (no recording — just timestamp)
+    #
+    #   held past SHORT_PRESS_MAX       → hold_threshold → handle_hold_threshold()
+    #                                    status flips to "recording-armed"
+    #                                    + LED green + force-render. Audio
+    #                                    keeps recording.
+    #
+    #   release after threshold         → hold_release → handle_hold_release()
+    #                                    stops arecord, transcribe + route
+    #                                    (journal OR overseer chat by wake
+    #                                    phrase). Runs on background thread.
+    #
+    #   held past SHUTDOWN_PRESS_MS     → shutdown → sm.shutdown()
+    #
+    # Why this is different from Slice 12: the v12 design fired long_press
+    # AT 1.5s while still held, which truncated audio mid-hold. v12.1 uses
+    # release timing only (hold_release sees actual hold duration).
 
-    # Slice 12: companion-mode button vocabulary.
-    #
-    # On press start (any_press):  begin AudioCapture immediately.
-    # On release < short_press_max: tap → flag-this-moment (5s post-press).
-    # On release > short_press_max:  hold → transcribe + route (chat | journal).
-    #
-    # Implementation: button.py already fires any_press / short_press /
-    # long_press. companion_press_start() hooks any_press; the existing
-    # handle_short_press / handle_long_press branch on companion_mode
-    # at the top of their HOME-state arm.
+    def _force_render(self):
+        """Push an immediate frame to the LCD so the user sees state
+        transitions within ~10ms instead of waiting up to 125ms for
+        the next tick. Safe to call from any thread (PIL render is
+        fast, ~15ms typical on Pi Zero 2W)."""
+        try:
+            t0 = time.monotonic()
+            state = self.build_display_state()
+            if state is not None:
+                self.ctx.display.render(state)
+            dbg.event("RENDER force",
+                      ms=round((time.monotonic() - t0) * 1000, 1))
+        except Exception as _re:
+            logging.getLogger("states.companion").debug(
+                "force-render failed: %s", _re)
 
     def companion_press_start(self):
-        """Any-press hook: kick off AudioCapture for the held duration.
-        Wired in main.py via button.on('any_press', ...).
+        """any_press hook — Slice 12.1.2: now a no-op in toggle-record mode.
 
-        Slice 12 force-render: after setting companion_status, push an
-        immediate frame to the LCD so the user sees REC within ~50ms
-        instead of waiting up to 1/DISPLAY_UPDATE_HZ for the next tick.
-        Without this, on the previous 2Hz config the press was visibly
-        unresponsive (up to 500ms of "nothing happened").
-        """
-        if not self.companion_mode or not _OC_AVAILABLE:
-            return
+        Kept as a method (still wired in main._on_any_press for wake-only
+        press logic) but does nothing here. All recording logic moved to
+        _toggle_record_start / _toggle_record_stop, dispatched from
+        handle_short_press on the actual button RELEASE."""
+        return
+
+    def _toggle_record_start(self):
+        """Start a new recording. Sets _oc_recording, starts arecord,
+        flips screen to the active-recording timer view, LED green."""
         if self._oc_busy:
-            return  # already processing a previous turn
-        if self.app_state != "HOME":
-            return  # don't override menu / recording / shutdown states
+            dbg.event("RECORD start IGNORED busy")
+            return
         try:
             self._oc_audio.start()
-            self.companion_status = "armed"
+            self._oc_recording = True
+            self._oc_record_start_mono = time.monotonic()
+            self.companion_status = "recording"
+            self.companion_routed = ""
+            self.companion_message = ""
             self.last_interaction = time.monotonic()
-            # LED yellow during armed/recording for visible feedback
-            self.ctx.board.set_rgb(180, 180, 0)
-            # Force-render the LCD now (don't wait for next tick)
-            try:
-                state = self.build_display_state()
-                if state is not None:
-                    self.ctx.display.render(state)
-            except Exception as _re:
-                logging.getLogger("states.companion").debug(
-                    "force-render after press_start failed: %s", _re)
+            self.ctx.board.set_rgb(0, 200, 0)  # solid green
+            self.ctx.logger.log("companion_record_start")
+            dbg.event("RECORD start")
+            self._force_render()
         except Exception as e:
+            self._oc_recording = False
+            self._oc_record_start_mono = None
+            self.companion_status = ""
+            self.ctx.board.set_rgb(0, 0, 0)
             logging.getLogger("states.companion").exception(
-                "companion_press_start failed: %s", e)
+                "_toggle_record_start failed: %s", e)
+            dbg.event("RECORD start FAILED", error=str(e))
+            self._force_render()
+
+    def _toggle_record_stop(self, reason="user-tap"):
+        """Stop the active recording. Get the wav, clear state, kick off
+        the transcribe+route thread (which reuses _companion_run_hold)."""
+        if not self._oc_recording:
+            return
+        wav, actual_dur = self._oc_audio.stop()
+        self._oc_recording = False
+        elapsed = (
+            time.monotonic() - self._oc_record_start_mono
+            if self._oc_record_start_mono else 0
+        )
+        self._oc_record_start_mono = None
+        wav_bytes = (os.path.getsize(wav)
+                     if wav and os.path.exists(wav) else 0)
+        dbg.event("RECORD stop", reason=reason,
+                  elapsed=round(elapsed, 2),
+                  actual_dur=round(actual_dur, 2),
+                  wav_bytes=wav_bytes)
+        # Discard misclick / very-short recordings (no point transcribing
+        # 200ms of audio).
+        if not wav or actual_dur < self.OC_MIN_RECORD_S:
+            self.companion_status = ""
+            self.companion_message = ""
+            self.ctx.board.set_rgb(0, 0, 0)
+            self.ctx.logger.log("companion_record_too_short", {
+                "duration_s": round(actual_dur, 2),
+                "reason": reason,
+            })
+            self._force_render()
+            return
+        # Hand off to the transcribe+route worker thread (same path as
+        # the old hold-release flow).
+        threading.Thread(
+            target=self._companion_run_hold,
+            args=(wav, actual_dur),
+            name="oc-toggle", daemon=True,
+        ).start()
+        self.ctx.logger.log("companion_record_stop", {
+            "duration_s": round(actual_dur, 1),
+            "reason": reason,
+        })
+
+    # Slice 12.1.2: hold_threshold and hold_release callbacks are no
+    # longer wired to the physical button (see main.py). The toggle
+    # model uses release timing only — short_press fires on every release
+    # < SHORT_PRESS_MAX_MS, and that's all we need.
+    def handle_hold_threshold(self):
+        """No-op stub — kept for any caller still referencing it."""
+        return
+
+    def handle_hold_release(self, duration_s: float):
+        """No-op stub — kept for any caller still referencing it."""
+        return
 
     def _companion_run_flag(self):
-        """Run the flag-moment flow on a background thread so the
-        button callback returns immediately."""
-        result = {}
+        """Run the instant-flag flow on a background thread.
+
+        Slice 12.1: no audio capture — the flag is a timestamp marker.
+        See overseer_companion.handle_flag_moment for the rationale."""
         try:
             self._oc_busy = True
-            self.companion_status = "flag-recording"
+            self.companion_status = "flag-saved"
             self.companion_routed = "flag-moment"
-            self.ctx.board.set_rgb(220, 140, 0)  # solid amber
+            self.ctx.board.set_rgb(220, 0, 180)  # magenta flash
+            dbg.event("STATE -> flag-saved")
+            self._force_render()
+
             result = oc.handle_flag_moment(
-                self._oc_audio,
                 on_state=lambda s: setattr(self, "companion_status", s),
             )
-            self.companion_message = (result.get("transcript") or
-                                       "(silent flag)")
+            self.companion_message = (
+                f"flagged at {time.strftime('%H:%M:%S')}"
+            )
             self.ctx.logger.log("flag_moment", {
                 "ok": result.get("ok"),
-                "transcript_chars": len(result.get("transcript", "") or ""),
-                "stt_backend": result.get("stt_backend"),
                 "error": result.get("error"),
             })
-            # Hold the "FLAG SAVED" screen for a couple seconds
-            self.companion_status = "flag-saved"
-            self.ctx.board.set_rgb(0, 200, 0)
-            time.sleep(2.0)
+            dbg.event("FLAG saved", ok=result.get("ok"))
+            self._force_render()
+            time.sleep(1.5)  # short hold — flag is instant
         finally:
             self._oc_busy = False
             self.companion_status = ""
             self.companion_message = ""
             self.companion_routed = ""
             self.ctx.board.set_rgb(0, 0, 0)
+            self._force_render()
 
     def _companion_run_hold(self, wav_path, duration):
-        """Run the hold-release flow on a background thread."""
+        """Run the hold-release flow on a background thread.
+
+        Slice 12.1: now force-renders after every status change so the
+        user sees 'transcribing…' / 'asking overseer…' / 'saved' within
+        ~50ms of each transition."""
         try:
             self._oc_busy = True
 
             def _state_cb(name):
                 self.companion_status = name
-                # LED state mapping
                 if name == "transcribing":
-                    self.ctx.board.set_rgb_fade(0, 100, 200, 200)  # blue
+                    self.ctx.board.set_rgb_fade(0, 100, 200, 200)
                 elif name == "asking-overseer":
                     self.ctx.board.set_rgb_fade(0, 60, 220, 200)
                 elif name == "reply-speaking":
-                    self.ctx.board.set_rgb_fade(0, 200, 0, 300)  # green
+                    self.ctx.board.set_rgb_fade(0, 200, 200, 300)  # cyan
                 elif name in ("saving-journal", "saved"):
                     self.ctx.board.set_rgb_fade(0, 220, 80, 300)
                 elif name == "idle":
                     self.ctx.board.set_rgb(0, 0, 0)
+                dbg.event("STATE -> " + name)
+                self._force_render()
 
             result = oc.handle_hold_release(
                 wav_path, duration, on_state=_state_cb)
             routed = result.get("routed", "")
             self.companion_routed = routed
-            # Pick the message to show:
-            # - overseer chat → the assistant's reply
-            # - journal       → the transcript itself
             if routed == "overseer-chat":
                 self.companion_message = (result.get("reply") or
                                            "(empty reply)")
@@ -581,9 +689,14 @@ class StateManager:
                 "duration_s": round(duration, 1),
                 "error": result.get("error"),
             })
-            # Hold the completion screen for ~3 seconds so the user
-            # can read the result.
-            self.companion_status = "saved" if routed != "overseer-chat" else "reply-speaking"
+            dbg.event("HOLD complete", routed=routed,
+                      ok=result.get("ok"),
+                      stt=result.get("stt_backend"))
+            # Hold the completion screen for 3 seconds so user can read it
+            self.companion_status = (
+                "saved" if routed != "overseer-chat" else "reply-speaking"
+            )
+            self._force_render()
             time.sleep(3.0)
         finally:
             self._oc_busy = False
@@ -591,6 +704,7 @@ class StateManager:
             self.companion_message = ""
             self.companion_routed = ""
             self.ctx.board.set_rgb(0, 0, 0)
+            self._force_render()
 
     def handle_short_press(self):
         self.wake_display()
@@ -598,24 +712,34 @@ class StateManager:
         stt = self.ctx.stt
         recorder = self.ctx.recorder
 
-        # Slice 12: in companion mode + HOME, short press = flag-moment.
-        # Cancel the in-progress AudioCapture (started in any_press)
-        # because flag-moment does its own 5s post-press capture.
+        # Slice 12.1 wake-press: if this press was just a screen wake,
+        # swallow the release and do nothing else.
+        if self._oc_wake_only_press:
+            self._oc_wake_only_press = False
+            dbg.event("SHORT-PRESS swallowed (wake-only press)")
+            return
+
+        # Slice 12.1.2 toggle-record:
+        #   - not recording → start recording (timer + green LED)
+        #   - already recording → stop, transcribe, route, save
+        # The transcribe+route work happens on a background thread so the
+        # button handler returns immediately.
         if (
             self.companion_mode
             and _OC_AVAILABLE
             and self.app_state == "HOME"
             and self._oc_audio is not None
         ):
-            try:
-                self._oc_audio.stop()  # discard the brief tap audio
-            except Exception:
-                pass
-            threading.Thread(
-                target=self._companion_run_flag,
-                name="oc-flag", daemon=True,
-            ).start()
-            logger.log("companion_flag_press")
+            # If a previous transcribe/save is still running (rare —
+            # only if the user taps very fast right after stopping),
+            # ignore the press to avoid clobbering state.
+            if self._oc_busy:
+                dbg.event("SHORT-PRESS IGNORED busy")
+                return
+            if self._oc_recording:
+                self._toggle_record_stop(reason="user-tap")
+            else:
+                self._toggle_record_start()
             return
 
         if self.app_state == "HOME":
@@ -668,34 +792,13 @@ class StateManager:
             self.pause_start_mono = None
 
     def handle_long_press(self):
+        """Legacy long_press handler — companion-mode path moved to
+        handle_hold_release in Slice 12.1. The physical button no longer
+        wires to long_press in companion mode (see main.py). This is
+        still called by gamepad action handlers in legacy RECORDING/
+        PAUSED app states.
+        """
         self.wake_display()
-
-        # Slice 12: in companion mode + HOME, long press = the user
-        # held the button to record. The AudioCapture was started by
-        # any_press (companion_press_start). Stop it now and run the
-        # transcribe + route logic.
-        if (
-            self.companion_mode
-            and _OC_AVAILABLE
-            and self.app_state == "HOME"
-            and self._oc_audio is not None
-        ):
-            wav, dur = self._oc_audio.stop()
-            if not wav:
-                self.ctx.board.set_rgb(0, 0, 0)
-                self.ctx.logger.log("companion_hold_empty", {
-                    "duration_s": round(dur, 1),
-                })
-                return
-            threading.Thread(
-                target=self._companion_run_hold,
-                args=(wav, dur),
-                name="oc-hold", daemon=True,
-            ).start()
-            self.ctx.logger.log("companion_hold_release", {
-                "duration_s": round(dur, 1),
-            })
-            return
 
         if self.app_state in ("RECORDING", "PAUSED"):
             elapsed = round(self.ctx.recorder.get_session_elapsed(), 1)
@@ -871,13 +974,23 @@ class StateManager:
                 except Exception as e:
                     logger.log("ble_error", {"error": str(e), "raw": msg[:200]})
 
+        # ── Slice 12.1.2: toggle-record auto-cap ─────────────────
+        # If the user starts a recording and forgets / walks away, we
+        # don't want to record forever. Auto-stop + save at the cap.
+        if self.companion_mode and self._oc_recording and self._oc_record_start_mono:
+            elapsed = time.monotonic() - self._oc_record_start_mono
+            if elapsed > self.OC_MAX_RECORD_S:
+                dbg.event("RECORD auto-stop (cap)",
+                          elapsed=round(elapsed, 1))
+                self._toggle_record_stop(reason="max-duration-cap")
+
         # ── Display auto-off ─────────────────────────────────────
         # Slice 12: keep the screen awake while a companion flow is
         # in progress (recording / transcribing / asking-overseer /
         # speaking). Otherwise the 60s timeout can blank the LCD
         # mid-flow on a long overseer reply.
         if self.companion_mode and (
-            self.companion_status or self._oc_busy
+            self.companion_status or self._oc_busy or self._oc_recording
         ):
             self.last_interaction = time.monotonic()
         if self.backlight_on and (time.monotonic() - self.last_interaction > DISPLAY_TIMEOUT_S):
@@ -938,6 +1051,13 @@ class StateManager:
                 self, "companion_message", "") or ""
             state.companion_routed = getattr(
                 self, "companion_routed", "") or ""
+            # Slice 12.1.2: live timer for the toggle-record screen
+            if self._oc_recording and self._oc_record_start_mono:
+                state.recording_elapsed_s = (
+                    time.monotonic() - self._oc_record_start_mono
+                )
+            else:
+                state.recording_elapsed_s = 0
             try:
                 state.journal_queue_depth = oc.journal_queue_depth()
             except Exception:

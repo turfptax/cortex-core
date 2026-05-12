@@ -176,9 +176,13 @@ def main():
     if http_server:
         http_server.context_fn = sm.get_cortex_context
 
-    # Wire button callbacks
+    # Wire button callbacks (Slice 12.1.2: toggle-record model uses
+    # release timing only. handle_short_press toggles the recording
+    # state on every tap. hold_threshold + hold_release are no longer
+    # wired — the threshold-based dispatch was unreliable on Pi Zero
+    # 2W when the main loop got backlogged, and the user had no way to
+    # see the screen flip from "pressed" to "recording".)
     button.on("short_press", sm.handle_short_press)
-    button.on("long_press", sm.handle_long_press)
     button.on("shutdown", sm.shutdown)
 
     # Slice 12: kick off the notification watcher (best-effort).
@@ -193,13 +197,16 @@ def main():
         sm.notification_watcher = None
 
     def _on_any_press():
-        # Slice 12: any_press both wakes the display AND starts the
-        # AudioCapture for companion mode. The capture is canceled
-        # (via stop+discard) by handle_short_press if the release fires
-        # the tap path; or stopped+routed by handle_long_press if the
-        # release fires the hold path.
+        # Slice 12.1.2 wake-on-press:
+        # - If the backlight was OFF when this press arrived, mark this
+        #   press as wake-only — handle_short_press will swallow the
+        #   matching release without toggling recording.
+        # - If the backlight was already ON, just wake_display (refresh
+        #   the idle timer); the short_press handler will toggle record
+        #   start/stop based on _oc_recording state.
+        was_asleep = not sm.backlight_on
         sm.wake_display()
-        sm.companion_press_start()
+        sm._oc_wake_only_press = was_asleep
     button.on("any_press", _on_any_press)
 
     led.set_state("stt_idle")
@@ -209,22 +216,41 @@ def main():
     })
 
     # ── Main loop ────────────────────────────────────────────────
+    # Slice 12.1.2: instrument each step so we can find slow loop
+    # iterations that drop framerate. dbg.event is no-op when
+    # CORTEX_DEBUG=0.
+    from debug import dbg as _dbg
     try:
         while True:
             loop_start = time.monotonic()
 
+            t0 = loop_start
             button.check_held()
+            t1 = time.monotonic()
 
             for action in gamepad.poll():
                 sm.handle_gamepad(action)
+            t2 = time.monotonic()
 
             sm.tick()
+            t3 = time.monotonic()
 
             # Render display
             if sm.backlight_on:
                 render_state = sm.build_display_state()
                 if render_state is not None:
                     display.render(render_state)
+            t4 = time.monotonic()
+
+            # Only log if total iteration > 100ms (i.e. below 10 fps)
+            iter_ms = (t4 - t0) * 1000
+            if iter_ms > 100:
+                _dbg.event("LOOP slow",
+                           total_ms=round(iter_ms, 1),
+                           btn_ms=round((t1 - t0) * 1000, 1),
+                           pad_ms=round((t2 - t1) * 1000, 1),
+                           tick_ms=round((t3 - t2) * 1000, 1),
+                           render_ms=round((t4 - t3) * 1000, 1))
 
             elapsed = time.monotonic() - loop_start
             sleep_time = sm.loop_interval - elapsed

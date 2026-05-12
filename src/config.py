@@ -56,9 +56,17 @@ COLOR_CIRCUIT_PRIMARY = (12, 20, 35)  # Very subtle trace lines
 COLOR_CIRCUIT_NODE = (16, 28, 45)     # Junction dots (slightly brighter)
 
 # Button timing (milliseconds)
-SHORT_PRESS_MAX_MS = 500
+# Slice 12.1 (2026-05-09): SHORT_PRESS_MAX_MS doubles as the
+# "you've crossed into hold-mode" threshold for companion-mode UX.
+# Was 500ms; lowered to 350 because 500 is long enough that users
+# overshoot taps. Also raised SHUTDOWN_PRESS_MS from 5000 -> 7000
+# so a moderately-long hold-record (e.g. 5-6 sec voice memo) doesn't
+# trip shutdown. LONG_PRESS_MS is now legacy — kept for the gamepad
+# action handlers that still call handle_long_press, but the physical
+# button no longer wires to it (button.py uses hold_threshold/release).
+SHORT_PRESS_MAX_MS = 350
 LONG_PRESS_MS = 1500
-SHUTDOWN_PRESS_MS = 5000
+SHUTDOWN_PRESS_MS = 7000
 
 # Byte rate for disk capacity calculation
 BYTE_RATE = SAMPLE_RATE * CHANNELS * 2  # 16-bit = 2 bytes per sample
@@ -102,7 +110,14 @@ UPLOADS_DIR = os.path.join(HOME, "uploads")
 # BATTERY_DREAM_MIN_PCT) now live with the plugin.
 
 # Gamepad (8BitDo Micro via evdev)
-GAMEPAD_ENABLED = True
+# Slice 12.1.2 (2026-05-09): GAMEPAD_ENABLED is now env-overridable.
+# On .132 (Pi Zero 2W companion), the gamepad isn't used (single board
+# button is the input device). The bluetoothctl scan inside
+# gamepad.poll() blocks the main loop for 5-13 seconds per attempt,
+# which made the on-screen recording timer update once every ~10s
+# instead of 8x per second. Set CORTEX_GAMEPAD_ENABLED=0 in the
+# systemd unit on .132 to skip the scan entirely.
+GAMEPAD_ENABLED = os.environ.get("CORTEX_GAMEPAD_ENABLED", "1") != "0"
 GAMEPAD_DEVICE_NAME = "8BitDo"
 GAMEPAD_MAC = "E4:17:D8:68:7C:ED"  # 8BitDo Micro in Android/D-input mode
 GAMEPAD_REPEAT_DELAY_S = 0.4   # seconds before auto-repeat starts

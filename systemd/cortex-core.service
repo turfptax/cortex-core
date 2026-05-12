@@ -8,6 +8,25 @@ Type=simple
 User=root
 WorkingDirectory=/home/turfptax/cortex-core/src
 Environment=PYTHONUNBUFFERED=1
+# Slice 12.1 (2026-05-09): CORTEX_DEBUG=1 turns on debug.py event ring
+# buffer + INFO-level emission to journalctl. Set to 0 (or remove this
+# line) once the button + LCD UX is verified working — debug logging is
+# a non-trivial chatty footprint on a 416 MB Pi.
+# Toggle without editing this file:
+#   sudo systemctl set-environment CORTEX_DEBUG=0  (or 1)
+#   sudo systemctl restart cortex-core
+# Slice 12.1.2: CORTEX_DEBUG=1 enables the cortex.dbg ring-buffer + journal
+# events (button events, state transitions, render timing, STT backend,
+# loop slowness). Default off in production — flip to 1 when investigating
+# a specific issue, then back to 0 once it's resolved.
+Environment=CORTEX_DEBUG=0
+# Slice 12.1.2 (.132 only — pi zero 2w companion): the 8BitDo gamepad
+# isn't paired with this device, and gamepad.poll() runs a blocking
+# bluetoothctl scan every ~13s that freezes the main loop for 5-13s
+# at a time (= recording-screen timer only updates once every 10s).
+# Set to 0 here so .132 skips the scan entirely. Remove this line on
+# any device that actually uses the gamepad.
+Environment=CORTEX_GAMEPAD_ENABLED=0
 ExecStart=/usr/bin/python3 /home/turfptax/cortex-core/src/main.py
 Restart=on-failure
 RestartSec=5

@@ -95,6 +95,10 @@ class DisplayState:
     overseer_loop_running: bool = False
     notification_preview: str = ""     # latest unread notification preview text
     journal_queue_depth: int = 0       # local queue depth (offline degrade)
+    # Slice 12.1.2 toggle-record: seconds elapsed since the user pressed
+    # to start the active recording. Updated every render frame from
+    # StateManager._oc_record_start_mono. Drives the on-screen timer.
+    recording_elapsed_s: float = 0     # 0 when not recording
 
     def get(self, key: str, default: Any = None) -> Any:
         """Dict-style access for backward compat with tamagotchi_display.py."""

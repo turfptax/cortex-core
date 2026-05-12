@@ -418,31 +418,26 @@ def flush_journal_queue() -> int:
 
 # ── Top-level dispatch ──────────────────────────────────────────
 
-def handle_flag_moment(audio: AudioCapture, on_state=None) -> dict:
-    """Short-tap: record 5s post-press audio, transcribe, save as
-    flag-moment. Returns result dict.
+def handle_flag_moment(on_state=None) -> dict:
+    """Slice 12.1: instant flag — saves a timestamped marker to the
+    journal with NO audio capture. Tap-and-forget UX.
 
-    on_state(name) callback fires for LED/display sync at each phase.
-    Phases: 'flag-recording' → 'flag-transcribing' → 'flag-saved'."""
-    if on_state:
-        on_state("flag-recording")
-    wav = audio.fixed_capture(FLAG_RECORD_S)
-    if on_state:
-        on_state("flag-transcribing")
-    if not wav:
-        return {"ok": False, "error": "no audio captured"}
-    text, backend = transcribe(wav)
+    Tory's stated intent for flag-this-moment is "quickly tag the
+    present moment in passing" (often hands busy / attention elsewhere).
+    Doing a 5s post-press capture defeats that — the user has to wait
+    out the recording, and during the wait they probably forgot what
+    they were flagging. Pre-roll buffer (capture the 5s BEFORE the tap)
+    is a future enhancement; for now flag is just a timestamp.
+
+    on_state(name) callback fires once with 'flag-saved' for LED/LCD
+    sync. Synchronous; ~50-300ms total (network round trip)."""
     ts = time.strftime("%H:%M:%S")
-    body = f"[flag at {ts}] {text}" if text else f"[flag at {ts}] (silent)"
+    body = f"[flagged at {ts}]"
     result = post_journal(body, entry_type="flag-moment")
-    result["transcript"] = text
-    result["stt_backend"] = backend
+    result["transcript"] = ""
+    result["stt_backend"] = "none"
     if on_state:
         on_state("flag-saved")
-    try:
-        os.unlink(wav)
-    except OSError:
-        pass
     return result
 
 

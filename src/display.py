@@ -1,15 +1,31 @@
-"""Display UI renderer for the 240x280 ST7789P3 via WhisPlay driver."""
+"""Display UI renderer for the 240x280 ST7789P3 via WhisPlay driver.
+
+Slice 12.1: _flush() rewritten to use numpy-vectorized RGB->RGB565
+conversion. The pure-Python loop was the dominant cost (~365ms per
+frame on Pi Zero 2W), which blocked the main loop, blocked button
+event dispatch, and made the device feel frozen during companion-mode
+press handling. Numpy version benches at ~15-30ms — fast enough that
+DISPLAY_UPDATE_HZ=8 is comfortable and force-render adds real value.
+"""
 
 import time
 
 from PIL import Image, ImageDraw, ImageFont
+
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    _HAS_NUMPY = False
 
 from config import (
     DISPLAY_WIDTH, DISPLAY_HEIGHT, SEGMENT_SECONDS,
     FONT_PATH, FONT_PATH_REGULAR, FONT_LARGE, FONT_MEDIUM, FONT_SMALL,
     COLOR_BG, COLOR_TEXT, COLOR_DIM, COLOR_RED, COLOR_GREEN,
     COLOR_YELLOW, COLOR_BLUE, COLOR_BAR_BG, COLOR_CYAN, COLOR_CYAN_DIM,
+    COLOR_MAGENTA,
 )
+from debug import dbg
 
 
 def _format_duration(seconds):
@@ -73,47 +89,163 @@ class Display:
     def render(self, state):
         """Render full frame from application state dict.
 
-        Dispatches to the appropriate screen renderer based on app_state
-        + Slice 12 companion_status. The HOME / STT_IDLE branch is now
-        the companion-aware home (overseer status digest + button hint),
-        and four new screens cover the recording / processing / done
-        states of the voice flows.
+        Slice 12.1 dispatch: companion_status WINS over app_state.
+        Whenever a companion flow is active (status non-empty), we route
+        to the appropriate companion screen regardless of what app_state
+        says. This fixes the v12 bug where the recording screen never
+        painted on a fast tap because app_state was still HOME.
         """
         self.draw.rectangle([0, 0, self.W, self.H], fill=COLOR_BG)
 
         app = state.get("app_state", "STT_IDLE")
         cstatus = state.get("companion_status", "") or ""
 
-        # Slice 12: companion-mode dispatch — when the StateManager is
-        # running an overseer flow, the companion_status overrides the
-        # app_state-based render.
-        if cstatus in ("armed", "flag-recording", "flag-transcribing"):
+        # Companion-status routing — absolute, regardless of app_state.
+        # Slice 12.1.2 trace: dbg-log which renderer ran so we can see
+        # if a frame "looks black" because the renderer drew nothing,
+        # or because dispatch went somewhere unexpected.
+        renderer = "unknown"
+        if cstatus == "recording":
+            # Slice 12.1.2 toggle-record: active recording with timer.
+            self._render_companion_recording_active(state)
+            renderer = "rec_active"
+        elif cstatus == "pressed":
+            self._render_companion_pressed(state)
+            renderer = "pressed"
+        elif cstatus in ("recording-armed", "armed",
+                         "flag-recording", "flag-transcribing"):
+            # 'armed', 'flag-recording', 'flag-transcribing' are legacy
+            # v12 status names kept for backwards compat during deploy.
             self._render_companion_recording(state)
-        elif cstatus in ("transcribing", "asking-overseer"):
+            renderer = "rec_legacy"
+        elif cstatus in ("transcribing", "asking-overseer",
+                         "saving-journal"):
             self._render_companion_processing(state)
-        elif cstatus in ("reply-speaking", "saving-journal", "saved",
-                         "flag-saved"):
+            renderer = "processing"
+        elif cstatus in ("reply-speaking", "saved", "flag-saved"):
             self._render_companion_done(state)
+            renderer = "done"
+        elif cstatus:
+            # Unknown companion_status — render a generic processing
+            # screen so the LCD never goes blank mid-flow.
+            self._render_companion_processing(state)
+            renderer = f"unknown:{cstatus}"
         elif app in ("HOME", "STT_IDLE"):
             self._render_companion_home(state)
+            renderer = "home"
         elif app == "STT_LISTENING":
             self._render_stt_listening(state)
+            renderer = "stt_list"
         elif app == "NOTE_TAKING":
             self._render_note_taking(state)
+            renderer = "note"
         elif app in ("RECORDING", "PAUSED", "IDLE"):
             self._draw_status_bar(state)
             self._draw_segment_info(state)
             self._draw_progress_bar(state)
             self._draw_session_stats(state)
             self._draw_footer(state)
+            renderer = "rec_legacy_app"
         else:
-            # Unknown app_state — fall back to companion home so the
-            # screen is never blank.
             self._render_companion_home(state)
+            renderer = "home_fallback"
+        # Throttle: only log renderer name on dispatch CHANGE so we don't
+        # spam the journal with "rec_active rec_active rec_active...".
+        if renderer != getattr(self, "_last_renderer", None):
+            dbg.event("RENDER dispatch", to=renderer,
+                      cstatus=cstatus, app=app)
+            self._last_renderer = renderer
 
         self._flush()
 
-    # ---- Slice 12: companion-mode screens ----
+    # ---- Slice 12 / 12.1: companion-mode screens ----
+
+    def _render_companion_recording_active(self, state):
+        """Slice 12.1.2: active toggle-record screen with elapsed timer.
+
+        Layout (240×280 portrait):
+          - Clock top-left, dim
+          - Big green REC dot top-center
+          - HUGE elapsed timer (MM:SS) center
+          - Hint at bottom: 'press button to save'
+        """
+        time_str = state.get("time_str", "--:--")
+        elapsed = max(0.0, float(state.get("recording_elapsed_s", 0)))
+        mm = int(elapsed) // 60
+        ss = int(elapsed) % 60
+        timer = f"{mm:02d}:{ss:02d}"
+
+        # Clock
+        self.draw.text((10, 6), time_str,
+                       fill=COLOR_DIM, font=self.font_sm)
+
+        # REC dot top-center
+        cx, cy, r = self.W // 2, 50, 18
+        self.draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=COLOR_RED)
+        self.draw.text((cx - 16, cy - 9), "REC",
+                       fill=COLOR_BG, font=self.font_sm)
+
+        # Big timer (use the largest available font; if too small, just
+        # render font_lg twice as bold-looking by drawing it 2px offset)
+        bw_lg = self.font_lg.getbbox(timer)[2]
+        # Draw timer in bright green at vertical center
+        ty = 110
+        # Center horizontally
+        tx = (self.W - bw_lg) // 2
+        # Render twice for "bold" effect (no actual bold font available)
+        self.draw.text((tx, ty), timer,
+                       fill=COLOR_GREEN, font=self.font_lg)
+        self.draw.text((tx + 1, ty), timer,
+                       fill=COLOR_GREEN, font=self.font_lg)
+
+        # Secondary timer label
+        sub = "recording…"
+        sw = self.font_md.getbbox(sub)[2]
+        self.draw.text(((self.W - sw) // 2, 160), sub,
+                       fill=COLOR_TEXT, font=self.font_md)
+
+        # Bottom hint
+        self.draw.line([(14, 220), (self.W - 14, 220)],
+                       fill=COLOR_DIM, width=1)
+        hint = "press button to save"
+        hw = self.font_sm.getbbox(hint)[2]
+        self.draw.text(((self.W - hw) // 2, 232), hint,
+                       fill=COLOR_GREEN, font=self.font_sm)
+        hint2 = 'or say "hey overseer" to chat'
+        hw2 = self.font_sm.getbbox(hint2)[2]
+        self.draw.text(((self.W - hw2) // 2, 250), hint2,
+                       fill=COLOR_DIM, font=self.font_sm)
+
+    def _render_companion_pressed(self, state):
+        """Slice 12.1: shown WHILE the button is held but before the
+        SHORT_PRESS_MAX_MS threshold. Tells the user 'you're pressing —
+        release now to flag, keep holding to record'.
+
+        The bottom hint flips at the threshold (handled by render dispatch
+        which switches to _render_companion_recording when companion_status
+        becomes 'recording-armed')."""
+        time_str = state.get("time_str", "--:--")
+        self.draw.text((10, 6), time_str,
+                       fill=COLOR_DIM, font=self.font_sm)
+
+        # Big yellow circle centered, growing implication
+        cx, cy, r = self.W // 2, 90, 30
+        self.draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                          outline=COLOR_YELLOW, width=4)
+        self.draw.text((cx - 18, cy - 9), "...",
+                       fill=COLOR_YELLOW, font=self.font_md)
+
+        # Primary cue
+        msg = "release: flag this"
+        bw = self.font_md.getbbox(msg)[2]
+        self.draw.text(((self.W - bw) // 2, 150), msg,
+                       fill=COLOR_TEXT, font=self.font_md)
+
+        # Secondary cue
+        msg2 = "keep holding: record"
+        bw = self.font_sm.getbbox(msg2)[2]
+        self.draw.text(((self.W - bw) // 2, 180), msg2,
+                       fill=COLOR_DIM, font=self.font_sm)
 
     def _render_companion_home(self, state):
         """Idle home screen for the overseer companion role.
@@ -164,15 +296,15 @@ class Display:
         self.draw.text(((self.W - bw) // 2, y), digest,
                        fill=COLOR_DIM, font=self.font_sm)
 
-        # Button vocabulary hint
+        # Button vocabulary hint (Slice 12.1.2: toggle-record model)
         y = 116
-        self.draw.text((14, y), "Hold: record + route",
+        self.draw.text((14, y), "tap: start recording",
+                       fill=COLOR_GREEN, font=self.font_md)
+        y += 26
+        self.draw.text((14, y), "tap again: save",
                        fill=COLOR_TEXT, font=self.font_md)
         y += 26
-        self.draw.text((14, y), "Tap:  flag this moment",
-                       fill=COLOR_TEXT, font=self.font_md)
-        y += 26
-        self.draw.text((14, y), 'Say "hey overseer" to chat',
+        self.draw.text((14, y), 'say "hey overseer" to chat',
                        fill=COLOR_CYAN, font=self.font_sm)
 
         # Bottom strip — notification preview OR last tick
@@ -192,28 +324,34 @@ class Display:
                            fill=COLOR_DIM, font=self.font_sm)
 
     def _render_companion_recording(self, state):
-        """Big REC screen — visible from across a room."""
+        """Big REC screen — visible from across a room.
+
+        Slice 12.1: copy revised. 'recording-armed' is the new primary
+        state name; the legacy v12 names still map for safety during
+        the rolling deploy window."""
         time_str = state.get("time_str", "--:--")
         cstatus = state.get("companion_status", "") or ""
         self.draw.text((10, 6), time_str,
                        fill=COLOR_DIM, font=self.font_sm)
 
         cx, cy, r = self.W // 2, 90, 36
-        self.draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=COLOR_RED)
+        self.draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                          fill=COLOR_GREEN)  # was COLOR_RED — green = recording journal
         self.draw.text((cx - 22, cy - 14), "REC",
                        fill=COLOR_BG, font=self.font_md)
 
         label_map = {
-            "armed": "ARMED — release to confirm",
-            "flag-recording": "FLAGGING — 5 sec",
-            "flag-transcribing": "Transcribing flag…",
+            "recording-armed": "recording…",
+            "armed": "recording…",                    # legacy
+            "flag-recording": "flagging…",            # legacy
+            "flag-transcribing": "transcribing flag…", # legacy
         }
-        label = label_map.get(cstatus, cstatus.upper())
+        label = label_map.get(cstatus, cstatus)
         bw = self.font_md.getbbox(label)[2]
         self.draw.text(((self.W - bw) // 2, 160), label,
                        fill=COLOR_TEXT, font=self.font_md)
 
-        hint = "Release to save"
+        hint = "release to save"
         bw = self.font_sm.getbbox(hint)[2]
         self.draw.text(((self.W - bw) // 2, 240), hint,
                        fill=COLOR_DIM, font=self.font_sm)
@@ -627,7 +765,48 @@ class Display:
             self.draw.text((14, y + 16), "Hold: Stop | Hold 5s: Off", fill=COLOR_DIM, font=self.font_sm)
 
     def _flush(self):
-        """Convert PIL RGB image to RGB565 bytes and send to display."""
+        """Convert PIL RGB image to RGB565 bytes and send to display.
+
+        Slice 12.1: numpy-vectorized fast path. The legacy pure-Python
+        loop is still here as a fallback for environments without numpy
+        (shouldn't happen on the Pi but keeping the code path for safety).
+        """
+        t0 = time.monotonic()
+        if _HAS_NUMPY:
+            buf = self._flush_numpy()
+            t_conv = time.monotonic()
+            self.board.draw_image(0, 0, self.W, self.H, buf)
+        else:
+            self._flush_python()
+            t_conv = time.monotonic()
+        t1 = time.monotonic()
+        # Only log when meaningfully slow (>30ms) to avoid spam
+        total_ms = (t1 - t0) * 1000
+        if total_ms > 30:
+            dbg.event("RENDER flush slow",
+                      total_ms=round(total_ms, 1),
+                      conv_ms=round((t_conv - t0) * 1000, 1),
+                      spi_ms=round((t1 - t_conv) * 1000, 1),
+                      backend="numpy" if _HAS_NUMPY else "python")
+
+    def _flush_numpy(self):
+        """Vectorized RGB888 -> RGB565 (big-endian) using numpy.
+        Returns a Python list of ints (matches WhisPlay board API)."""
+        rgb = np.asarray(self.img, dtype=np.uint8)  # (H, W, 3)
+        r = rgb[:, :, 0].astype(np.uint16)
+        g = rgb[:, :, 1].astype(np.uint16)
+        b = rgb[:, :, 2].astype(np.uint16)
+        rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        flat = rgb565.ravel()
+        # Big-endian: high byte first then low byte. Two strided assigns.
+        buf = np.empty(flat.size * 2, dtype=np.uint8)
+        buf[0::2] = (flat >> 8).astype(np.uint8)
+        buf[1::2] = (flat & 0xFF).astype(np.uint8)
+        return buf.tolist()
+
+    def _flush_python(self):
+        """Legacy pure-Python conversion (slow — ~350ms on Pi Zero 2W).
+        Kept as a fallback for environments without numpy."""
         pixels = self.img.tobytes()
         buf = self._buf
         idx = 0
