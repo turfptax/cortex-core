@@ -180,9 +180,27 @@ class OverseerPlugin(Plugin):
                 "working_memory_status": "cache-corrupt",
                 "working_memory_error": str(e)[:200],
             }
+        # Slice 9.2 (overseer ask #2): compute the cache age at READ time
+        # so the consumer doesn't have to. The overseer flagged that
+        # it was confidently citing stale top_projects last_touched
+        # without knowing how long ago the snapshot was built. With
+        # working_memory_age_minutes in the static context, it can
+        # gate its own confidence statements on freshness.
+        age_minutes = None
+        if built_at:
+            try:
+                from datetime import datetime, timezone
+                b = datetime.fromisoformat(built_at.replace("Z", "+00:00"))
+                age_minutes = max(
+                    0,
+                    int((datetime.now(timezone.utc) - b).total_seconds() / 60),
+                )
+            except Exception:
+                age_minutes = None
         return {
             "working_memory": wm,
             "working_memory_built_at": built_at,
+            "working_memory_age_minutes": age_minutes,
             "working_memory_status": "fresh",
         }
 
@@ -2005,7 +2023,28 @@ class OverseerPlugin(Plugin):
             wm = json.loads(cached)
         except Exception as e:
             return {"ok": False, "error": "cached wm corrupt: " + str(e)}
-        return {"ok": True, "working_memory": wm, "source": "cache"}
+        # Slice 9.2 (overseer ask #2): surface built_at + age_minutes at
+        # the top level too, so any /working-memory consumer (Hub UI,
+        # MCP, sibling-Claude check-in scripts) has the same staleness
+        # signal the chat-context path now exposes.
+        built_at = wm.get("built_at") or self.overseer_db.get_overseer_state(
+            "working_memory_built_at")
+        age_minutes = None
+        if built_at:
+            try:
+                from datetime import datetime, timezone
+                b = datetime.fromisoformat(built_at.replace("Z", "+00:00"))
+                age_minutes = max(
+                    0,
+                    int((datetime.now(timezone.utc) - b).total_seconds() / 60),
+                )
+            except Exception:
+                age_minutes = None
+        return {
+            "ok": True, "working_memory": wm, "source": "cache",
+            "working_memory_built_at": built_at,
+            "working_memory_age_minutes": age_minutes,
+        }
 
 
     # ── Slice 3e handlers ───────────────────────────────────────

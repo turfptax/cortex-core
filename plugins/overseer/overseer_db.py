@@ -1318,6 +1318,104 @@ class OverseerDB(CortexDB):
         ).fetchone()
         return dict(row) if row else None
 
+    # ── Slice 9.2 (overseer ask #2): staleness signals ─────────────
+    # The overseer asked to see its own ingest backlog + last-gist
+    # freshness in the working_memory artifact so it can tell whether
+    # quiet stretches reflect user absence or ingest stall. Both reads
+    # are O(table-scan-with-filter); summaries_gist has idx_gist_created.
+
+    def last_successful_gist_at(self) -> str | None:
+        """ISO timestamp of the most recent summaries_gist row, or None
+        if the table is empty. Used by working_memory so the overseer
+        can compute how long it's been since a fresh observation."""
+        row = self._conn.execute(
+            "SELECT MAX(created_at) AS last FROM summaries_gist"
+        ).fetchone()
+        return row["last"] if row and row["last"] else None
+
+    def recent_gist_source_distribution(self, recent_n: int = 30) -> dict:
+        """Of the most-recent N gists, what's the source/origin breakdown?
+
+        Used by the chat freshness section so the overseer can self-detect
+        sampling bias — e.g. "my last 30 gists are all chatgpt-archive
+        rollups while 906 grok-com sessions sit unprocessed". The overseer
+        flagged this as ask #2-followup; round 3 then learned that gists
+        come from two paths and only one of them uses `source:` tags:
+
+          path 1 — import-summary (one gist per imported_session):
+            tag `source:<value>` (chatgpt | claude-code | grok-com | grok-twitter)
+          path 2 — automation_rollup (one gist per project per period):
+            tags `auto`, `automation-rollup`, `project:<value>`. No source: tag.
+
+        So we report a combined "origin" view: source: tags first (true
+        per-session content), then project: tags for rollups (aggregate
+        signal but at least labeled), then untagged as a final bucket.
+
+        Returns {"window_size": int, "by_origin": {label: count},
+                 "untagged": int}. Each origin label is prefixed with its
+        tag type, e.g. "source:grok-com" or "rollup:chatgpt-archive"."""
+        rows = self._conn.execute(
+            "SELECT id FROM summaries_gist "
+            "ORDER BY created_at DESC LIMIT ?",
+            (int(recent_n),),
+        ).fetchall()
+        if not rows:
+            return {"window_size": 0, "by_origin": {}, "untagged": 0}
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        tag_rows = self._conn.execute(
+            f"SELECT row_id, tag FROM tags "
+            f"WHERE table_name = 'summaries_gist' "
+            f"  AND row_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        # Bucket each gist by its strongest origin signal
+        by_gist: dict[int, str] = {}
+        for tr in tag_rows:
+            tag = tr["tag"]
+            row_id = tr["row_id"]
+            if tag.startswith("source:"):
+                # source: wins (it's the per-session content tag)
+                by_gist[row_id] = "source:" + tag.split(":", 1)[1]
+            elif (tag.startswith("project:")
+                  and row_id not in by_gist):
+                # project: is the fallback for rollups
+                by_gist[row_id] = "rollup:" + tag.split(":", 1)[1]
+        by_origin: dict[str, int] = {}
+        for origin in by_gist.values():
+            by_origin[origin] = by_origin.get(origin, 0) + 1
+        return {
+            "window_size": len(ids),
+            "by_origin": by_origin,
+            "untagged": len(ids) - len(by_gist),
+        }
+
+    def imported_sessions_queue_stats(self) -> dict:
+        """Count of imported_sessions awaiting overseer processing.
+
+        Returns {"total": int, "by_source": {source: count}}. A row counts
+        as "unprocessed" if it has no matching row in
+        processed_imported_sessions. This is the same condition the
+        loop's _summarize_imported_sessions uses to find work."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM imported_sessions i "
+            "WHERE NOT EXISTS ("
+            "  SELECT 1 FROM processed_imported_sessions p "
+            "  WHERE p.imported_id = i.id"
+            ")"
+        ).fetchone()
+        total = row["n"] if row else 0
+        rows = self._conn.execute(
+            "SELECT i.source, COUNT(*) AS n FROM imported_sessions i "
+            "WHERE NOT EXISTS ("
+            "  SELECT 1 FROM processed_imported_sessions p "
+            "  WHERE p.imported_id = i.id"
+            ") "
+            "GROUP BY i.source"
+        ).fetchall()
+        by_source = {r["source"]: r["n"] for r in rows}
+        return {"total": total, "by_source": by_source}
+
     def questions_for_evidence(self, evidence_table, evidence_id):
         """Reverse lookup: which open_questions has this row been filed
         against? Used by the drill-down to walk gist → questions."""

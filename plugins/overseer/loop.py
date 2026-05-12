@@ -795,13 +795,21 @@ class OverseerLoop:
 
         project_tag = (("project:" + imp["project"])
                        if imp.get("project") else None)
-        tags = ["auto", "import-summary", "source:claude-code"]
+        # Slice 9.2 (overseer ask #4a): tag the gist with the ACTUAL
+        # source of the imported session, not a hardcoded "claude-code"
+        # literal. Before this fix, every gist (chatgpt, grok-com,
+        # grok-twitter, claude-code) shared a single source tag, which
+        # collapsed platform-specific behavior into one undifferentiated
+        # bucket and made it impossible to filter gists by source. The
+        # overseer flagged this explicitly when asked what would help.
+        source = imp.get("source") or "unknown"
+        tags = ["auto", "import-summary", f"source:{source}"]
         if project_tag:
             tags.append(project_tag)
 
         gist_id = self._db.add_gist(
             gist_text,
-            period_label="claude-code:" + (imp.get("id") or "")[-12:],
+            period_label=f"{source}:" + (imp.get("id") or "")[-12:],
             period_start=imp.get("started_at"),
             period_end=imp.get("ended_at"),
             confidence="med",
@@ -2038,9 +2046,20 @@ class OverseerLoop:
             for r in all_rollups
         ]
 
+        # ── Slice 9.2 (overseer ask #2): staleness signals ─────
+        # The overseer asked to see its own ingest backlog + last-gist
+        # freshness so it can tell whether a quiet stretch in top_projects
+        # last_touched dates reflects user absence or just an unprocessed
+        # ingest backlog. Round 3 added gist_source_distribution so the
+        # overseer can self-detect sampling bias when one source's
+        # rollups dominate its recent-gists view.
+        import_queue = self._db.imported_sessions_queue_stats()
+        last_gist_at = self._db.last_successful_gist_at()
+        gist_dist = self._db.recent_gist_source_distribution(recent_n=30)
+
         return {
             "built_at": _utc_iso(),
-            "schema_version": 5,           # 3g #2: drill-down tokens on items
+            "schema_version": 6,           # 9.2: + staleness signals
             "top_questions": top_questions,            # PRIMARY (3f.5)
             "top_projects": top_projects,
             "recent_decisions": self._core.recent_decisions(limit=decisions_n),
@@ -2058,6 +2077,14 @@ class OverseerLoop:
             "recent_drift": recent_drift,
             "recent_future_notes": recent_future_notes,
             "recent_rollups": recent_rollups,
+            # 9.2 #2: staleness signals (the overseer's self-awareness)
+            "import_queue_depth": import_queue["total"],
+            "import_queue_by_source": import_queue["by_source"],
+            "last_successful_gist_at": last_gist_at,
+            # 9.2 round 3: gist-source distribution so the overseer can
+            # detect when its recent-themes view is fitted to a biased
+            # slice (e.g. all chatgpt-archive rollups, no grok yet).
+            "recent_gist_source_distribution": gist_dist,
         }
 
     # ── Backfill (manual) ────────────────────────────────────────

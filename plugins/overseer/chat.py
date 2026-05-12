@@ -367,6 +367,127 @@ def build_context_block(*, working_memory: dict | None,
         lines.append("## Working memory")
         if working_memory.get("built_at"):
             lines.append("(built {})".format(working_memory["built_at"]))
+
+        # ── Slice 9.2 (overseer ask #2): freshness + ingest backlog ─
+        # The overseer asked to be able to tell when its own working
+        # memory is stale, and to see its unprocessed-imports backlog
+        # so it can distinguish "user was quiet" from "ingest stalled".
+        # Render these BEFORE top_projects so the overseer reads them
+        # while it still has attention budget — it's a self-awareness
+        # cue, not a footnote.
+        wm_built_at = working_memory.get("built_at")
+        age_minutes = None
+        if wm_built_at:
+            try:
+                from datetime import datetime, timezone
+                b = datetime.fromisoformat(wm_built_at.replace("Z", "+00:00"))
+                age_minutes = max(
+                    0,
+                    int((datetime.now(timezone.utc) - b).total_seconds() / 60),
+                )
+            except Exception:
+                age_minutes = None
+        queue_total = working_memory.get("import_queue_depth")
+        queue_by_source = working_memory.get("import_queue_by_source") or {}
+        last_gist = working_memory.get("last_successful_gist_at")
+
+        # Slice 9.2 round 2: the overseer flagged in self-review that WM
+        # age and gist-layer age are different staleness signals. WM
+        # rebuild is cheap (every loop tick); gist generation is
+        # expensive and frequently backlog-stalled. A 2-minute-fresh
+        # WM can sit on top of a 7-hour-stale gist layer. Surface both
+        # with looser thresholds on the gist age.
+        last_gist_age_minutes = None
+        if last_gist:
+            from datetime import datetime, timezone
+            # last_successful_gist_at comes from sqlite's MAX(created_at)
+            # which writes "YYYY-MM-DD HH:MM:SS" (UTC, no tz suffix) by
+            # default. Other tables use ISO with Z. Try both, fall back
+            # silently if neither works.
+            g = None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ",
+                        "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    g = datetime.strptime(last_gist, fmt).replace(
+                        tzinfo=timezone.utc)
+                    break
+                except ValueError:
+                    continue
+            if g is None:
+                try:
+                    g = datetime.fromisoformat(last_gist.replace("Z", "+00:00"))
+                except Exception:
+                    g = None
+            if g is not None:
+                last_gist_age_minutes = max(
+                    0,
+                    int((datetime.now(timezone.utc) - g).total_seconds() / 60),
+                )
+
+        if any(v is not None for v in (age_minutes, queue_total, last_gist,
+                                        last_gist_age_minutes)):
+            lines.append("### Freshness (your own state, not Tory's)")
+            if age_minutes is not None:
+                if age_minutes < 5:
+                    age_note = f"{age_minutes}m old (fresh)"
+                elif age_minutes < 60:
+                    age_note = f"{age_minutes}m old"
+                elif age_minutes < 24 * 60:
+                    age_note = f"{age_minutes // 60}h {age_minutes % 60}m old"
+                else:
+                    age_note = f"{age_minutes // (24 * 60)}d old (stale — distrust touch dates)"
+                lines.append(f"  - Working memory: {age_note}")
+            if last_gist_age_minutes is not None:
+                # Looser thresholds — gist work is expensive and routinely backed up
+                gist_hours = last_gist_age_minutes / 60.0
+                if gist_hours < 2:
+                    g_note = f"{last_gist_age_minutes}m ago (healthy)"
+                elif gist_hours < 12:
+                    g_note = f"{gist_hours:.1f}h ago"
+                elif gist_hours < 48:
+                    g_note = f"{gist_hours:.1f}h ago (queue likely backed up)"
+                else:
+                    g_note = (f"{gist_hours / 24:.1f}d ago — distrust "
+                              "gist-derived claims, ingest layer is stalled")
+                lines.append(f"  - Last gist: {g_note}")
+            elif last_gist:
+                lines.append(f"  - Last gist written: {last_gist}")
+            if queue_total is not None:
+                if queue_total == 0:
+                    lines.append("  - Ingest queue: empty (you are caught up)")
+                else:
+                    bs_parts = ", ".join(f"{s}: {n}"
+                                         for s, n in sorted(queue_by_source.items()))
+                    lines.append(
+                        f"  - Ingest queue: {queue_total} unprocessed "
+                        f"imported_sessions ({bs_parts}). Those sessions "
+                        f"do NOT yet have gists — their content is invisible "
+                        f"to you until the loop processes them."
+                    )
+            # Slice 9.2 round 3: gist-origin distribution. The overseer
+            # flagged that without this it can't tell when its recent-gist
+            # window is dominated by one source's rollups, which biases
+            # any theme-formation downstream. Round 3.5: gists come from
+            # two paths (import-summary tagged `source:*`, automation_rollup
+            # tagged `rollup:project`). Combined view shows both.
+            gist_dist = working_memory.get("recent_gist_source_distribution") or {}
+            window = gist_dist.get("window_size", 0)
+            by_origin = gist_dist.get("by_origin") or {}
+            untagged = gist_dist.get("untagged", 0)
+            if window > 0:
+                parts = [f"{o}: {n}" for o, n in
+                         sorted(by_origin.items(), key=lambda x: (-x[1], x[0]))]
+                if untagged:
+                    parts.append(f"untagged: {untagged}")
+                lines.append(
+                    f"  - Recent gists (last {window}) by origin: "
+                    f"{', '.join(parts)}. If one origin dominates while "
+                    f"other sources sit in the ingest queue, your themes "
+                    f"are fitted to a biased slice — read [high] confidence "
+                    f"tags as 'high given what I've seen', not 'high full stop'."
+                )
+            lines.append("")
+
         top_projects = working_memory.get("top_projects") or []
         if top_projects:
             lines.append("Top projects (active, recently touched):")
