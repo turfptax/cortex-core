@@ -507,6 +507,78 @@ def build_context_block(*, working_memory: dict | None,
                     f"In flight (dispatched, awaiting result): "
                     f"{sib_pending or 0}."
                 )
+            # Slice 9.4 CP2 (2026-05-16): git ingest channel freshness.
+            # Per overseer's explicit caveat: surface BOTH the last-
+            # successful-run timestamp AND any repos that got skipped
+            # (and why), so the freshness block answers "what am I NOT
+            # seeing on the git channel?" not just "when did it last
+            # refresh?" — the silent-blindness failure mode is more
+            # dangerous than the staleness one.
+            git_state = working_memory.get("git_ingest") or {}
+            git_last_run = git_state.get("last_run_at")
+            git_sum = git_state.get("summary") or {}
+            if git_last_run:
+                # Age of last run
+                from datetime import datetime, timezone
+                git_age_minutes = None
+                try:
+                    g = datetime.fromisoformat(
+                        git_last_run.replace("Z", "+00:00"))
+                    git_age_minutes = max(
+                        0,
+                        int((datetime.now(timezone.utc) - g).total_seconds()
+                            / 60),
+                    )
+                except Exception:
+                    pass
+                if git_age_minutes is not None:
+                    if git_age_minutes < 60:
+                        age_str = f"{git_age_minutes}m ago"
+                    elif git_age_minutes < 24 * 60:
+                        age_str = f"{git_age_minutes // 60}h ago"
+                    else:
+                        age_str = f"{git_age_minutes // (24*60)}d ago"
+                else:
+                    age_str = git_last_run
+                attempted = git_sum.get("repos_attempted") or []
+                skipped = git_sum.get("repos_skipped") or []
+                # Per-attempt count: just the repo names + insert counts
+                if attempted:
+                    bits = ", ".join(
+                        f"{a['repo'].split('/')[-1]}"
+                        f"({a.get('rows_inserted', 0)}+/"
+                        f"{a.get('rows_duplicate', 0)}=)"
+                        for a in attempted
+                    )
+                    lines.append(
+                        f"  - Git ingest channel: last ran {age_str}; "
+                        f"{len(attempted)} repos attempted ({bits})."
+                    )
+                else:
+                    lines.append(
+                        f"  - Git ingest channel: last ran {age_str}; "
+                        f"0 repos attempted."
+                    )
+                if skipped:
+                    # Always list skips — they are the silent-blindness
+                    # signal the overseer specifically wanted exposed.
+                    skip_bits = "; ".join(
+                        f"{s['repo']}: {s['reason']}" for s in skipped[:5])
+                    extra = (f" (+{len(skipped) - 5} more)"
+                             if len(skipped) > 5 else "")
+                    lines.append(
+                        f"    Repos SKIPPED this run: {skip_bits}{extra}"
+                    )
+            else:
+                # Channel never ran — possible reasons: disabled, no PAT,
+                # or first-boot before the interval elapsed. Don't speculate;
+                # just surface the absence.
+                if working_memory.get("git_ingest") is not None:
+                    lines.append(
+                        "  - Git ingest channel: no successful run yet "
+                        "(check loop_git_ingest_enabled, PAT, and the "
+                        "loop_git_ingest_repos list)."
+                    )
             lines.append("")
 
         top_projects = working_memory.get("top_projects") or []

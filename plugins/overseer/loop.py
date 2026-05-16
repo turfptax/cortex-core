@@ -432,6 +432,21 @@ class OverseerLoop:
                 self._log.exception("summarize-imports step failed: %s", e)
                 summary["errors"].append("summarize_imports: " + str(e)[:200])
 
+        # Step 1c.5 (Slice 9.4 CP2): periodic GitHub ingest.
+        # Runs on its own schedule via interval_hours, not every tick.
+        # On a successful run the freshly-ingested imported_sessions
+        # rows are picked up by the NEXT tick's _summarize_imported_
+        # sessions step — we deliberately don't loop them through in
+        # the same tick to keep budget accounting clean.
+        if self._cfg.get("loop_git_ingest_enabled", False):
+            try:
+                import git_ingest as _gi
+                summary["git_ingest"] = _gi.run_scheduled(
+                    self._db, self._cfg, self._log)
+            except Exception as e:
+                self._log.exception("git_ingest step failed: %s", e)
+                summary["errors"].append("git_ingest: " + str(e)[:200])
+
         # Step 1d: generate missing automation rollups (cheap, Sonnet 4.6).
         if (self._cfg.get("loop_run_rollups", True)
                 and not budget.exhausted()):
@@ -2065,6 +2080,15 @@ class OverseerLoop:
         # specifying it. See memory/agent_ecosystem_design.md.
         sibling_daily_cap = int(self._cfg.get(
             "loop_daily_sibling_dispatches", 20))
+
+        # Build_working_memory imports git_ingest lazily so deployments
+        # without the wrapper file don't import-fail. Inlined here so
+        # the return dict (below) reads a local variable, not a method.
+        try:
+            import git_ingest as _gi
+            git_ingest_state = _gi.last_run_state(self._db)
+        except Exception:
+            git_ingest_state = {}
         try:
             sibling_stats = self._db.sibling_dispatch_stats(
                 daily_cap=sibling_daily_cap)
@@ -2117,6 +2141,11 @@ class OverseerLoop:
             "sibling_daily_cap": sibling_stats["daily_cap"],
             "sibling_unrated_count": sibling_stats["unrated_count"],
             "sibling_pending_for_me": sibling_stats["pending_for_me"],
+            # 9.4 CP2: git ingest state (when this channel last refreshed,
+            # what was attempted, what was skipped). Lets the freshness
+            # block answer "is the git channel current?" and "what am I
+            # NOT seeing?" — overseer's explicit caveat on the slice.
+            "git_ingest": git_ingest_state,
         }
 
     # ── Backfill (manual) ────────────────────────────────────────

@@ -245,6 +245,24 @@ loop_daily_budget_calls = 250
 # Resets at local midnight (matches Slice 5.5 DailyBudget calendar).
 loop_daily_sibling_dispatches = 20
 
+# ── Slice 9.4 CP2 (2026-05-16): periodic GitHub ingest ──────────────
+# When enabled, the loop calls imports/github_ingester.py for each repo
+# in loop_git_ingest_repos every loop_git_ingest_interval_hours. Adds a
+# `source:git:<owner>/<name>` channel to the gist origin distribution,
+# distinct from the chat sources. Per overseer's spec: the channel is
+# adversarial to user-curation (catches what Tory ships, not what he
+# surfaces). Skipped-repos are logged in overseer_state so the freshness
+# block can show what is NOT being seen.
+#
+# Repo list is explicit, not auto-discovered. CP3 will add discovery +
+# allow/deny list across the PAT-accessible repo set (~80 repos).
+loop_git_ingest_enabled = true
+loop_git_ingest_repos = [
+    "Open-Muscle/OpenMuscle-Software",
+]
+loop_git_ingest_interval_hours = 6
+loop_git_ingest_lookback_days = 7
+
 # ── Slice 3e: notifications rules ─────────────────────────────────
 loop_run_notifications = true
 notify_stale_project_days = 14          # warn after N days untouched
