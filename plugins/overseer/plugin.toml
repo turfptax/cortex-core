@@ -236,6 +236,15 @@ loop_rollups_max_per_tick = 5           # cheap (Sonnet) but still bound
 loop_daily_budget_usd = 5.00
 loop_daily_budget_calls = 250
 
+# Slice 9.3 (2026-05-16): daily cap on overseer-initiated sibling task
+# dispatches. Independent of the LLM call cap above — siblings burn the
+# CALLER's LLM budget (Tory's Anthropic sub via Claude Code), not the
+# overseer's. This cap is the safety rail against runaway dispatching
+# (e.g. an overseer that "asks for a second opinion" on every chat turn
+# and quietly queues 200 tasks/day for sibling sessions to grind through).
+# Resets at local midnight (matches Slice 5.5 DailyBudget calendar).
+loop_daily_sibling_dispatches = 20
+
 # ── Slice 3e: notifications rules ─────────────────────────────────
 loop_run_notifications = true
 notify_stale_project_days = 14          # warn after N days untouched

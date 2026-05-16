@@ -336,6 +336,180 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
+    # ── Slice 9.3: read-side of sibling dispatch ───────────────────
+    # Paired with dispatch_sibling (write) so the overseer can integrate
+    # sibling work WITHIN a chat turn instead of waiting for a tick.
+    # Use after dispatching to check whether the sibling has completed
+    # the task yet; also use opportunistically to see if any siblings
+    # have completed work the overseer hasn't rated yet (the
+    # unrated_only filter is the natural inbox view).
+    {
+        "type": "function",
+        "function": {
+            "name": "get_recent_sibling_results",
+            "description": (
+                "Recently completed/failed/rejected sibling tasks — "
+                "the read counterpart to dispatch_sibling. Use this to "
+                "(a) check whether a task you dispatched has been "
+                "completed yet, (b) read the result text + the "
+                "sibling's reciprocal grade of your dispatch quality, "
+                "and (c) find completed tasks you haven't rated yet so "
+                "you can close the audit loop. Each row includes "
+                "result_text (full, never compacted), the sibling's "
+                "dispatch_quality_rating + notes, and the actual model "
+                "the sibling used. If unrated_only=true, filters to "
+                "tasks where you haven't yet set quality_rating — your "
+                "inbox of work-awaiting-your-read."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results (default 10).",
+                    },
+                    "unrated_only": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, return only completed tasks you "
+                            "haven't rated yet. Useful as your inbox."
+                        ),
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rate_sibling_result",
+            "description": (
+                "Rate a completed sibling task's result quality (1-5) "
+                "and optionally flag it as a dataset_candidate for "
+                "future Category C agent training. Use this AFTER "
+                "reading the result via get_recent_sibling_results "
+                "and integrating it into your reasoning. Rating closes "
+                "the audit loop and feeds the long-term flywheel that "
+                "trains specialized agents on (prompt, result, rating) "
+                "triples. Bias warning: you will be tempted to rate "
+                "work that confirms your prior read higher; the "
+                "reciprocal grading on dispatch quality is one "
+                "mitigation, but the most honest mitigation is to "
+                "pre-commit to a rating ceiling BEFORE reading the "
+                "result. Quote your pre-commit in the notes field."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "The id of the completed task.",
+                    },
+                    "rating": {
+                        "type": "integer",
+                        "description": "1 (useless) to 5 (load-bearing).",
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": (
+                            "Why you rated it that way. Specifically: "
+                            "what part of the result did real work for "
+                            "you, what part was restatement, and "
+                            "whether you arrived at the same point "
+                            "independently."
+                        ),
+                    },
+                    "dataset_candidate": {
+                        "type": "boolean",
+                        "description": (
+                            "Flag this (prompt, context, result) "
+                            "triple as exemplar training data for "
+                            "future specialized agents. Only true for "
+                            "ratings >= 4."
+                        ),
+                    },
+                },
+                "required": ["task_id", "rating"],
+            },
+        },
+    },
+    # ── Slice 9.3: sibling dispatch — the FIRST write tool ─────────
+    # All prior tools in this file are read-only inspection. This one
+    # writes to sibling_tasks. Distinguished by name + tool description
+    # so the model knows it's qualitatively different.
+    {
+        "type": "function",
+        "function": {
+            "name": "dispatch_sibling",
+            "description": (
+                "Dispatch a task to a sibling agent (currently: a Claude "
+                "Code session on Tory's PC). Use this when you need a "
+                "fresh perspective on something in your own state — "
+                "specifically when you're (a) uncertain whether you're "
+                "pattern-matching too hard on a frame, (b) want a "
+                "second opinion on whether a theme deserves [high] "
+                "confidence given recent evidence, or (c) have a "
+                "concrete question that one round-trip can resolve.\n\n"
+                "DO NOT use this to: ask generic LLM questions (free "
+                "via your other channels), do routine summarization "
+                "(no sibling needed), or as small-talk. Each dispatch "
+                "costs real money on the caller's Anthropic budget and "
+                "burns from your daily dispatch cap (currently 20/day, "
+                "checkable via your dispatch_stats freshness signal).\n\n"
+                "Returns the task id. The sibling will claim and "
+                "complete it asynchronously; you'll see the result on "
+                "a future tick via the sibling_recent surface, with an "
+                "optional reciprocal rating where the sibling grades "
+                "the quality of your dispatch (specifically to prevent "
+                "you rating your own ideas back to yourself as valid)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "What you want the sibling to do. Concrete "
+                            "and bounded. Example: 'Re-read "
+                            "human_journal id=4 and tell me if I'm "
+                            "overfitting the spine-vs-cover-story "
+                            "frame on FlexGrid V3.' Bad example: "
+                            "'What do you think of Open Muscle?'"
+                        ),
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": (
+                            "Any additional context the sibling needs "
+                            "(excerpts, IDs of relevant rows, links to "
+                            "your prior reasoning). Stored verbatim "
+                            "in context_json on the task row."
+                        ),
+                    },
+                    "cost_budget_usd": {
+                        "type": "number",
+                        "description": (
+                            "Max cost the sibling should spend on this "
+                            "task. Default 0.50 USD. Use lower for "
+                            "small fact-checks, higher for genuinely "
+                            "open-ended judgment work."
+                        ),
+                    },
+                    "task_type": {
+                        "type": "string",
+                        "enum": ["judgment", "synthesis", "fact-check"],
+                        "description": (
+                            "What kind of task. judgment=needs a real "
+                            "agent's read (default; targets Claude "
+                            "Code). synthesis=summarize/rewrite. "
+                            "fact-check=DB lookups + verify."
+                        ),
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
 ]
 
 # Per-call iteration cap — bounds blast radius if the model loops.
@@ -364,12 +538,18 @@ def _row_to_dict(row) -> dict:
     return {}
 
 
-def dispatch_tool(name: str, args: dict, *, db, core_memory) -> str:
+def dispatch_tool(name: str, args: dict, *, db, core_memory,
+                  sibling_daily_cap: int = 20) -> str:
     """Execute a tool call. Returns a JSON-serialized result string
     bounded to MAX_TOOL_RESULT_CHARS. Errors are returned as JSON
-    `{"error": "..."}` so the model can react rather than crash."""
+    `{"error": "..."}` so the model can react rather than crash.
+
+    sibling_daily_cap (Slice 9.3): max number of dispatch_sibling
+    calls the overseer can make per local day. Passed through from
+    the chat handler which reads it from plugin.toml at the edge."""
     try:
-        result = _dispatch(name, args or {}, db=db, core_memory=core_memory)
+        result = _dispatch(name, args or {}, db=db, core_memory=core_memory,
+                           sibling_daily_cap=sibling_daily_cap)
         text = json.dumps(result, default=str, ensure_ascii=False)
         return _truncate(text)
     except Exception as e:
@@ -377,7 +557,8 @@ def dispatch_tool(name: str, args: dict, *, db, core_memory) -> str:
         return json.dumps({"error": "{}: {}".format(type(e).__name__, e)})
 
 
-def _dispatch(name: str, args: dict, *, db, core_memory):
+def _dispatch(name: str, args: dict, *, db, core_memory,
+              sibling_daily_cap: int = 20):
     if name == "get_recent_human_journal":
         limit = max(1, min(50, int(args.get("limit", 10))))
         rows = db.list_human_journal_entries(limit=limit)
@@ -506,5 +687,68 @@ def _dispatch(name: str, args: dict, *, db, core_memory):
     if name == "get_recent_drift":
         limit = max(1, min(30, int(args.get("limit", 10))))
         return db.recent_drift(limit=limit)
+
+    # ── Slice 9.3: sibling read tools ──────────────────────────────
+    if name == "get_recent_sibling_results":
+        limit = max(1, min(50, int(args.get("limit", 10))))
+        unrated_only = bool(args.get("unrated_only", False))
+        rows = db.sibling_recent_completed(
+            limit=limit, unread_to_overseer_only=unrated_only)
+        # Don't return the dataset_candidate column for read; it's
+        # write-only via the rate tool. Same for reviewed_by_user
+        # (that's a Tory-side flag).
+        out = []
+        for r in rows:
+            d = _row_to_dict(r)
+            d.pop("dataset_candidate", None)
+            d.pop("reviewed_by_user", None)
+            out.append(d)
+        return out
+
+    if name == "rate_sibling_result":
+        task_id = args.get("task_id")
+        rating = args.get("rating")
+        if task_id is None or rating is None:
+            return {"error": "task_id and rating are required"}
+        try:
+            rating_int = int(rating)
+        except (TypeError, ValueError):
+            return {"error": "rating must be 1-5"}
+        if not (1 <= rating_int <= 5):
+            return {"error": "rating out of range (1-5)"}
+        notes = (args.get("notes") or "").strip()
+        dataset = bool(args.get("dataset_candidate", False))
+        return db.sibling_rate_result(
+            task_id, rating=rating_int, notes=notes,
+            dataset_candidate=dataset)
+
+    # ── Slice 9.3: dispatch_sibling — first write tool on the surface ──
+    if name == "dispatch_sibling":
+        prompt = (args.get("prompt") or "").strip()
+        if not prompt:
+            return {"error": "prompt is required"}
+        # Bound the budget — model can ask for higher but we clamp.
+        try:
+            budget = float(args.get("cost_budget_usd") or 0.50)
+        except (TypeError, ValueError):
+            budget = 0.50
+        budget = max(0.05, min(5.0, budget))
+        task_type = (args.get("task_type") or "judgment").strip()
+        if task_type not in ("judgment", "synthesis", "fact-check"):
+            task_type = "judgment"
+        # Targeting: today only Claude Code sessions listen, so we
+        # default to that. Future B (daemon) tasks would route here too.
+        target = "claude-code"
+        result = db.sibling_dispatch(
+            prompt=prompt,
+            created_by="overseer",
+            target=target,
+            task_type=task_type,
+            preferred_model_tier="smart",
+            cost_budget_usd=budget,
+            context=args.get("context"),
+            daily_cap=sibling_daily_cap,
+        )
+        return result
 
     return {"error": "unknown tool: {}".format(name)}

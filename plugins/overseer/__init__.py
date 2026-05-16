@@ -325,6 +325,21 @@ class OverseerPlugin(Plugin):
                   self._http_people_for_project),
             Route("GET",  "/people/stats",
                   self._http_people_stats),
+            # ── Slice 9.3: sibling task dispatch ─────────────────
+            Route("POST", "/sibling/dispatch",
+                  self._http_sibling_dispatch),
+            Route("GET",  "/sibling/pending",
+                  self._http_sibling_pending),
+            Route("POST", "/sibling/claim",
+                  self._http_sibling_claim),
+            Route("POST", "/sibling/complete",
+                  self._http_sibling_complete),
+            Route("POST", "/sibling/reject",
+                  self._http_sibling_reject),
+            Route("GET",  "/sibling/recent",
+                  self._http_sibling_recent),
+            Route("GET",  "/sibling/stats",
+                  self._http_sibling_stats),
         ]
 
     # ── Lifecycle ───────────────────────────────────────────────
@@ -1589,6 +1604,178 @@ class OverseerPlugin(Plugin):
             log.exception("people_stats failed")
             return {"ok": False, "error": str(e)}
 
+    # ── Slice 9.3: sibling task dispatch endpoints ─────────────────
+    # Read the daily cap from plugin.toml here (not in the DB layer)
+    # so the DB stays a pure data store and config lives at the edge.
+    def _sibling_daily_cap(self) -> int:
+        try:
+            return int(self.api.config.get(
+                "loop_daily_sibling_dispatches", 20))
+        except Exception:
+            return 20
+
+    def _http_sibling_dispatch(self, payload):
+        """POST /plugins/overseer/sibling/dispatch — create a new task.
+
+        Body: {prompt, created_by?, target?, task_type?,
+               preferred_model_tier?, cost_budget_usd?, context?}
+        Returns {ok, id, used_today, cap} or {ok: false, error}.
+
+        Normally called by the dispatch_sibling chat tool when the
+        overseer is mid-turn; can also be POSTed directly (e.g. from
+        Tory's CLI to inject a manual task). The created_by field
+        defaults to 'overseer' but should be overridden when a human
+        is creating it."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        prompt = (payload.get("prompt") or "").strip()
+        if not prompt:
+            return {"ok": False, "error": "prompt is required"}
+        try:
+            return self.overseer_db.sibling_dispatch(
+                prompt=prompt,
+                created_by=(payload.get("created_by") or "overseer"),
+                target=(payload.get("target") or "claude-code"),
+                task_type=(payload.get("task_type") or "judgment"),
+                preferred_model_tier=(
+                    payload.get("preferred_model_tier") or "smart"),
+                cost_budget_usd=float(
+                    payload.get("cost_budget_usd") or 0.50),
+                context=payload.get("context"),
+                daily_cap=self._sibling_daily_cap(),
+            )
+        except Exception as e:
+            log.exception("sibling_dispatch failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_sibling_pending(self, payload):
+        """GET /plugins/overseer/sibling/pending?target=claude-code
+
+        Returns the list of claimable tasks. Siblings filter by their
+        own capability target; 'any'-targeted tasks always surface."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        target = (payload.get("target") or "claude-code").strip() or None
+        try:
+            limit = int(payload.get("limit") or 50)
+        except (TypeError, ValueError):
+            limit = 50
+        try:
+            tasks = self.overseer_db.sibling_pending(
+                target=target, limit=limit)
+            return {"ok": True, "tasks": tasks, "count": len(tasks)}
+        except Exception as e:
+            log.exception("sibling_pending failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_sibling_claim(self, payload):
+        """POST /plugins/overseer/sibling/claim — atomic claim.
+
+        Body: {id, claimed_by}. Refuses race conditions (another
+        sibling already claimed it). Returns the full task on success
+        so the sibling has everything it needs without a second
+        round-trip."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        task_id = payload.get("id")
+        claimed_by = (payload.get("claimed_by") or "").strip()
+        if not task_id or not claimed_by:
+            return {"ok": False,
+                    "error": "id and claimed_by are required"}
+        try:
+            return self.overseer_db.sibling_claim(
+                task_id, claimed_by=claimed_by)
+        except Exception as e:
+            log.exception("sibling_claim failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_sibling_complete(self, payload):
+        """POST /plugins/overseer/sibling/complete — submit result.
+
+        Body: {id, result_text, actual_model_used?, result_cost_usd?,
+               dispatch_quality_rating?, dispatch_quality_notes?}
+        Reciprocal grading is OPTIONAL but encouraged — siblings rating
+        the overseer's dispatch quality is the mitigation against the
+        overseer-self-rates-results bias the overseer itself flagged."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        task_id = payload.get("id")
+        result_text = (payload.get("result_text") or "").strip()
+        if not task_id or not result_text:
+            return {"ok": False,
+                    "error": "id and result_text are required"}
+        try:
+            return self.overseer_db.sibling_complete(
+                task_id,
+                result_text=result_text,
+                actual_model_used=(payload.get("actual_model_used") or ""),
+                result_cost_usd=float(
+                    payload.get("result_cost_usd") or 0.0),
+                dispatch_quality_rating=payload.get(
+                    "dispatch_quality_rating"),
+                dispatch_quality_notes=(
+                    payload.get("dispatch_quality_notes") or ""),
+            )
+        except Exception as e:
+            log.exception("sibling_complete failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_sibling_reject(self, payload):
+        """POST /plugins/overseer/sibling/reject — pass on a task.
+
+        Body: {id, reason}. Different from `complete` with a bad
+        result: rejection means the sibling chose not to attempt it
+        (out of scope, ambiguous, would exceed cost budget, etc.).
+        Reason text shows up in the overseer's next-tick read."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        task_id = payload.get("id")
+        reason = (payload.get("reason") or "").strip()
+        if not task_id or not reason:
+            return {"ok": False, "error": "id and reason are required"}
+        try:
+            return self.overseer_db.sibling_reject(task_id, reason=reason)
+        except Exception as e:
+            log.exception("sibling_reject failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_sibling_recent(self, payload):
+        """GET /plugins/overseer/sibling/recent
+
+        Returns recently completed/failed/rejected tasks for the
+        overseer's tick loop (or the Hub UI) to integrate.
+        Pass ?unread=1 to filter to ones the overseer hasn't rated yet."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        try:
+            limit = int(payload.get("limit") or 20)
+        except (TypeError, ValueError):
+            limit = 20
+        unread = str(payload.get("unread", "")).lower() in ("1", "true", "yes")
+        try:
+            tasks = self.overseer_db.sibling_recent_completed(
+                limit=limit, unread_to_overseer_only=unread)
+            return {"ok": True, "tasks": tasks, "count": len(tasks)}
+        except Exception as e:
+            log.exception("sibling_recent failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_sibling_stats(self, payload):
+        """GET /plugins/overseer/sibling/stats — counts + daily budget.
+
+        Used by the chat freshness section to surface the overseer's
+        dispatch posture (how many it's used today, how many pending,
+        how many awaiting its read)."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        try:
+            stats = self.overseer_db.sibling_dispatch_stats(
+                daily_cap=self._sibling_daily_cap())
+            return {"ok": True, **stats}
+        except Exception as e:
+            log.exception("sibling_stats failed")
+            return {"ok": False, "error": str(e)}
+
     def _http_distill_corrections(self, payload):
         """POST /plugins/overseer/insight/distill-corrections
 
@@ -2184,6 +2371,8 @@ class OverseerPlugin(Plugin):
                     "insight_chat_snippet_enabled", True)),
                 attachments=attachments,
                 uploads_dir=UPLOADS_DIR,
+                # Slice 9.3: cap on dispatch_sibling calls from chat tools
+                sibling_daily_cap=self._sibling_daily_cap(),
             )
         except Exception as e:
             self.api.log.exception("chat failed: %s", e)

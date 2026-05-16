@@ -676,7 +676,8 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
                        max_history_turns: int = 20,
                        insight_snippet_enabled: bool = True,
                        attachments: list[dict] | None = None,
-                       uploads_dir: str | None = None) -> dict:
+                       uploads_dir: str | None = None,
+                       sibling_daily_cap: int = 20) -> dict:
     """End-to-end: append user msg to chat_messages, build prompt,
     call LLM, persist assistant response, return result dict.
 
@@ -971,6 +972,7 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
             log.info("tool: %s(%s)", fn_name, fn_args)
             tool_result = chat_tools.dispatch_tool(
                 fn_name, fn_args, db=db, core_memory=core_memory,
+                sibling_daily_cap=sibling_daily_cap,
             )
             tool_call_audit.append({
                 "iter": iter_num,

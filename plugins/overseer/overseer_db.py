@@ -743,6 +743,64 @@ CREATE TABLE IF NOT EXISTS chat_message_files (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_message_files_msg
     ON chat_message_files(chat_message_id);
+
+-- ── Slice 9.3: sibling task dispatch ─────────────────────────────
+-- Lets the overseer dispatch work to "sibling" agents (currently:
+-- Claude Code sessions on Tory's PC, via MCP tools). Closes the
+-- write-back asymmetry the overseer flagged: previously siblings
+-- could chat TO the overseer but the overseer couldn't dispatch
+-- work back. Each row is one task with full audit trail (who
+-- dispatched, who claimed, what model was used, what the result
+-- was, how good the result was rated by overseer + the sibling).
+--
+-- Forward-compat fields (task_type, preferred_model_tier,
+-- dataset_candidate, dispatch_quality_rating) are populated as
+-- Category B (daemon siblings) and Category C (specialized agents
+-- with training-data accumulation) ship in later slices. Today
+-- only Category A (Claude Code via MCP) is wired.
+CREATE TABLE IF NOT EXISTS sibling_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_by TEXT NOT NULL,                   -- "overseer" | "tory" | <bot-id>
+    target TEXT NOT NULL DEFAULT 'any',         -- "any" | "claude-code" | "daemon" | <specific-id>
+    prompt TEXT NOT NULL,                       -- what the sibling should do
+    context_json TEXT NOT NULL DEFAULT '{}',    -- why overseer is asking (excerpts, refs)
+    cost_budget_usd REAL NOT NULL DEFAULT 0.50,
+    task_type TEXT NOT NULL DEFAULT 'judgment',
+        -- "judgment" — needs a real agent (Category A)
+        -- "synthesis" — summarize/rewrite (B, balanced tier)
+        -- "fact-check" — DB lookups + verify (B, fast tier)
+        -- "compact" — chat-history compaction with review (C)
+        -- "audit" — quality check of overseer's own output (C)
+    preferred_model_tier TEXT NOT NULL DEFAULT 'smart',
+        -- "fast" | "balanced" | "smart"
+    status TEXT NOT NULL DEFAULT 'pending',
+        -- pending | claimed | completed | failed | rejected | timed-out
+    claimed_at TEXT,
+    claimed_by TEXT,                            -- sibling id (hostname:session_id)
+    completed_at TEXT,
+    result_text TEXT,                           -- never compacted; full audit
+    actual_model_used TEXT NOT NULL DEFAULT '',
+    result_cost_usd REAL NOT NULL DEFAULT 0,
+    rejection_reason TEXT,
+    -- ── overseer's rating of the sibling's result (next tick after read) ──
+    quality_rating INTEGER,                     -- 1-5; nullable
+    quality_notes TEXT,                         -- overseer's reasoning
+    -- ── reciprocal: sibling's rating of the overseer's dispatch ──
+    -- Prevents the dataset from becoming "what overseer already believed, validated."
+    dispatch_quality_rating INTEGER,            -- 1-5; nullable
+    dispatch_quality_notes TEXT,
+    -- ── training data flag (Category C) ──
+    -- Set by overseer when this row is exemplar work worth training future
+    -- specialized agents on. The (prompt, context, result) triple becomes
+    -- a training pair when this is 1.
+    dataset_candidate INTEGER NOT NULL DEFAULT 0,
+    reviewed_by_user INTEGER NOT NULL DEFAULT 0 -- Tory has eyeballed the round-trip
+);
+CREATE INDEX IF NOT EXISTS idx_sibling_status
+    ON sibling_tasks(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_sibling_target_status
+    ON sibling_tasks(target, status);
 """
 
 
@@ -1232,6 +1290,22 @@ class OverseerDB(CortexDB):
         Anchor for any additive columns we add later (e.g. an
         extracted_text cache for pdfs) so existing installs pick them
         up without a manual migration."""
+        self._migrate_9_3_sibling_tasks()
+
+    def _migrate_9_3_sibling_tasks(self):
+        """Slice 9.3: sibling_tasks table.
+
+        Fresh installs get it via CREATE TABLE IF NOT EXISTS in
+        OVERSEER_SCHEMA_SQL. Existing installs (the .25 we deploy to)
+        need to additively pick up the table + indexes; the CREATE
+        TABLE IF NOT EXISTS in the schema handles that on every boot.
+
+        This method is the chain anchor for future additive columns
+        we may add to sibling_tasks (e.g. a deadline_at, or a
+        parent_task_id for subtask trees). When we add those, ALTER
+        TABLE statements go here gated on a try/except OperationalError
+        check, same pattern as _migrate_3f5.
+        """
         return
 
     # ── overseer_state ──────────────────────────────────────────
@@ -3759,4 +3833,221 @@ class OverseerDB(CortexDB):
             "top_projects": top_projects,
             "top_expertise_tags": top_expertise_tags,
             "recent_additions": recent_additions,
+        }
+
+    # ── Slice 9.3: sibling task dispatch ────────────────────────────
+    # Public methods used by the Pi endpoints + the overseer's
+    # dispatch_sibling chat tool. All writes go through these so the
+    # daily dispatch cap + audit fields are enforced in one place.
+
+    def _local_day_start_iso(self) -> str:
+        """ISO timestamp of midnight-local-time, expressed as UTC.
+        Used by sibling_* methods so the daily cap calendar matches the
+        user's day (same convention as Slice 5.5's DailyBudget reset)."""
+        from datetime import datetime, timezone, timedelta
+        offset_min = 0
+        try:
+            raw = self.get_overseer_state("local_tz_offset_minutes")
+            if raw is not None:
+                offset_min = int(raw)
+        except Exception:
+            pass
+        now_local = (datetime.now(timezone.utc)
+                     + timedelta(minutes=offset_min))
+        day_start_local = now_local.replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        day_start_utc = day_start_local - timedelta(minutes=offset_min)
+        return day_start_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+    def sibling_dispatch(self, *, prompt, created_by="overseer",
+                         target="claude-code", task_type="judgment",
+                         preferred_model_tier="smart",
+                         cost_budget_usd=0.50, context=None,
+                         daily_cap=20) -> dict:
+        """Create a sibling task. Returns {ok, id, ...} or {ok: False, error}.
+
+        Enforces the daily dispatch cap (passed in by the Pi endpoint
+        layer, which reads ``loop_daily_sibling_dispatches`` from
+        plugin.toml — default 20). Measured by local-day rollover so it
+        matches the LLM-budget calendar (Slice 5.5 alignment).
+
+        ``context`` is any dict (excerpts, refs, current overseer state);
+        serialized to JSON for storage."""
+        import json as _json
+        day_start_iso = self._local_day_start_iso()
+
+        used_today = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM sibling_tasks "
+            "WHERE created_by = ? AND created_at >= ?",
+            (created_by, day_start_iso),
+        ).fetchone()["n"]
+        if used_today >= daily_cap:
+            return {
+                "ok": False,
+                "error": (f"daily dispatch cap reached "
+                          f"({used_today}/{daily_cap}); "
+                          f"resets at next local midnight"),
+                "cap": daily_cap,
+                "used_today": used_today,
+            }
+
+        ctx_json = _json.dumps(context or {}, default=str, ensure_ascii=False)
+        cur = self._conn.execute(
+            "INSERT INTO sibling_tasks "
+            "  (created_by, target, prompt, context_json, cost_budget_usd, "
+            "   task_type, preferred_model_tier) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (created_by, target, prompt, ctx_json,
+             float(cost_budget_usd), task_type, preferred_model_tier),
+        )
+        self._safe_commit()
+        return {
+            "ok": True,
+            "id": cur.lastrowid,
+            "used_today": used_today + 1,
+            "cap": daily_cap,
+        }
+
+    def sibling_pending(self, *, target=None, limit=50) -> list[dict]:
+        """List tasks a sibling can claim. Filters out claimed/done."""
+        sql = ("SELECT id, created_at, created_by, target, prompt, "
+               "       context_json, cost_budget_usd, task_type, "
+               "       preferred_model_tier "
+               "FROM sibling_tasks WHERE status = 'pending'")
+        params: list = []
+        if target:
+            sql += " AND (target = ? OR target = 'any')"
+            params.append(target)
+        sql += " ORDER BY created_at ASC LIMIT ?"
+        params.append(int(limit))
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def sibling_claim(self, task_id, *, claimed_by) -> dict:
+        """Atomic claim. Refuses if already claimed/completed."""
+        cur = self._conn.execute(
+            "UPDATE sibling_tasks SET status = 'claimed', "
+            "  claimed_at = datetime('now'), claimed_by = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (claimed_by, int(task_id)),
+        )
+        self._safe_commit()
+        if cur.rowcount == 0:
+            row = self._conn.execute(
+                "SELECT status, claimed_by FROM sibling_tasks WHERE id = ?",
+                (int(task_id),),
+            ).fetchone()
+            if not row:
+                return {"ok": False, "error": "no such task"}
+            return {
+                "ok": False,
+                "error": (f"task already {row['status']}"
+                          + (f" by {row['claimed_by']}"
+                             if row["claimed_by"] else "")),
+            }
+        full = self._conn.execute(
+            "SELECT * FROM sibling_tasks WHERE id = ?",
+            (int(task_id),),
+        ).fetchone()
+        return {"ok": True, "task": dict(full) if full else None}
+
+    def sibling_complete(self, task_id, *, result_text,
+                         actual_model_used="",
+                         result_cost_usd=0.0,
+                         dispatch_quality_rating=None,
+                         dispatch_quality_notes="") -> dict:
+        """Submit a completed result + optional reciprocal grade of
+        the dispatch."""
+        cur = self._conn.execute(
+            "UPDATE sibling_tasks SET status = 'completed', "
+            "  completed_at = datetime('now'), result_text = ?, "
+            "  actual_model_used = ?, result_cost_usd = ?, "
+            "  dispatch_quality_rating = ?, dispatch_quality_notes = ? "
+            "WHERE id = ? AND status = 'claimed'",
+            (result_text, actual_model_used,
+             float(result_cost_usd),
+             (int(dispatch_quality_rating)
+              if dispatch_quality_rating is not None else None),
+             dispatch_quality_notes,
+             int(task_id)),
+        )
+        self._safe_commit()
+        if cur.rowcount == 0:
+            row = self._conn.execute(
+                "SELECT status FROM sibling_tasks WHERE id = ?",
+                (int(task_id),),
+            ).fetchone()
+            return {
+                "ok": False,
+                "error": (f"cannot complete: task is "
+                          f"{row['status'] if row else 'missing'}, "
+                          f"expected 'claimed'"),
+            }
+        return {"ok": True, "id": int(task_id)}
+
+    def sibling_reject(self, task_id, *, reason) -> dict:
+        """Mark a task as rejected (sibling chose not to do it).
+        Different from failed (sibling tried and couldn't)."""
+        cur = self._conn.execute(
+            "UPDATE sibling_tasks SET status = 'rejected', "
+            "  rejection_reason = ?, completed_at = datetime('now') "
+            "WHERE id = ? AND status IN ('pending', 'claimed')",
+            (reason, int(task_id)),
+        )
+        self._safe_commit()
+        if cur.rowcount == 0:
+            return {"ok": False, "error": "task not in rejectable state"}
+        return {"ok": True, "id": int(task_id)}
+
+    def sibling_recent_completed(self, *, limit=20,
+                                 unread_to_overseer_only=False) -> list[dict]:
+        """List recently completed tasks. Used by the overseer's tick
+        loop to find new results to integrate, and by the chat context
+        builder to surface unread results in the freshness section."""
+        sql = ("SELECT * FROM sibling_tasks "
+               "WHERE status IN ('completed', 'failed', 'rejected')")
+        if unread_to_overseer_only:
+            sql += " AND (quality_rating IS NULL OR quality_rating = 0)"
+        sql += " ORDER BY completed_at DESC LIMIT ?"
+        rows = self._conn.execute(sql, (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def sibling_rate_result(self, task_id, *, rating, notes="",
+                            dataset_candidate=False) -> dict:
+        """Overseer rates a sibling's completed result (next tick).
+        Optionally flags the (prompt, context, result) triple as a
+        training-data candidate for future Category C agents."""
+        cur = self._conn.execute(
+            "UPDATE sibling_tasks SET quality_rating = ?, "
+            "  quality_notes = ?, dataset_candidate = ? "
+            "WHERE id = ? AND status = 'completed'",
+            (int(rating), notes, 1 if dataset_candidate else 0,
+             int(task_id)),
+        )
+        self._safe_commit()
+        if cur.rowcount == 0:
+            return {"ok": False, "error": "no completed task with that id"}
+        return {"ok": True, "id": int(task_id)}
+
+    def sibling_dispatch_stats(self, *, daily_cap=20) -> dict:
+        """Headline counts + daily budget used. Surfaces in the
+        chat freshness section so the overseer sees its own
+        dispatch posture. ``daily_cap`` passed by Pi endpoint layer
+        from plugin.toml."""
+        cur = self._conn
+        rows = cur.execute(
+            "SELECT status, COUNT(*) AS n FROM sibling_tasks "
+            "GROUP BY status"
+        ).fetchall()
+        by_status = {r["status"]: r["n"] for r in rows}
+        day_start_iso = self._local_day_start_iso()
+        today_n = cur.execute(
+            "SELECT COUNT(*) AS n FROM sibling_tasks "
+            "WHERE created_by = 'overseer' AND created_at >= ?",
+            (day_start_iso,),
+        ).fetchone()["n"]
+        return {
+            "by_status": by_status,
+            "today_dispatches": today_n,
+            "daily_cap": daily_cap,
+            "remaining_today": max(0, daily_cap - today_n),
         }
