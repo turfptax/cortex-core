@@ -486,6 +486,27 @@ def build_context_block(*, working_memory: dict | None,
                     f"are fitted to a biased slice — read [high] confidence "
                     f"tags as 'high given what I've seen', not 'high full stop'."
                 )
+            # Slice 9.2.1 (2026-05-16): sibling dispatch posture
+            # (A-only). Per overseer's explicit ask: numbers only,
+            # no nudges, no "suggested next action" field — the
+            # recommendation is the overseer's job and they want
+            # the friction of deciding. No Category B/C fields here
+            # by design; we want the overseer to feel the absence
+            # of B telemetry before specifying what it should look
+            # like. See memory/agent_ecosystem_design.md.
+            sib_today = working_memory.get("sibling_dispatched_today")
+            sib_cap = working_memory.get("sibling_daily_cap")
+            sib_unrated = working_memory.get("sibling_unrated_count")
+            sib_pending = working_memory.get("sibling_pending_for_me")
+            if sib_today is not None and sib_cap is not None:
+                lines.append(
+                    f"  - Sibling (Cat A) dispatches today: "
+                    f"{sib_today}/{sib_cap}. "
+                    f"Unrated completed (you owe a rating): "
+                    f"{sib_unrated or 0}. "
+                    f"In flight (dispatched, awaiting result): "
+                    f"{sib_pending or 0}."
+                )
             lines.append("")
 
         top_projects = working_memory.get("top_projects") or []

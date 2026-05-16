@@ -2057,9 +2057,33 @@ class OverseerLoop:
         last_gist_at = self._db.last_successful_gist_at()
         gist_dist = self._db.recent_gist_source_distribution(recent_n=30)
 
+        # Slice 9.2.1 (2026-05-16): A-only sibling dispatch counters
+        # in the freshness block. Per overseer's explicit ask: numbers
+        # only — no "suggested next action" field, no nudges, no
+        # placeholders for B/C agents that don't exist yet. The
+        # overseer wants to "feel the absence of B telemetry" before
+        # specifying it. See memory/agent_ecosystem_design.md.
+        sibling_daily_cap = int(self._cfg.get(
+            "loop_daily_sibling_dispatches", 20))
+        try:
+            sibling_stats = self._db.sibling_dispatch_stats(
+                daily_cap=sibling_daily_cap)
+        except Exception as e:
+            # Defensive: if sibling_tasks table is missing on an
+            # older overseer.db (pre-9.3 migration), don't crash the
+            # working-memory build. Surface zeros instead.
+            self._log.warning(
+                "sibling_dispatch_stats failed (table missing?): %s", e)
+            sibling_stats = {
+                "today_dispatches": 0,
+                "daily_cap": sibling_daily_cap,
+                "unrated_count": 0,
+                "pending_for_me": 0,
+            }
+
         return {
             "built_at": _utc_iso(),
-            "schema_version": 6,           # 9.2: + staleness signals
+            "schema_version": 7,  # 9.2.1: + sibling A-only counters
             "top_questions": top_questions,            # PRIMARY (3f.5)
             "top_projects": top_projects,
             "recent_decisions": self._core.recent_decisions(limit=decisions_n),
@@ -2085,6 +2109,14 @@ class OverseerLoop:
             # detect when its recent-themes view is fitted to a biased
             # slice (e.g. all chatgpt-archive rollups, no grok yet).
             "recent_gist_source_distribution": gist_dist,
+            # 9.2.1: sibling dispatch posture (A-only). today_dispatches
+            # is the cap counter; unrated_count is completed-but-not-
+            # rated-by-overseer; pending_for_me is dispatched-but-
+            # not-yet-returned. Rendered in chat freshness section.
+            "sibling_dispatched_today": sibling_stats["today_dispatches"],
+            "sibling_daily_cap": sibling_stats["daily_cap"],
+            "sibling_unrated_count": sibling_stats["unrated_count"],
+            "sibling_pending_for_me": sibling_stats["pending_for_me"],
         }
 
     # ── Backfill (manual) ────────────────────────────────────────

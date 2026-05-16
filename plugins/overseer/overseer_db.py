@@ -3350,17 +3350,59 @@ class OverseerDB(CortexDB):
         return project
 
     def get_project_summary(self, project):
-        row = self._conn.execute(
+        """Look up a project_summaries row by name.
+
+        Bug fix 2026-05-16 (task 4 diagnostic): callers from the chat
+        tool surface pass the *tag* form (`openmuscle-flexgrid`) read
+        from working_memory.top_projects, while the table's PK is the
+        *display* form (`OpenMuscle-FlexGrid`). SQLite's default
+        BINARY collation made exact lookups fail. We now try, in
+        order:
+          1. exact match
+          2. case-insensitive match (COLLATE NOCASE)
+          3. slug-normalized match (lowercase, spaces↔hyphens)
+        First hit wins. Returns None if all three miss.
+        """
+        if not project:
+            return None
+        cur = self._conn
+        # 1. exact
+        row = cur.execute(
             "SELECT * FROM project_summaries WHERE project = ?",
             (project,),
+        ).fetchone()
+        if row:
+            return dict(row)
+        # 2. case-insensitive
+        row = cur.execute(
+            "SELECT * FROM project_summaries "
+            "WHERE project = ? COLLATE NOCASE",
+            (project,),
+        ).fetchone()
+        if row:
+            return dict(row)
+        # 3. slug-normalized: lowercase + treat hyphens and spaces
+        #    as interchangeable. Compare normalized PK against
+        #    normalized input.
+        wanted = project.lower().replace(" ", "-")
+        row = cur.execute(
+            "SELECT * FROM project_summaries "
+            "WHERE REPLACE(LOWER(project), ' ', '-') = ?",
+            (wanted,),
         ).fetchone()
         return dict(row) if row else None
 
     def list_project_summaries(self, *, order_by="last_active_at",
-                               descending=True):
-        """List all project summaries. order_by: any column name —
-        common picks: last_active_at (default), session_count,
-        cost_usd_estimate, total_minutes."""
+                               descending=True, limit=None):
+        """List project summaries. ``order_by`` is one of a whitelisted
+        column set. ``limit`` is an optional cap on rows returned.
+
+        Bug fix 2026-05-16 (task 4 diagnostic): the chat tool surface
+        ``list_active_projects`` passes ``limit=`` per its declared
+        schema but the original signature didn't accept it, throwing
+        TypeError on every call. The limit is applied SQL-side for
+        efficiency.
+        """
         # Whitelist to prevent SQL injection via order_by.
         allowed = {
             "last_active_at", "session_count", "cost_usd_estimate",
@@ -3375,11 +3417,20 @@ class OverseerDB(CortexDB):
         sql = "SELECT * FROM project_summaries ORDER BY {} {} NULLS LAST".format(
             order_by, direction,
         )
+        params = ()
+        if limit is not None:
+            try:
+                lim = max(1, int(limit))
+            except (TypeError, ValueError):
+                lim = 50
+            sql = sql + " LIMIT ?"
+            params = (lim,)
         try:
-            rows = self._conn.execute(sql).fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
         except sqlite3.OperationalError:
+            # Older SQLite without NULLS LAST support: retry without it.
             sql = sql.replace(" NULLS LAST", "")
-            rows = self._conn.execute(sql).fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     def delete_project_summary(self, project):
@@ -4032,7 +4083,17 @@ class OverseerDB(CortexDB):
         """Headline counts + daily budget used. Surfaces in the
         chat freshness section so the overseer sees its own
         dispatch posture. ``daily_cap`` passed by Pi endpoint layer
-        from plugin.toml."""
+        from plugin.toml.
+
+        Slice 9.2.1 (2026-05-16): added ``unrated_count`` and
+        ``pending_for_me`` so the overseer's freshness block shows
+        the read-side of its own dispatch posture (\"are there
+        completed tasks I owe a rating to; are there dispatches
+        still in flight\"), not just the write-side counter.
+        Per overseer's explicit ask: \"the loop should surface it
+        the same way it surfaces ingest queue depth and last-gist
+        age.\" A-only — no Category B/C placeholders.
+        """
         cur = self._conn
         rows = cur.execute(
             "SELECT status, COUNT(*) AS n FROM sibling_tasks "
@@ -4045,9 +4106,28 @@ class OverseerDB(CortexDB):
             "WHERE created_by = 'overseer' AND created_at >= ?",
             (day_start_iso,),
         ).fetchone()["n"]
+        # Completed tasks the overseer dispatched but hasn't rated
+        # yet. Scoped to created_by='overseer' because that's whose
+        # audit loop the rating closes — Tory-created test tasks
+        # don't appear in the overseer's "unrated" tally.
+        unrated_n = cur.execute(
+            "SELECT COUNT(*) AS n FROM sibling_tasks "
+            "WHERE status = 'completed' "
+            "AND quality_rating IS NULL "
+            "AND created_by = 'overseer'"
+        ).fetchone()["n"]
+        # Dispatches still in flight (no sibling has finished yet).
+        # Includes both unclaimed (pending) and in-progress (claimed).
+        pending_for_me_n = cur.execute(
+            "SELECT COUNT(*) AS n FROM sibling_tasks "
+            "WHERE created_by = 'overseer' "
+            "AND status IN ('pending', 'claimed')"
+        ).fetchone()["n"]
         return {
             "by_status": by_status,
             "today_dispatches": today_n,
             "daily_cap": daily_cap,
             "remaining_today": max(0, daily_cap - today_n),
+            "unrated_count": unrated_n,
+            "pending_for_me": pending_for_me_n,
         }
