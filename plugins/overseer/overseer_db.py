@@ -842,6 +842,23 @@ class OverseerDB(CortexDB):
         self._conn.executescript(OVERSEER_SCHEMA_SQL)
         self._safe_commit()
         self._migrate_3f5()
+        # Slice 9.4.1 (2026-05-16): every _at column gets a paired
+        # local_<col>_at populated by trigger. Auto-discovers any new
+        # tables added by future slices so the "time always shows
+        # local + tz" rule (memory/feedback_time_always_local_with_tz.md)
+        # is backstopped structurally, not just by writer convention.
+        # Idempotent and cheap; safe to call at every init.
+        try:
+            import sys as _sys
+            from pathlib import Path as _Path
+            _src = str(_Path(__file__).resolve().parent.parent.parent / "src")
+            if _src not in _sys.path:
+                _sys.path.insert(0, _src)
+            from timestamp_localizer import ensure_local_timestamp_columns
+            ensure_local_timestamp_columns(self._conn)
+        except Exception as e:
+            log.warning(
+                "overseer_db: timestamp_localizer init failed: %s", e)
 
     def _safe_commit(self):
         """Lock-protected commit. Use this instead of self._conn.commit()

@@ -187,6 +187,14 @@ class CortexDB:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA_SQL)
         self._conn.commit()
+        # Slice 9.4.1 (2026-05-16): every timestamp column gets a
+        # paired local_<col>_at (ISO with explicit offset) populated
+        # by trigger. Backstops the durable rule that every displayed
+        # time must include timezone — see
+        # memory/feedback_time_always_local_with_tz.md.
+        # Idempotent: cost-near-zero after first call.
+        from timestamp_localizer import ensure_local_timestamp_columns
+        ensure_local_timestamp_columns(self._conn)
 
     def close(self):
         if self._conn:

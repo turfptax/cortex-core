@@ -365,8 +365,24 @@ def build_context_block(*, working_memory: dict | None,
     # layers (questions, themes) live in their own sections only.
     if working_memory:
         lines.append("## Working memory")
-        if working_memory.get("built_at"):
-            lines.append("(built {})".format(working_memory["built_at"]))
+        # Slice 9.4.1: prefer local-with-offset render. Strip the
+        # seconds + offset prefix to its display-friendly form. UTC
+        # fallback always carries an explicit " UTC" suffix so the
+        # frame is never naked. See
+        # memory/feedback_time_always_local_with_tz.md.
+        _wm_built_local = working_memory.get("local_built_at") or ""
+        _wm_built_utc = working_memory.get("built_at") or ""
+        if _wm_built_local:
+            # "2026-05-16T21:33:11-05:00" → "2026-05-16 21:33 CDT/CST"
+            _abbr_for = {"-05:00": "CDT", "-06:00": "CST"}
+            _date_part = _wm_built_local[:10]
+            _time_part = _wm_built_local[11:16]
+            _off = _wm_built_local[19:]
+            _tz_abbr = _abbr_for.get(_off, _off or "local")
+            lines.append(
+                "(built {} {} {})".format(_date_part, _time_part, _tz_abbr))
+        elif _wm_built_utc:
+            lines.append("(built {} UTC)".format(_wm_built_utc))
 
         # ── Slice 9.2 (overseer ask #2): freshness + ingest backlog ─
         # The overseer asked to be able to tell when its own working
@@ -451,7 +467,10 @@ def build_context_block(*, working_memory: dict | None,
                               "gist-derived claims, ingest layer is stalled")
                 lines.append(f"  - Last gist: {g_note}")
             elif last_gist:
-                lines.append(f"  - Last gist written: {last_gist}")
+                # Slice 9.4.1: explicit UTC marker. last_gist comes
+                # from sqlite MAX(created_at) which is naked UTC; we
+                # don't have a paired local var at this aggregate.
+                lines.append(f"  - Last gist written: {last_gist} UTC")
             if queue_total is not None:
                 if queue_total == 0:
                     lines.append("  - Ingest queue: empty (you are caught up)")

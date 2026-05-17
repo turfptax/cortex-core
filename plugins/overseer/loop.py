@@ -2105,9 +2105,18 @@ class OverseerLoop:
                 "pending_for_me": 0,
             }
 
+        # Slice 9.4.1 (2026-05-16): always emit BOTH UTC and local-
+        # with-offset timestamps so any display surface can pick the
+        # correct frame. See memory/feedback_time_always_local_with_tz.md.
+        try:
+            from temporal import format_local_iso as _fmt_local_iso
+            _local_built_at = _fmt_local_iso()
+        except Exception:
+            _local_built_at = ""
         return {
             "built_at": _utc_iso(),
-            "schema_version": 7,  # 9.2.1: + sibling A-only counters
+            "local_built_at": _local_built_at,
+            "schema_version": 8,  # 9.4.1: +local_built_at
             "top_questions": top_questions,            # PRIMARY (3f.5)
             "top_projects": top_projects,
             "recent_decisions": self._core.recent_decisions(limit=decisions_n),
