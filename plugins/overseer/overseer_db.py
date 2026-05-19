@@ -28,6 +28,7 @@ cortex.db + the bundled Session 0 seed is supported.
 import json
 import sqlite3
 import threading
+from datetime import datetime, timezone
 
 from cortex_db import CortexDB
 
@@ -2635,6 +2636,57 @@ class OverseerDB(CortexDB):
         self._conn.execute("DELETE FROM chat_message_files")
         self._conn.execute("DELETE FROM chat_messages")
         self._safe_commit()
+
+    def compress_chat_replace(self, *, old_ids, summary_content,
+                              created_at=None, metadata=None):
+        """Slice 9.5 CP3: atomically replace a set of older chat messages
+        with one synthetic 'system' role message containing their
+        compressed summary.
+
+        Order matters and we serialize under the write lock so a
+        concurrent chat() write can't interleave between the delete
+        and the insert.
+
+        Returns the new chat_messages.id of the synthetic prefix row.
+        """
+        old_ids = [int(i) for i in (old_ids or []) if i is not None]
+        meta_json = json.dumps(metadata or {}, ensure_ascii=False)
+        with self._write_lock:
+            try:
+                # 1. Clean up any chat_message_files belonging to the
+                # messages being compressed (FK CASCADE is OFF; manual).
+                if old_ids:
+                    placeholders = ",".join("?" * len(old_ids))
+                    self._conn.execute(
+                        f"DELETE FROM chat_message_files "
+                        f"WHERE chat_message_id IN ({placeholders})",
+                        old_ids,
+                    )
+                    self._conn.execute(
+                        f"DELETE FROM chat_messages "
+                        f"WHERE id IN ({placeholders})",
+                        old_ids,
+                    )
+                # 2. Insert the synthetic. created_at controls sort
+                # position; we set it to the oldest dropped timestamp
+                # so the prefix sorts to the HEAD of the thread.
+                cur = self._conn.execute(
+                    "INSERT INTO chat_messages "
+                    "(role, content, backend, model, latency_ms, "
+                    "cost_usd, prompt_tokens, response_tokens, "
+                    "metadata_json, created_at) VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("system", summary_content, "compress-internal",
+                     "anthropic/claude-sonnet-4.6", 0, 0.0, 0, 0,
+                     meta_json,
+                     created_at or datetime.now(timezone.utc).strftime(
+                         "%Y-%m-%d %H:%M:%S")),
+                )
+                self._conn.commit()
+                return cur.lastrowid
+            except Exception:
+                self._conn.rollback()
+                raise
 
     # ── Slice 8: chat file attachments ──────────────────────────
 

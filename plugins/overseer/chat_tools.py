@@ -440,6 +440,44 @@ TOOL_DEFINITIONS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "compress_chat",
+            "description": (
+                "Fold older messages in THIS chat thread into a single "
+                "Sonnet-summarized prefix. Use when you notice the chat "
+                "history is bloating your per-turn context cost — "
+                "specifically when (a) the thread has 20+ turns and the "
+                "older half is no longer actively load-bearing for the "
+                "current topic, or (b) Tory has shifted topic and the "
+                "prior context is now noise, or (c) you've been calling "
+                "many tools and the tool-result text is dominating "
+                "history.\n\nDO NOT use this if: the conversation is "
+                "active and recent context matters, the thread is < 15 "
+                "turns, or you're mid-decision and need the original "
+                "framing intact. Compression is destructive — the "
+                "originals are deleted and replaced with the summary.\n\n"
+                "Cost: ~$0.01-0.02 per compression (Sonnet). The "
+                "compression summary is preserved as a synthetic system "
+                "message at the head of the thread; future turns read "
+                "it as context. Tool-call audit (which tools you "
+                "called) IS preserved in the summary."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keep_recent": {
+                        "type": "integer",
+                        "description": (
+                            "How many of the most recent turns to keep "
+                            "raw. Default 12. Minimum 2."
+                        ),
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "dispatch_sibling",
             "description": (
                 "Dispatch a task to a sibling agent (currently: a Claude "
@@ -539,17 +577,20 @@ def _row_to_dict(row) -> dict:
 
 
 def dispatch_tool(name: str, args: dict, *, db, core_memory,
-                  sibling_daily_cap: int = 20) -> str:
+                  sibling_daily_cap: int = 20, llm=None) -> str:
     """Execute a tool call. Returns a JSON-serialized result string
     bounded to MAX_TOOL_RESULT_CHARS. Errors are returned as JSON
     `{"error": "..."}` so the model can react rather than crash.
 
     sibling_daily_cap (Slice 9.3): max number of dispatch_sibling
     calls the overseer can make per local day. Passed through from
-    the chat handler which reads it from plugin.toml at the edge."""
+    the chat handler which reads it from plugin.toml at the edge.
+
+    llm (Slice 9.5 CP3): LLMRouter handle. Required by compress_chat
+    tool only — other tools work without it."""
     try:
         result = _dispatch(name, args or {}, db=db, core_memory=core_memory,
-                           sibling_daily_cap=sibling_daily_cap)
+                           sibling_daily_cap=sibling_daily_cap, llm=llm)
         text = json.dumps(result, default=str, ensure_ascii=False)
         return _truncate(text)
     except Exception as e:
@@ -558,7 +599,7 @@ def dispatch_tool(name: str, args: dict, *, db, core_memory,
 
 
 def _dispatch(name: str, args: dict, *, db, core_memory,
-              sibling_daily_cap: int = 20):
+              sibling_daily_cap: int = 20, llm=None):
     if name == "get_recent_human_journal":
         limit = max(1, min(50, int(args.get("limit", 10))))
         rows = db.list_human_journal_entries(limit=limit)
@@ -723,6 +764,23 @@ def _dispatch(name: str, args: dict, *, db, core_memory,
             dataset_candidate=dataset)
 
     # ── Slice 9.3: dispatch_sibling — first write tool on the surface ──
+    if name == "compress_chat":
+        # Slice 9.5 CP3: overseer can fold its own older chat turns
+        # into a Sonnet-summarized prefix when it notices context
+        # bloating. Tory's directive 2026-05-19: "they can always
+        # use tools" — give the overseer agency over its own context
+        # window cost.
+        if llm is None:
+            return {"error": "llm router unavailable"}
+        keep_recent = int(args.get("keep_recent") or 12)
+        try:
+            import chat as _chat_mod
+            return _chat_mod.compress_chat_history(
+                db=db, llm=llm, keep_recent=keep_recent,
+            )
+        except Exception as e:
+            return {"error": f"compress failed: {e}"[:200]}
+
     if name == "dispatch_sibling":
         prompt = (args.get("prompt") or "").strip()
         if not prompt:

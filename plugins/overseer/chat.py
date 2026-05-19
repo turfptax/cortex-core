@@ -1085,6 +1085,7 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
             tool_result = chat_tools.dispatch_tool(
                 fn_name, fn_args, db=db, core_memory=core_memory,
                 sibling_daily_cap=sibling_daily_cap,
+                llm=llm,  # Slice 9.5 CP3: compress_chat needs LLMRouter
             )
             tool_call_audit.append({
                 "iter": iter_num,
@@ -1180,4 +1181,204 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
         "insight_candidates": insight_candidates,
         "chat_correction_id": chat_correction_id,   # 3i CP2
         "attachments": persisted_attachments,        # Slice 8
+    }
+
+
+# ── Slice 9.5 CP3 (2026-05-19): chat history compression ───────────
+#
+# Folds older chat turns into a single synthesized "system" message
+# summarizing topics, decisions, and tool-call audit. Two trigger
+# surfaces:
+#   1. Manual: POST /plugins/overseer/chat/compress (slash command)
+#   2. Tool:   overseer can call compress_chat mid-conversation
+#              when it notices its own context bloating
+#
+# Strategy: keep the N most recent raw messages, summarize everything
+# older into ONE message, DELETE the originals, INSERT the synthetic
+# at a created_at equal to the oldest dropped message so it sorts
+# correctly into chronological position at the head of the thread.
+#
+# Cost target: < $0.02 per compression. Sonnet on ~12K input tokens
+# of older history produces ~600 tokens of summary. Cheap relative
+# to the ongoing Opus chat cost the compression bounds.
+
+COMPRESS_KEEP_RECENT_DEFAULT = 12
+COMPRESS_PROMPT = """You are condensing the older portion of a chat thread \
+between a user (Tory) and an AI agent (the overseer) so the recent \
+conversation has continuity without paying for the full history every \
+turn.
+
+Below is the thread to compress, newest at the bottom. Produce a tight, \
+bullet-structured summary covering:
+
+1. Main topics discussed — what was the conversation actually about?
+2. Decisions Tory made, directives he gave, or commitments either party made.
+3. Tools the overseer called (preserve tool names + key results that \
+   informed downstream reasoning).
+4. Open threads — anything pending, undelivered, or explicitly deferred.
+5. Anything Tory expressed strong feeling about (positive or negative) \
+   that the future-overseer should know.
+
+Constraints:
+- Under 800 words.
+- No preamble. No "Summary:" header. Start directly with the bullets.
+- Use Markdown headings + bullets for structure.
+- Preserve specific names (people, projects, files, slice IDs, commit \
+  SHAs) verbatim — those are load-bearing for memory recall.
+- If a topic was raised but went nowhere, say "Raised but not resolved: ..." \
+  rather than dropping it silently.
+
+Thread to compress:
+"""
+
+
+def compress_chat_history(*, db, llm, keep_recent: int = COMPRESS_KEEP_RECENT_DEFAULT
+                          ) -> dict:
+    """Fold older chat messages into one synthesized prefix message.
+
+    Returns {"ok": bool, "messages_before": int, "messages_after": int,
+             "compressed_summary": str, "cost_usd": float,
+             "compressed_message_id": int, "error": str}.
+
+    No-ops cleanly:
+      - If total chat messages <= keep_recent + 1, returns ok=True with
+        messages_before == messages_after.
+      - If keep_recent < 2, clamps to 2 to keep at least one Q/A pair
+        as raw context.
+    """
+    keep_recent = max(2, int(keep_recent))
+    total = db.chat_message_count()
+    if total <= keep_recent + 1:
+        # Nothing meaningful to compress
+        return {
+            "ok": True, "messages_before": total, "messages_after": total,
+            "compressed_summary": "",
+            "cost_usd": 0.0,
+            "compressed_message_id": 0,
+            "error": "",
+        }
+
+    # Pull all messages oldest-first. recent_chat_messages returns
+    # chronological order despite the SELECT being DESC internally.
+    all_msgs = db.recent_chat_messages(limit=max(total, 1000))
+    if len(all_msgs) <= keep_recent + 1:
+        return {
+            "ok": True, "messages_before": len(all_msgs),
+            "messages_after": len(all_msgs),
+            "compressed_summary": "", "cost_usd": 0.0,
+            "compressed_message_id": 0, "error": "",
+        }
+
+    to_compress = all_msgs[:-keep_recent]
+    to_keep = all_msgs[-keep_recent:]
+    if not to_compress:
+        return {
+            "ok": True, "messages_before": len(all_msgs),
+            "messages_after": len(all_msgs),
+            "compressed_summary": "", "cost_usd": 0.0,
+            "compressed_message_id": 0, "error": "",
+        }
+
+    # Build the thread transcript for the summarizer. Truncate each
+    # message at 1200 chars so a giant assistant monologue doesn't
+    # dominate the prompt budget — the summary will lose granular
+    # detail anyway. Tool-call audit lives in metadata_json; surface
+    # the tool names so the summary can mention them.
+    parts = []
+    for m in to_compress:
+        role = (m.get("role") or "?").upper()
+        ts = m.get("local_created_at") or m.get("created_at") or "?"
+        content = (m.get("content") or "").strip()
+        if len(content) > 1200:
+            content = content[:1200] + " […]"
+        # Surface tool calls if any
+        tool_calls_summary = ""
+        try:
+            meta = json.loads(m.get("metadata_json") or "{}")
+            tcs = meta.get("tool_calls") or []
+            if tcs:
+                names = [tc.get("name") or "?" for tc in tcs]
+                tool_calls_summary = f"\n[tool calls: {', '.join(names)}]"
+        except Exception:
+            pass
+        parts.append(f"[{ts}] {role}:\n{content}{tool_calls_summary}")
+    transcript = "\n\n".join(parts)
+
+    prompt = COMPRESS_PROMPT + transcript
+
+    # Use Sonnet for compression — cheaper than Opus, fully capable
+    # for summarization. Bypass chat tools (compression doesn't need
+    # to call other tools).
+    log.info(
+        "compress_chat_history: compressing %d msgs, keeping %d recent",
+        len(to_compress), len(to_keep),
+    )
+    result = llm.complete(
+        prompt,
+        system="You compress chat threads for downstream context. "
+               "Bullet structure. Under 800 words. Preserve specific "
+               "names and tool calls verbatim.",
+        backend="openrouter",
+        model="anthropic/claude-sonnet-4.6",
+        max_tokens=1200,
+        temperature=0.3,
+        purpose="chat-compress",
+    )
+    if not result.get("ok"):
+        return {
+            "ok": False, "messages_before": len(all_msgs),
+            "messages_after": len(all_msgs),
+            "compressed_summary": "", "cost_usd": 0.0,
+            "compressed_message_id": 0,
+            "error": result.get("error", "LLM failed"),
+        }
+    summary_text = (result.get("text") or "").strip()
+    cost = float(result.get("cost_usd") or 0.0)
+
+    # Wrap the summary so it's clearly identifiable as compressed
+    # context, not a real user/assistant turn.
+    wrapped = (
+        f"**[Compressed context — {len(to_compress)} earlier messages "
+        f"folded into this summary at "
+        f"{(to_compress[0].get('local_created_at') or to_compress[0].get('created_at') or '?')} "
+        f"→ {(to_compress[-1].get('local_created_at') or to_compress[-1].get('created_at') or '?')}]**\n\n"
+        + summary_text
+    )
+
+    # Delete the old messages (and their chat_message_files via
+    # explicit cleanup — FK CASCADE is off per overseer_db.py:
+    # clear_chat()'s pattern). Then insert the synthetic at the
+    # oldest dropped timestamp so it sorts to the head.
+    ids_to_delete = [int(m["id"]) for m in to_compress if m.get("id")]
+    oldest_ts = to_compress[0].get("created_at")
+    try:
+        new_id = db.compress_chat_replace(
+            old_ids=ids_to_delete,
+            summary_content=wrapped,
+            created_at=oldest_ts,
+            metadata={
+                "compressed_from_count": len(to_compress),
+                "compressed_from_ids": ids_to_delete,
+                "compress_cost_usd": cost,
+                "compress_model": result.get("model", ""),
+            },
+        )
+    except Exception as e:
+        log.exception("compress_chat_history: DB write failed: %s", e)
+        return {
+            "ok": False, "messages_before": len(all_msgs),
+            "messages_after": len(all_msgs),
+            "compressed_summary": "", "cost_usd": cost,
+            "compressed_message_id": 0,
+            "error": f"DB write failed: {e}",
+        }
+
+    return {
+        "ok": True,
+        "messages_before": len(all_msgs),
+        "messages_after": len(to_keep) + 1,  # +1 for the synthetic prefix
+        "compressed_summary": summary_text,
+        "cost_usd": cost,
+        "compressed_message_id": new_id,
+        "error": "",
     }

@@ -240,6 +240,7 @@ class OverseerPlugin(Plugin):
             Route("POST", "/chat",                  self._http_chat),
             Route("GET",  "/chat/history",          self._http_chat_history),
             Route("POST", "/chat/clear",            self._http_chat_clear),
+            Route("POST", "/chat/compress",         self._http_chat_compress),
             # ── Slice 3e: notifications ─────────────────────────
             Route("GET",  "/notifications",         self._http_notifications),
             Route("POST", "/notifications/dismiss", self._http_notifications_dismiss),
@@ -2402,6 +2403,31 @@ class OverseerPlugin(Plugin):
         n = self.overseer_db.chat_message_count()
         self.overseer_db.clear_chat()
         return {"ok": True, "cleared": n}
+
+    def _http_chat_compress(self, payload):
+        """POST /plugins/overseer/chat/compress
+        Body: {"keep_recent"?: int}  default 12
+
+        Slice 9.5 CP3: fold older chat turns into a Sonnet-generated
+        summary so the recent conversation has continuity without
+        paying for the full thread every turn. Surface for both Tory
+        (via /compress slash command) and the overseer (via the
+        compress_chat tool — see chat_tools.py)."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        if self.llm is None:
+            return {"ok": False, "error": "llm not initialized"}
+        keep_recent = int(payload.get("keep_recent") or 12)
+        try:
+            import chat as _chat_mod
+            return _chat_mod.compress_chat_history(
+                db=self.overseer_db,
+                llm=self.llm,
+                keep_recent=keep_recent,
+            )
+        except Exception as e:
+            log.exception("chat/compress failed")
+            return {"ok": False, "error": str(e)[:500]}
 
     def _http_notifications(self, payload):
         """GET /plugins/overseer/notifications
