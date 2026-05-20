@@ -330,10 +330,39 @@ CREATE TABLE IF NOT EXISTS notifications (
     rule_key TEXT NOT NULL,                    -- per-rule dedup key
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     dismissed_at TEXT,                          -- nullable
+    -- Slice 9.6 CP1 (2026-05-19): per-notification custom action
+    -- buttons. JSON array of {label, kind, payload?}. kind ∈
+    -- predefined CRUD names ('archive_project', 'mark_dormant', ...)
+    -- | 'free_text' | 'yes_no' | 'dispatch_sibling' | 'custom'.
+    -- When set, the frontend renders these BUTTONS in addition to
+    -- the standard Archive/Snooze/Touch row. User responses land
+    -- in notification_responses keyed by notification_id.
+    actions_json TEXT NOT NULL DEFAULT '[]',
     UNIQUE(rule_name, rule_key)
 );
 CREATE INDEX IF NOT EXISTS idx_notif_dismissed ON notifications(dismissed_at);
 CREATE INDEX IF NOT EXISTS idx_notif_severity ON notifications(severity);
+
+-- Slice 9.6 CP1: Tory's responses to notification action buttons.
+-- Logged on click. Overseer reads via get_pending_notification_responses
+-- (CP3) and marks processed_at to dequeue. This upgrades the Bell
+-- tab from one-way alerts into a structured two-way command channel
+-- (the structural fix to the Bell-tab-functionally-abandoned finding
+-- earlier today).
+CREATE TABLE IF NOT EXISTS notification_responses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    notification_id INTEGER NOT NULL,
+    action_kind TEXT NOT NULL,                 -- 'archive_project' | 'free_text' | 'yes_no' | 'dispatch_sibling' | custom
+    action_label TEXT NOT NULL DEFAULT '',     -- the button label clicked
+    response_payload_json TEXT NOT NULL DEFAULT '{}',
+                                               -- {value: 'yes'/'no'/text/...} +
+                                               -- any extras the action's payload carries
+    taken_at TEXT NOT NULL DEFAULT (datetime('now')),
+    processed_by_overseer_at TEXT,             -- nullable; overseer sets via mark_processed
+    FOREIGN KEY (notification_id) REFERENCES notifications(id)
+);
+CREATE INDEX IF NOT EXISTS idx_notif_resp_notif ON notification_responses(notification_id);
+CREATE INDEX IF NOT EXISTS idx_notif_resp_unread ON notification_responses(processed_by_overseer_at);
 
 -- ─ Slice 3f: dialectic checker (paired generation) ─────────────
 -- Every interpretive artifact (gist, theme, episode, question) is
@@ -1318,13 +1347,29 @@ class OverseerDB(CortexDB):
         need to additively pick up the table + indexes; the CREATE
         TABLE IF NOT EXISTS in the schema handles that on every boot.
 
-        This method is the chain anchor for future additive columns
-        we may add to sibling_tasks (e.g. a deadline_at, or a
-        parent_task_id for subtask trees). When we add those, ALTER
-        TABLE statements go here gated on a try/except OperationalError
-        check, same pattern as _migrate_3f5.
+        Chain: 9.6 notification custom actions.
         """
-        return
+        self._migrate_9_6_notification_actions()
+
+    def _migrate_9_6_notification_actions(self):
+        """Slice 9.6 CP1 (2026-05-19): notifications gain actions_json
+        column for per-notification custom action buttons. Fresh
+        installs get it via OVERSEER_SCHEMA_SQL; existing installs
+        (the .25 we deploy to) need an ALTER TABLE here.
+
+        notification_responses table is created by CREATE TABLE IF
+        NOT EXISTS in the schema — no migration needed for it on
+        existing installs.
+        """
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(notifications)"
+        ).fetchall()}
+        if "actions_json" not in cols:
+            self._conn.execute(
+                "ALTER TABLE notifications ADD COLUMN actions_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
+            self._safe_commit()
 
     # ── overseer_state ──────────────────────────────────────────
 
@@ -2825,6 +2870,166 @@ class OverseerDB(CortexDB):
         )
         self._safe_commit()
         return cur.rowcount > 0
+
+    # ── Slice 9.6 CP2 (2026-05-19): chat message redaction ─────
+
+    def delete_chat_message(self, message_id):
+        """Delete a single chat_messages row + its attachments. Used
+        by overseer's redact_chat_message tool when Tory has asked
+        for a message to be scrubbed. FK CASCADE is off on this DB,
+        so attachments must be deleted explicitly first."""
+        message_id = int(message_id)
+        with self._write_lock:
+            self._conn.execute(
+                "DELETE FROM chat_message_files WHERE chat_message_id = ?",
+                (message_id,),
+            )
+            cur = self._conn.execute(
+                "DELETE FROM chat_messages WHERE id = ?",
+                (message_id,),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def redact_chat_attachment(self, *, file_id=None, message_id=None):
+        """Delete a chat attachment (file) without deleting the message.
+        Pass either file_id (single file) OR message_id (all files on
+        that message). Returns the count deleted.
+
+        The underlying file on disk under /uploads is NOT touched here —
+        that's the responsibility of a separate file-cleanup pass. We
+        only remove the DB linkage so the file no longer appears in
+        chat history or LLM prompt construction.
+        """
+        with self._write_lock:
+            if file_id is not None:
+                cur = self._conn.execute(
+                    "DELETE FROM chat_message_files WHERE id = ?",
+                    (int(file_id),),
+                )
+            elif message_id is not None:
+                cur = self._conn.execute(
+                    "DELETE FROM chat_message_files "
+                    "WHERE chat_message_id = ?",
+                    (int(message_id),),
+                )
+            else:
+                return 0
+            self._conn.commit()
+            return cur.rowcount
+
+    # ── Slice 9.6 CP1 (2026-05-19): notification responses ─────
+
+    def add_notification_response(self, *, notification_id, action_kind,
+                                   action_label="", response_payload=None):
+        """Log Tory's click/response to a custom action button on a
+        notification. response_payload is dict (auto-JSON-encoded).
+        Returns the new notification_responses.id."""
+        payload_json = json.dumps(response_payload or {},
+                                   ensure_ascii=False, sort_keys=True)
+        with self._write_lock:
+            cur = self._conn.execute(
+                "INSERT INTO notification_responses "
+                "(notification_id, action_kind, action_label, "
+                "response_payload_json) VALUES (?, ?, ?, ?)",
+                (int(notification_id), action_kind,
+                 action_label or "", payload_json),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def list_pending_notification_responses(self, *, limit=50):
+        """Return responses that overseer hasn't marked processed yet.
+        Joined to the notification's title + rule + body so overseer
+        sees the full context in one call.
+
+        Slice 9.6 CP3: read tool for overseer. After reading, overseer
+        should call mark_notification_responses_processed with the
+        returned ids to dequeue.
+        """
+        rows = self._conn.execute(
+            "SELECT nr.id, nr.notification_id, nr.action_kind, "
+            "  nr.action_label, nr.response_payload_json, nr.taken_at, "
+            "  nr.local_taken_at, "
+            "  n.rule_name, n.rule_key, n.title as notif_title, "
+            "  n.body as notif_body, n.related_table, n.related_id, "
+            "  n.actions_json "
+            "FROM notification_responses nr "
+            "LEFT JOIN notifications n ON n.id = nr.notification_id "
+            "WHERE nr.processed_by_overseer_at IS NULL "
+            "ORDER BY nr.id ASC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["response_payload"] = json.loads(
+                    d.pop("response_payload_json", None) or "{}")
+            except Exception:
+                d["response_payload"] = {}
+            try:
+                d["actions"] = json.loads(d.pop("actions_json", None) or "[]")
+            except Exception:
+                d["actions"] = []
+            out.append(d)
+        return out
+
+    def pending_notification_responses_count(self):
+        """Count of unprocessed responses — surfaced in working memory
+        freshness so overseer notices new responses without polling."""
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM notification_responses "
+            "WHERE processed_by_overseer_at IS NULL"
+        ).fetchone()[0]
+
+    def mark_notification_responses_processed(self, *, response_ids):
+        """Mark a list of response ids as read by overseer. Idempotent."""
+        ids = [int(i) for i in (response_ids or []) if i is not None]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        with self._write_lock:
+            cur = self._conn.execute(
+                f"UPDATE notification_responses "
+                f"SET processed_by_overseer_at = datetime('now') "
+                f"WHERE id IN ({placeholders}) "
+                f"AND processed_by_overseer_at IS NULL",
+                ids,
+            )
+            self._conn.commit()
+            return cur.rowcount
+
+    def emit_notification(self, *, severity, title, body="",
+                           rule_name="overseer-emit", rule_key=None,
+                           related_table="", related_id="",
+                           action_url="", actions=None):
+        """Slice 9.6 CP3: insert a notification with custom action
+        buttons. If rule_key is None we auto-generate one so each
+        emit creates a distinct row (otherwise UNIQUE(rule_name,
+        rule_key) coalesces multiple emits into one).
+
+        actions: list of dicts {label, kind, payload?}. JSON-encoded
+        into actions_json. The frontend renders them as buttons.
+
+        Returns the new notification.id."""
+        actions = actions or []
+        actions_json = json.dumps(actions, ensure_ascii=False, sort_keys=True)
+        if not rule_key:
+            # Auto-key per insert so emits don't coalesce
+            import uuid
+            rule_key = f"emit-{uuid.uuid4().hex[:12]}"
+        with self._write_lock:
+            cur = self._conn.execute(
+                "INSERT INTO notifications "
+                "(severity, title, body, related_table, related_id, "
+                "action_url, rule_name, rule_key, actions_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (severity, title, body, related_table, related_id,
+                 action_url, rule_name, rule_key, actions_json),
+            )
+            self._conn.commit()
+            return cur.lastrowid
 
     def auto_archive_stale_notifications(self, *, rule_name,
                                           older_than_days):

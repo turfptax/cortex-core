@@ -2155,6 +2155,15 @@ class OverseerLoop:
             # block answer "is the git channel current?" and "what am I
             # NOT seeing?" — overseer's explicit caveat on the slice.
             "git_ingest": git_ingest_state,
+            # 9.6 CP3: unread notification responses from Tory. Bell
+            # tab is now a two-way channel; this is the count of
+            # action-button clicks / free-text replies overseer hasn't
+            # yet read+acted-on. Surfaced in freshness so overseer
+            # notices when Tory has actually responded.
+            "pending_notification_responses": (
+                self._db.pending_notification_responses_count()
+                if hasattr(self._db, "pending_notification_responses_count")
+                else 0),
         }
 
     # ── Backfill (manual) ────────────────────────────────────────

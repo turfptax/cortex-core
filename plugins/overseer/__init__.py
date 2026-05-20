@@ -245,6 +245,7 @@ class OverseerPlugin(Plugin):
             Route("GET",  "/notifications",         self._http_notifications),
             Route("POST", "/notifications/dismiss", self._http_notifications_dismiss),
             Route("POST", "/notifications/action",  self._http_notifications_action),
+            Route("POST", "/notifications/respond", self._http_notifications_respond),
             # ── Slice 3e: budget visibility ─────────────────────
             Route("GET",  "/budget",                self._http_budget),
             # ── Slice 3f: dialectic checker ─────────────────────
@@ -2511,6 +2512,57 @@ class OverseerPlugin(Plugin):
                 "snooze_days": days,
             }
         return {"ok": False, "error": "action must be archive | snooze | touch"}
+
+    def _http_notifications_respond(self, payload):
+        """POST /plugins/overseer/notifications/respond  (Slice 9.6 CP1)
+
+        Body: {"notification_id": int, "action_kind": str,
+               "action_label"?: str, "response_payload"?: dict,
+               "also_archive"?: bool}
+
+        Logs Tory's response to a custom action button. Returns the new
+        notification_responses.id. If also_archive is true (default),
+        the notification is archived in the same call — most action
+        responses imply the user has handled the notification.
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        nid_raw = payload.get("notification_id")
+        if nid_raw is None:
+            return {"ok": False, "error": "notification_id is required"}
+        try:
+            nid = int(nid_raw)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "notification_id must be int"}
+        kind = str(payload.get("action_kind") or "").strip()
+        if not kind:
+            return {"ok": False, "error": "action_kind is required"}
+        label = str(payload.get("action_label") or "")
+        response_payload = payload.get("response_payload") or {}
+        if not isinstance(response_payload, dict):
+            return {"ok": False, "error": "response_payload must be object"}
+        also_archive = bool(payload.get("also_archive", True))
+        try:
+            resp_id = self.overseer_db.add_notification_response(
+                notification_id=nid,
+                action_kind=kind,
+                action_label=label,
+                response_payload=response_payload,
+            )
+        except Exception as e:
+            log.exception("notifications/respond failed")
+            return {"ok": False, "error": str(e)[:300]}
+        archived = False
+        if also_archive:
+            try:
+                archived = self.overseer_db.archive_notification(nid)
+            except Exception:
+                pass
+        return {
+            "ok": True, "response_id": resp_id,
+            "notification_id": nid, "action_kind": kind,
+            "archived": archived,
+        }
 
     # ── Slice 3f: dialectic handlers ────────────────────────────
 

@@ -548,6 +548,240 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
+    # ── Slice 9.6 CP2 (2026-05-19): write tools ────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "update_project_status",
+            "description": (
+                "Change a project's status (active | dormant | archived). "
+                "Use when Tory has stopped working on a project, or after "
+                "a stale-project notification response indicates he wants "
+                "it archived/marked-dormant rather than 'touched'. "
+                "Idempotent — no-op if status already matches."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tag": {"type": "string", "description": "Project tag (slug)."},
+                    "status": {
+                        "type": "string",
+                        "description": "active | dormant | archived",
+                    },
+                },
+                "required": ["tag", "status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_project",
+            "description": (
+                "Create a new project record. Use sparingly — most "
+                "projects auto-emerge from Claude Code session ingestion. "
+                "Use this when Tory has named a project verbally / in "
+                "chat but no session row has yet seeded it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tag": {"type": "string"},
+                    "name": {"type": "string"},
+                    "status": {"type": "string", "description": "active|dormant|archived (default active)"},
+                    "category": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["tag"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_question",
+            "description": (
+                "Add a new open_question to your interpretive layer. Use "
+                "when a recurring concern surfaces that you want to track "
+                "across sessions / weeks. Not for one-off curiosities. "
+                "If a similar question already exists, file evidence to "
+                "it instead via file_evidence (not yet a tool)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "body": {"type": "string"},
+                    "confidence": {"type": "string", "description": "high|med|low"},
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_question_lifecycle",
+            "description": (
+                "Move an open_question through its lifecycle: dormant | "
+                "active | partially_answered | resolved | abandoned. "
+                "Use this to close stale questions or to revive ones "
+                "that have new evidence."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question_id": {"type": "integer"},
+                    "lifecycle": {"type": "string"},
+                },
+                "required": ["question_id", "lifecycle"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "redact_chat_attachment",
+            "description": (
+                "Remove an attached file from a chat message. Pass "
+                "either file_id (single file) or message_id (all "
+                "attachments on the message). The file itself is left "
+                "on disk; only the DB linkage is removed so it stops "
+                "appearing in chat history + LLM prompts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_id": {"type": "integer"},
+                    "message_id": {"type": "integer"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_chat_message",
+            "description": (
+                "DESTRUCTIVE: delete a single chat_messages row and all "
+                "its attachments. Use only when Tory has explicitly "
+                "asked for a message to be scrubbed (privacy, "
+                "embarrassment, accidental paste). Cannot be undone "
+                "from the DB layer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "integer"},
+                },
+                "required": ["message_id"],
+            },
+        },
+    },
+    # ── Slice 9.6 CP3 (2026-05-19): notification emit + responses ─
+    {
+        "type": "function",
+        "function": {
+            "name": "emit_notification",
+            "description": (
+                "Send Tory a notification with optional custom action "
+                "buttons. Appears in the Hub Bell tab. Use for things "
+                "you want him to see soon but not immediately interrupt "
+                "for. Custom action kinds: 'free_text' (opens a "
+                "textarea for free reply), 'yes_no' (two-button binary), "
+                "'dispatch_sibling' (Tory clicks → creates a sibling "
+                "task seeded with this notification's context), "
+                "'archive_project'/'mark_dormant'/etc (predefined CRUD "
+                "you'll act on when reading the response).\n\n"
+                "Tory's response lands in pending_notification_responses, "
+                "surfaced in your freshness on next tick, fetchable via "
+                "get_pending_notification_responses. Be intentional — "
+                "the Bell tab's noise floor is real; emit only when "
+                "you want a structured reply, not as broadcast."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "severity": {
+                        "type": "string",
+                        "description": "info | warn | important",
+                    },
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "rule_key": {
+                        "type": "string",
+                        "description": "Optional dedup key (auto-generated if omitted).",
+                    },
+                    "related_table": {"type": "string"},
+                    "related_id": {"type": "string"},
+                    "actions": {
+                        "type": "array",
+                        "description": (
+                            "Custom action buttons. Each: "
+                            "{label, kind, payload?}. Example: "
+                            "[{label: 'Yes archive', kind: 'archive_project', "
+                            "payload: {tag: 'openmuscle-flexgrid'}}, "
+                            "{label: 'No keep active', kind: 'yes_no', "
+                            "payload: {value: 'no'}}]"
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "kind": {"type": "string"},
+                                "payload": {"type": "object"},
+                            },
+                            "required": ["label", "kind"],
+                        },
+                    },
+                },
+                "required": ["severity", "title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pending_notification_responses",
+            "description": (
+                "Fetch Tory's unread responses to notifications you "
+                "emitted. Returns the full notification context + his "
+                "response payload + action kind clicked. Call this when "
+                "your freshness shows pending_notification_responses > 0. "
+                "After you've acted on a response, call "
+                "mark_notification_responses_processed with the response "
+                "ids so they don't re-surface."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "max rows (default 20)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mark_notification_responses_processed",
+            "description": (
+                "Mark a list of notification_response ids as read so "
+                "they stop appearing in get_pending_notification_responses. "
+                "Call after acting on the response (e.g. you updated the "
+                "project status per Tory's reply)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "response_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                    },
+                },
+                "required": ["response_ids"],
+            },
+        },
+    },
 ]
 
 # Per-call iteration cap — bounds blast radius if the model loops.
@@ -808,5 +1042,152 @@ def _dispatch(name: str, args: dict, *, db, core_memory,
             daily_cap=sibling_daily_cap,
         )
         return result
+
+    # ── Slice 9.6 CP2 (2026-05-19): write tools ────────────────────
+
+    if name == "update_project_status":
+        tag = (args.get("tag") or "").strip()
+        status = (args.get("status") or "").strip()
+        if not tag or status not in ("active", "dormant", "archived"):
+            return {"error": "tag + status (active|dormant|archived) required"}
+        if not core_memory:
+            return {"error": "core_memory unavailable"}
+        try:
+            ok = core_memory.update_project_status_only(tag, status)
+            if not ok:
+                return {"error": f"no project with tag '{tag}'"}
+            return {"ok": True, "tag": tag, "status": status}
+        except Exception as e:
+            return {"error": f"update_project_status failed: {e}"[:200]}
+
+    if name == "create_project":
+        tag = (args.get("tag") or "").strip()
+        if not tag:
+            return {"error": "tag required"}
+        if not core_memory:
+            return {"error": "core_memory unavailable"}
+        try:
+            row_id = core_memory.upsert_project(
+                tag=tag,
+                name=(args.get("name") or "").strip() or tag,
+                status=(args.get("status") or "active").strip(),
+                category=(args.get("category") or "").strip(),
+                description=(args.get("description") or "").strip(),
+            )
+            return {"ok": True, "tag": tag, "project_row_id": row_id}
+        except Exception as e:
+            return {"error": f"create_project failed: {e}"[:200]}
+
+    if name == "create_question":
+        question = (args.get("question") or "").strip()
+        if not question:
+            return {"error": "question required"}
+        try:
+            qid = db.add_question(
+                question,
+                body=(args.get("body") or "").strip(),
+                confidence=(args.get("confidence") or "med").strip(),
+            )
+            return {"ok": True, "question_id": qid}
+        except Exception as e:
+            return {"error": f"create_question failed: {e}"[:200]}
+
+    if name == "update_question_lifecycle":
+        qid = args.get("question_id")
+        lifecycle = (args.get("lifecycle") or "").strip()
+        if qid is None or lifecycle not in (
+                "dormant", "active", "partially_answered",
+                "resolved", "abandoned"):
+            return {"error": "question_id + valid lifecycle required"}
+        try:
+            ok = db.set_question_lifecycle(int(qid), lifecycle)
+            return {"ok": bool(ok), "question_id": int(qid),
+                    "lifecycle": lifecycle}
+        except Exception as e:
+            return {"error": f"update_question_lifecycle failed: {e}"[:200]}
+
+    if name == "redact_chat_attachment":
+        fid = args.get("file_id")
+        mid = args.get("message_id")
+        if fid is None and mid is None:
+            return {"error": "file_id or message_id required"}
+        try:
+            n = db.redact_chat_attachment(
+                file_id=int(fid) if fid is not None else None,
+                message_id=int(mid) if mid is not None else None,
+            )
+            return {"ok": True, "removed_count": n}
+        except Exception as e:
+            return {"error": f"redact_chat_attachment failed: {e}"[:200]}
+
+    if name == "delete_chat_message":
+        mid = args.get("message_id")
+        if mid is None:
+            return {"error": "message_id required"}
+        try:
+            ok = db.delete_chat_message(int(mid))
+            return {"ok": bool(ok), "message_id": int(mid)}
+        except Exception as e:
+            return {"error": f"delete_chat_message failed: {e}"[:200]}
+
+    # ── Slice 9.6 CP3 (2026-05-19): notification emit + responses ─
+
+    if name == "emit_notification":
+        severity = (args.get("severity") or "info").strip()
+        title = (args.get("title") or "").strip()
+        if not title or severity not in ("info", "warn", "important"):
+            return {"error": "title + severity (info|warn|important) required"}
+        actions = args.get("actions") or []
+        if not isinstance(actions, list):
+            return {"error": "actions must be a list"}
+        # Lightly validate each action shape so a bad emit doesn't
+        # produce a broken UI on Tory's side.
+        validated = []
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            label = (a.get("label") or "").strip()
+            kind = (a.get("kind") or "").strip()
+            if not label or not kind:
+                continue
+            validated.append({
+                "label": label, "kind": kind,
+                "payload": a.get("payload") or {},
+            })
+        try:
+            nid = db.emit_notification(
+                severity=severity,
+                title=title,
+                body=(args.get("body") or "").strip(),
+                rule_name="overseer-emit",
+                rule_key=(args.get("rule_key") or None),
+                related_table=(args.get("related_table") or "").strip(),
+                related_id=(args.get("related_id") or "").strip(),
+                actions=validated,
+            )
+            return {
+                "ok": True, "notification_id": nid,
+                "actions_attached": len(validated),
+            }
+        except Exception as e:
+            return {"error": f"emit_notification failed: {e}"[:200]}
+
+    if name == "get_pending_notification_responses":
+        limit = max(1, min(50, int(args.get("limit") or 20)))
+        try:
+            rows = db.list_pending_notification_responses(limit=limit)
+            return {"ok": True, "count": len(rows), "responses": rows}
+        except Exception as e:
+            return {"error": f"get_pending_notification_responses failed: {e}"[:200]}
+
+    if name == "mark_notification_responses_processed":
+        ids = args.get("response_ids") or []
+        if not isinstance(ids, list) or not ids:
+            return {"error": "response_ids (non-empty list) required"}
+        try:
+            n = db.mark_notification_responses_processed(response_ids=ids)
+            return {"ok": True, "marked_count": n}
+        except Exception as e:
+            return {"error": f"mark_processed failed: {e}"[:200]}
 
     return {"error": "unknown tool: {}".format(name)}

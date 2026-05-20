@@ -526,6 +526,21 @@ def build_context_block(*, working_memory: dict | None,
                     f"In flight (dispatched, awaiting result): "
                     f"{sib_pending or 0}."
                 )
+            # Slice 9.6 CP3 (2026-05-19): pending notification responses
+            # from Tory — the Bell tab now logs his clicks on custom
+            # action buttons and his free-text replies, queued for you
+            # to read via get_pending_notification_responses tool.
+            # Non-zero = Tory has actually used the channel since last
+            # tick; you should fetch and act.
+            pending_resp = working_memory.get("pending_notification_responses")
+            if pending_resp:
+                lines.append(
+                    f"  - Notification responses pending your read: "
+                    f"**{pending_resp}** (Tory clicked an action button "
+                    f"or sent free-text reply on a notification you "
+                    f"emitted). Use `get_pending_notification_responses` "
+                    f"to fetch + act."
+                )
             # Slice 9.4 CP2 (2026-05-16): git ingest channel freshness.
             # Per overseer's explicit caveat: surface BOTH the last-
             # successful-run timestamp AND any repos that got skipped

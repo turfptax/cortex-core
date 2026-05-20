@@ -288,6 +288,27 @@ class CortexDB:
         self._conn.commit()
         return tag
 
+    def get_project_by_tag(self, tag):
+        """Slice 9.6 CP2: lookup single project row by tag, returns
+        dict or None. Used by overseer's update_project_status tool
+        to preserve existing name/description on partial updates."""
+        row = self._conn.execute(
+            "SELECT * FROM projects WHERE tag = ?", (tag,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_project_status_only(self, tag, status):
+        """Slice 9.6 CP2: change status without touching other fields.
+        Returns True if a row was updated, False if no project with
+        that tag exists."""
+        cur = self._conn.execute(
+            "UPDATE projects SET status = ?, last_touched = datetime('now') "
+            "WHERE tag = ?",
+            (status, tag),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
     # --- Organizations ---
 
     def upsert_org(self, tag, name="", org_type="", my_role="",
