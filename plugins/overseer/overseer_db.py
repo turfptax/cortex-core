@@ -3409,7 +3409,13 @@ class OverseerDB(CortexDB):
 
     # ── Slice 3h: pending interpretations + scan log ────────────
 
-    VALID_INSIGHT_KINDS = ("theme", "pattern", "drift", "blindspot")
+    # Slice 9.7 (2026-05-19/20): 'merge_proposal' added so overseer
+    # can route proposed project merges through the standard
+    # pending_interpretations review flow (accept/reject in Hub
+    # Insights). Per overseer's spec: "DOES NOT execute the merge —
+    # writes a row for Tory to accept/reject."
+    VALID_INSIGHT_KINDS = ("theme", "pattern", "drift", "blindspot",
+                            "merge_proposal")
     VALID_INTERP_STATUSES = (
         "pending", "confirmed", "rejected", "edited", "superseded",
     )

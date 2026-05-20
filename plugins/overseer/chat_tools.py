@@ -739,6 +739,142 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
+    # ── Slice 9.7 (2026-05-19/20): synthesis primitives ────────────
+    # Per overseer's explicit spec ("synthesis power, not raw write
+    # power"). Three tools chosen by overseer when given a blank
+    # check; rejected the entity-CRUD expansion in favor of these.
+    {
+        "type": "function",
+        "function": {
+            "name": "file_evidence",
+            "description": (
+                "File a piece of evidence to an open question to "
+                "build its evidence trail. Source can be ANY artifact "
+                "table — extends the existing gist-only file-evidence "
+                "flow to cover notes / sessions / human_journal / "
+                "your own journal reflections / chat messages.\n\n"
+                "Use this as your PRIMARY synthesis primitive. If "
+                "you can name 'evidence E supports question Q', file "
+                "it. The map between projects and questions emerges "
+                "implicitly from filed evidence — if 8 pieces of "
+                "evidence on question Q come from project P's sessions, "
+                "the link is structural, no junction table needed.\n\n"
+                "Idempotent — re-filing the same (question, evidence) "
+                "pair is a no-op. Filing 'answers' will move an active "
+                "question to 'partially_answered'; never auto-resolves "
+                "(that's Tory's call)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question_id": {"type": "integer"},
+                    "source_table": {
+                        "type": "string",
+                        "description": (
+                            "Which table the evidence row lives in. "
+                            "Common: summaries_gist | summaries_theme "
+                            "| summaries_episode | imported_sessions "
+                            "| chat_messages | overseer_journal | "
+                            "human_journal_entries | notes."
+                        ),
+                    },
+                    "source_id": {"type": "integer"},
+                    "stance": {
+                        "type": "string",
+                        "description": (
+                            "supports | complicates | answers | "
+                            "reframes (default 'supports')"
+                        ),
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": (
+                            "One-sentence why this evidence routes "
+                            "to this question. Load-bearing — without "
+                            "it the audit trail is opaque."
+                        ),
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "description": "high|med|low — your confidence in the routing call",
+                    },
+                },
+                "required": ["question_id", "source_table", "source_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_project_merge",
+            "description": (
+                "Surface a proposed project merge to Tory's Hub "
+                "Insights queue. Use when you notice two projects "
+                "look like duplicates, aliases, or one is a "
+                "sub-project of the other — you see 83 active "
+                "projects on every working memory rebuild and you've "
+                "named that 10-15 are probably duplicates.\n\n"
+                "DOES NOT execute the merge. Writes one row to "
+                "pending_interpretations with kind='merge_proposal' "
+                "for Tory to accept/reject. The rationale field is "
+                "load-bearing: explain WHY you think they're the "
+                "same work, ideally citing specific sessions or "
+                "themes that overlap.\n\n"
+                "Dedup is automatic — re-proposing the same merge "
+                "won't double-up. Convention: put the keeper tag in "
+                "tag_a, the merge-source in tag_b."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tag_a": {
+                        "type": "string",
+                        "description": "Keeper project tag (the canonical one)",
+                    },
+                    "tag_b": {
+                        "type": "string",
+                        "description": "Project tag to be merged into tag_a",
+                    },
+                    "reasoning": {
+                        "type": "string",
+                        "description": (
+                            "Why they look like the same work. "
+                            "Cite specific evidence: 'both had 5 "
+                            "sessions in the OpenMuscle-Software repo "
+                            "in 2026-05-14..16; same Claude Code cwd'."
+                        ),
+                    },
+                },
+                "required": ["tag_a", "tag_b", "reasoning"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "redact_human_journal",
+            "description": (
+                "DESTRUCTIVE: delete a human_journal_entries row. Use "
+                "ONLY when Tory has explicitly asked for a journal "
+                "entry to be pulled from your view (privacy, regret, "
+                "wanted-to-rewrite, accidental). The row + its "
+                "timestamp variants are removed.\n\n"
+                "NOT scrubbed: any temporal narratives (daily / "
+                "weekly / monthly / yearly rollups) that may have "
+                "folded this entry's content into a summary "
+                "already. Those would need manual regeneration. "
+                "Flag this consequence to Tory when redacting if "
+                "the entry is older than a day."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entry_id": {"type": "integer"},
+                },
+                "required": ["entry_id"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -1171,6 +1307,93 @@ def _dispatch(name: str, args: dict, *, db, core_memory,
             }
         except Exception as e:
             return {"error": f"emit_notification failed: {e}"[:200]}
+
+    # ── Slice 9.7 (2026-05-19/20): synthesis primitives ────────────
+
+    if name == "file_evidence":
+        qid = args.get("question_id")
+        table = (args.get("source_table") or "").strip()
+        eid = args.get("source_id")
+        if qid is None or not table or eid is None:
+            return {"error": "question_id + source_table + source_id required"}
+        stance = (args.get("stance") or "supports").strip()
+        if stance not in ("supports", "complicates", "answers", "reframes"):
+            return {"error": "stance must be supports|complicates|answers|reframes"}
+        try:
+            filed, reactivated = db.file_evidence(
+                question_id=int(qid),
+                evidence_table=table,
+                evidence_id=int(eid),
+                contribution=stance,
+                reason=(args.get("note") or "").strip(),
+                confidence=(args.get("confidence") or "med").strip(),
+                contributed_by="overseer-chat",
+            )
+            return {
+                "ok": True,
+                "filed": bool(filed),
+                "duplicate": (not bool(filed)),
+                "question_reactivated": bool(reactivated),
+                "question_id": int(qid),
+            }
+        except ValueError as e:
+            return {"error": str(e)}
+        except Exception as e:
+            return {"error": f"file_evidence failed: {e}"[:200]}
+
+    if name == "propose_project_merge":
+        tag_a = (args.get("tag_a") or "").strip()
+        tag_b = (args.get("tag_b") or "").strip()
+        reasoning = (args.get("reasoning") or "").strip()
+        if not tag_a or not tag_b or not reasoning:
+            return {"error": "tag_a + tag_b + reasoning all required"}
+        if tag_a == tag_b:
+            return {"error": "tag_a and tag_b must differ"}
+        title = f"Merge proposed: {tag_b} -> {tag_a}"
+        body = (
+            f"**Proposed merge:** `{tag_b}` looks like a "
+            f"duplicate or sub-project of `{tag_a}`.\n\n"
+            f"**Rationale (overseer's read):**\n\n{reasoning}\n\n"
+            f"**Action:** accept → merge tag_b into tag_a. "
+            f"Reject → discard the proposal."
+        )
+        try:
+            new_id = db.insert_pending_interpretation(
+                kind="merge_proposal",
+                title=title,
+                body=body,
+                confidence="med",
+                rationale=f"Project merge proposal: '{tag_b}' -> '{tag_a}'",
+                proposed_by="overseer-chat:merge-tool",
+                source_kind="project-merge-proposal",
+                source_project=tag_a,
+            )
+            if new_id is None:
+                return {
+                    "ok": True, "deduped": True,
+                    "message": "An identical merge proposal is already pending.",
+                }
+            return {
+                "ok": True, "pending_id": new_id,
+                "tag_a": tag_a, "tag_b": tag_b,
+            }
+        except ValueError as e:
+            return {"error": str(e)}
+        except Exception as e:
+            return {"error": f"propose_project_merge failed: {e}"[:200]}
+
+    if name == "redact_human_journal":
+        eid = args.get("entry_id")
+        if eid is None:
+            return {"error": "entry_id required"}
+        try:
+            n = db.delete_human_journal_entry(int(eid))
+            return {
+                "ok": True, "deleted_count": n,
+                "entry_id": int(eid),
+            }
+        except Exception as e:
+            return {"error": f"redact_human_journal failed: {e}"[:200]}
 
     if name == "get_pending_notification_responses":
         limit = max(1, min(50, int(args.get("limit") or 20)))
