@@ -519,6 +519,24 @@ class OverseerLoop:
                         wm = json.loads(wm_json)
                     except Exception:
                         wm = None
+                # Slice 9.9 (2026-05-20): journal step is now tool-
+                # enabled. Pass core_memory + sibling_daily_cap so the
+                # tool dispatcher has everything it needs. Sibling
+                # dispatch is blocked at the journal layer (defense
+                # in depth) but the cap is still threaded in case a
+                # future allowed-tool needs it.
+                _sib_cap = int(self._cfg.get(
+                    "loop_daily_sibling_dispatches", 20))
+                # 9.9: inject pending_notification_responses into the
+                # tick summary so is_tick_notable() fires the journal
+                # step when Tory has clicked something. Without this,
+                # quiet ticks (no imports, no rollups) wouldn't trigger
+                # the journal even when there's a queue of his clicks
+                # waiting to be acted on.
+                _pending_resp = (wm or {}).get(
+                    "pending_notification_responses", 0)
+                if _pending_resp:
+                    summary["pending_notification_responses"] = _pending_resp
                 jid = write_tick_journal_entry(
                     db=self._db, llm=self._llm,
                     tick_summary=summary,
@@ -526,6 +544,8 @@ class OverseerLoop:
                     budget=budget,
                     instance_id="overseer@" + (
                         self._stats.get("started_at") or "unknown"),
+                    core_memory=self._core,
+                    sibling_daily_cap=_sib_cap,
                 )
                 if jid:
                     summary["journal_entry_id"] = jid

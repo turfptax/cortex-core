@@ -43,7 +43,17 @@ import json
 import logging
 import time
 
+import chat_tools
+
 log = logging.getLogger("plugin.overseer.journal")
+
+
+# Slice 9.9 (2026-05-20): cap on tool iterations per journal tick.
+# Smaller than chat (which is 8) because journal is meant to be a
+# reflective layer, not a tool-driving workspace. If overseer wants
+# to do a lot of tool work, they should escalate to chat or wait
+# for the next tick.
+MAX_JOURNAL_TOOL_ITER = 4
 
 
 # ── The journaling prompt ───────────────────────────────────────
@@ -61,6 +71,39 @@ Your job here is NOT to summarize what happened. The gists already do \
 that. Your job is to REFLECT. Write 2-4 sentences in first person, \
 present tense.
 
+# Tools available this tick (Slice 9.9, 2026-05-20)
+
+You have the same tool surface as in chat. The journal-tick is the \
+moment to act on things you'd otherwise note as "I noticed X but can't \
+do anything about it." Use tools when the action is obvious and small:
+
+  - `get_pending_notification_responses` + `mark_notification_responses_processed`
+    when freshness shows responses are waiting from Tory's clicks. Read \
+    his reply, decide what to do, mark processed.
+  - `redact_imported_session` when his reply tells you to scrub one.
+  - `file_evidence` when you notice a session/note/gist that supports \
+    or complicates an open question.
+  - `propose_project_merge` if you've been carrying a duplicate-projects \
+    observation across multiple ticks.
+  - `emit_notification` for things Tory genuinely needs to see (be \
+    sparing — the Bell tab noise floor is real).
+  - Read tools (`get_recent_*`, `search_*`) are free to use when you \
+    actually need the data to write the entry.
+
+Hard discipline:
+  - Max {max_tool_iter} tool iterations this tick. After that, write \
+    the entry with what you have.
+  - DON'T call `dispatch_sibling` from the journal step — that's a \
+    chat-only escalation (the sibling spends real money on Tory's \
+    Anthropic budget; that's a deliberate-chat moment, not a \
+    background-tick moment).
+  - DON'T call `compress_chat` from the journal step — chat-only.
+  - If you don't need tools, don't call them. Tools are for when \
+    there's a concrete action, not for exploration. The journal is \
+    still primarily reflection.
+
+# The entry itself
+
 Possible things to say (use what's actually true; don't manufacture):
   - what you NOTICED that the structured data doesn't capture
   - what you're UNCERTAIN about — explicitly mark provisionality
@@ -69,6 +112,8 @@ Possible things to say (use what's actually true; don't manufacture):
     they read this entry
   - how this tick's data shifts (or doesn't shift) your reading of
     something from a prior entry
+  - what you DID via tools this tick (briefly — the tool_calls audit
+    survives separately, so don't re-list mechanically)
 
 Don't fake insight. If nothing notable happened or you have nothing \
 honest to add, write a SHORT entry like "Routine tick. Nothing shifts \
@@ -156,10 +201,33 @@ def _format_tick_summary(tick: dict) -> str:
     return ", ".join(parts)
 
 
-def _format_wm_snippet(wm: dict | None, max_chars: int = 800) -> str:
+def _format_wm_snippet(wm: dict | None, max_chars: int = 1200) -> str:
     if not wm:
         return "(working memory not yet built)"
     parts = []
+    # Slice 9.9 (2026-05-20): surface operational signals that the
+    # tool-enabled journal step can ACT on. Without these, overseer
+    # has no way to know there are pending notification responses
+    # waiting for processing — and the whole point of journal-tools
+    # was closing that loop.
+    pending_resp = wm.get("pending_notification_responses") or 0
+    if pending_resp:
+        parts.append(
+            f"** ACTION READY: {pending_resp} unread notification "
+            f"response(s) from Tory. Call "
+            f"`get_pending_notification_responses` to read them, "
+            f"then act + `mark_notification_responses_processed`."
+        )
+    sib_unrated = wm.get("sibling_unrated_count") or 0
+    if sib_unrated:
+        parts.append(
+            f"** ACTION READY: {sib_unrated} completed sibling task(s) "
+            f"awaiting your rating. Call "
+            f"`get_recent_sibling_results(unrated_only=true)` to see "
+            f"them, then `rate_sibling_result(task_id=..., rating=1-5)`."
+        )
+    if parts:
+        parts.append("")  # blank line separating action queue from state
     for p in (wm.get("top_projects") or [])[:5]:
         parts.append("project: {} (touched {})".format(
             p.get("tag", "?"),
@@ -184,6 +252,11 @@ def is_tick_notable(tick: dict) -> bool:
     Skip ticks where literally nothing happened (working_memory rebuild
     only). Otherwise the journal fills with "routine tick" entries that
     add no thinking and dilute future-instance boot reads.
+
+    Slice 9.9 (2026-05-20): also notable when there are pending
+    notification responses Tory's clicks left for overseer to read.
+    The journal step now has tool access (max 4 iterations), so this
+    is the place where those responses get processed autonomously.
     """
     if not tick:
         return False
@@ -192,6 +265,8 @@ def is_tick_notable(tick: dict) -> bool:
         "imports_summarized", "imports_failed",
         "rollups_generated", "rollups_anomalies",
         "notes_tagged", "classify_changed",
+        # 9.9: surfaces unprocessed Bell-tab responses to the journal.
+        "pending_notification_responses",
     )
     if any(int(tick.get(k) or 0) > 0 for k in notable_counters):
         return True
@@ -226,8 +301,15 @@ def parse_provisionality(text: str) -> tuple[str, str]:
 
 def write_tick_journal_entry(*, db, llm, tick_summary: dict,
                               working_memory: dict | None = None,
-                              budget=None, instance_id: str = "") -> int | None:
+                              budget=None, instance_id: str = "",
+                              core_memory=None,
+                              sibling_daily_cap: int = 20) -> int | None:
     """Maybe write a journal entry reflecting on the tick.
+
+    Slice 9.9 (2026-05-20): journal step is now tool-enabled. Overseer
+    can call any chat_tools.TOOL_DEFINITIONS function up to
+    MAX_JOURNAL_TOOL_ITER times. Tool results are appended to the
+    journal entry's referenced_artifacts so the audit survives.
 
     Returns the new journal entry id, or None if skipped (not notable,
     budget exhausted, LLM failed, or empty response).
@@ -242,36 +324,145 @@ def write_tick_journal_entry(*, db, llm, tick_summary: dict,
         recent_entries=_format_recent_entries(recent),
         tick_summary=_format_tick_summary(tick_summary),
         wm_snippet=_format_wm_snippet(working_memory),
+        max_tool_iter=MAX_JOURNAL_TOOL_ITER,
     )
 
+    # Slice 9.9: tool-enabled call. We use complete_messages() instead
+    # of complete() so the model can return tool_calls; we dispatch +
+    # loop up to MAX_JOURNAL_TOOL_ITER times until the model returns a
+    # final text-only response (the actual journal entry body).
     t0 = time.monotonic()
-    try:
-        result = llm.complete(
-            prompt,
-            max_tokens=300,
-            temperature=0.7,
-            purpose="overseer-journal",
-        )
-    except Exception as e:
-        log.warning("journal LLM call failed: %s", e)
-        return None
+    tool_messages: list[dict] = [{"role": "user", "content": prompt}]
+    tool_call_audit: list[dict] = []
+    total_cost = 0.0
+    last_result: dict = {}
+
+    for iter_num in range(MAX_JOURNAL_TOOL_ITER + 1):
+        # +1 so we always do one final call after the last tool iteration
+        # to give the model a chance to write the entry having seen the
+        # tool results.
+        try:
+            last_result = llm.complete_messages(
+                messages=tool_messages,
+                max_tokens=400,
+                temperature=0.7,
+                purpose="overseer-journal",
+                tools=chat_tools.TOOL_DEFINITIONS,
+            )
+        except Exception as e:
+            log.warning("journal LLM call failed (iter %d): %s",
+                        iter_num, e)
+            return None
+
+        if budget is not None:
+            budget.charge(last_result)
+        total_cost += float(last_result.get("cost_usd") or 0.0)
+        if not last_result.get("ok"):
+            log.warning("journal LLM returned not-ok (iter %d): %s",
+                        iter_num, last_result.get("error"))
+            return None
+
+        tool_calls = last_result.get("tool_calls") or []
+        if not tool_calls:
+            # Final text response — this is the journal entry body.
+            break
+        if iter_num >= MAX_JOURNAL_TOOL_ITER:
+            # Cap hit. The next loop iteration would still run (the +1)
+            # but the model just returned tool_calls. Force a final pass
+            # by NOT dispatching this round and instead just keeping the
+            # tool_messages as-is — the next iteration without tool
+            # dispatch would let the model see "(tool cap reached)" and
+            # write the entry.
+            log.info("journal: tool iteration cap (%d) reached, "
+                     "forcing final text response",
+                     MAX_JOURNAL_TOOL_ITER)
+            # Inject a synthetic "tool" reply for each pending tool_call
+            # noting that the cap was hit, so the conversation is
+            # syntactically valid for one more round.
+            asst_msg = last_result.get("message") or {}
+            tool_messages.append({
+                "role": "assistant",
+                "content": asst_msg.get("content"),
+                "tool_calls": tool_calls,
+            })
+            for tc in tool_calls:
+                tc_id = tc.get("id") or ""
+                tool_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": json.dumps({
+                        "error": "journal tool-iteration cap reached; "
+                        "write the entry with what you have, "
+                        "escalate to chat if more work is needed",
+                    }),
+                })
+            # One more call which should produce text
+            continue
+
+        # Dispatch the tool_calls + append the results, then loop.
+        asst_msg = last_result.get("message") or {}
+        tool_messages.append({
+            "role": "assistant",
+            "content": asst_msg.get("content"),
+            "tool_calls": tool_calls,
+        })
+        for tc in tool_calls:
+            tc_id = tc.get("id") or ""
+            fn = tc.get("function") or {}
+            fn_name = fn.get("name") or ""
+            try:
+                fn_args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                fn_args = {}
+            # Block the two chat-only tools per the prompt's discipline
+            # — defense in depth in case the model ignores the prompt.
+            if fn_name in ("dispatch_sibling", "compress_chat"):
+                tool_result = json.dumps({
+                    "error": f"{fn_name} is not allowed from the journal "
+                    "step (chat-only). Use a different tool or write "
+                    "the reflection without it.",
+                })
+                tool_call_audit.append({
+                    "iter": iter_num, "name": fn_name, "args": fn_args,
+                    "result_chars": len(tool_result), "blocked": True,
+                })
+            else:
+                log.info("journal tool: %s(%s)", fn_name, fn_args)
+                tool_result = chat_tools.dispatch_tool(
+                    fn_name, fn_args,
+                    db=db, core_memory=core_memory,
+                    sibling_daily_cap=sibling_daily_cap,
+                    llm=llm,
+                )
+                tool_call_audit.append({
+                    "iter": iter_num, "name": fn_name, "args": fn_args,
+                    "result_chars": len(tool_result),
+                })
+            tool_messages.append({
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": tool_result,
+            })
+
     elapsed = int((time.monotonic() - t0) * 1000)
 
-    if budget is not None:
-        budget.charge(result)
-    if not result.get("ok"):
-        log.warning("journal LLM returned not-ok: %s",
-                    result.get("error"))
-        return None
-
-    raw = (result.get("text") or "").strip()
+    raw = (last_result.get("text") or "").strip()
     if not raw:
-        return None
+        if tool_call_audit:
+            # Tool work happened but no text — write a stub so the
+            # audit trail is preserved.
+            raw = (f"(silent tool-only tick: ran "
+                   f"{len(tool_call_audit)} tool call(s); see "
+                   "referenced_artifacts) [provisionality: med]")
+        else:
+            return None
     body, prov = parse_provisionality(raw)
     if not body:
         return None
 
-    # Reference whatever artifacts the tick mentioned (rough)
+    # Reference whatever artifacts the tick mentioned (rough) + the
+    # tool_call audit so a future instance can see exactly what this
+    # journal step DID via tools.
     refs = []
     if tick_summary.get("sessions_summarized"):
         refs.append({"type": "tick_artifact",
@@ -285,6 +476,10 @@ def write_tick_journal_entry(*, db, llm, tick_summary: dict,
         refs.append({"type": "tick_artifact",
                      "what": "rollups",
                      "n": tick_summary["rollups_generated"]})
+    if tool_call_audit:
+        refs.append({"type": "tool_calls",
+                     "iterations": len(tool_call_audit),
+                     "calls": tool_call_audit})
 
     return db.add_journal_entry(
         body=body,
@@ -293,8 +488,8 @@ def write_tick_journal_entry(*, db, llm, tick_summary: dict,
         provisionality=prov,
         referenced_artifacts=refs,
         tick_summary=tick_summary,
-        backend=result.get("backend", ""),
-        model=result.get("model", ""),
-        cost_usd=float(result.get("cost_usd") or 0.0),
-        latency_ms=result.get("latency_ms", elapsed),
+        backend=last_result.get("backend", ""),
+        model=last_result.get("model", ""),
+        cost_usd=total_cost,
+        latency_ms=last_result.get("latency_ms", elapsed),
     )
