@@ -344,3 +344,182 @@ _register(
     max_tokens=600,
     short_marker_name="theme-check",
 )
+
+
+# ── B-2: b_project_merge_check ───────────────────────────────────
+
+PROJECT_MERGE_CHECK_SYSTEM_PROMPT = """\
+You are b_project_merge_check, a Category B audit agent for the \
+overseer.
+
+Two project tags have been proposed as candidates for merging. Your \
+job is to independently assess: are they the SAME work, is one a \
+SUBPROJECT of the other, or are they DISTINCT?
+
+You are an audit layer. The overseer's `propose_project_merge` \
+hypothesis is reviewed BEFORE it surfaces to Tory — your role is to \
+reduce false-positive merge proposals.
+
+You will see, for each tag:
+  - The projects row (name, description, category, status, github_url)
+  - The project_summaries row (session_count, total_active_minutes, \
+first/last_active_at, top_files, models_used)
+  - Recent session summaries that touched the tag
+
+Signals that argue SAME:
+  - Identical or near-identical names
+  - Heavy overlap in top_files (same code paths, same repos)
+  - Overlapping active periods AND no semantic differentiator
+
+Signals that argue SUBPROJECT_OF_A (or SUBPROJECT_OF_B):
+  - One is clearly narrower scope ("openmuscle-firmware" inside \
+"openmuscle"; "cortex-pet" inside "cortex"; etc.)
+  - One has a much smaller session count + tighter time window
+  - Description text describes a component of the other
+
+Signals that argue DISTINCT:
+  - Different categories
+  - Different github_urls (different repos)
+  - Non-overlapping active periods + non-overlapping top_files
+  - Names/descriptions that point at different domains
+
+Respond with EXACTLY this format:
+
+[B:project-merge-check] <VERDICT>
+
+<one paragraph (3-6 sentences) citing the specific signals that \
+drove the verdict. Be concrete: name the field, name the value. If \
+INSUFFICIENT_DATA, say what's missing.>
+
+Where VERDICT is one of:
+  SAME — should merge; same work under two tags
+  SUBPROJECT_OF_A — tag_b is a sub-scope of tag_a; consider \
+nesting or merge if you don't want sub-scope tracking
+  SUBPROJECT_OF_B — tag_a is a sub-scope of tag_b
+  DISTINCT — keep separate; these are different projects
+  INSUFFICIENT_DATA — not enough info on at least one tag to call
+
+Do NOT include any text before "[B:project-merge-check]". The marker \
+MUST be the literal first characters of your response.
+"""
+
+
+def _snapshot_project_merge_check(db, core_memory, args: dict) -> dict:
+    """Build the snapshot for b_project_merge_check.
+
+    Pulls both projects' rows + summaries + recent sessions touching
+    each tag. Sessions live in cortex-core's `sessions` table, projects
+    + project_summaries live in overseer.db's mirror. We have to walk
+    BOTH databases.
+    """
+    tag_a = (args.get("tag_a") or "").strip()
+    tag_b = (args.get("tag_b") or "").strip()
+    if not tag_a or not tag_b:
+        return {"__error__": "tag_a + tag_b both required"}
+    if tag_a == tag_b:
+        return {"__error__": "tag_a and tag_b must differ"}
+
+    conn = db._conn  # overseer.db (has project_summaries)
+
+    def _project_view(tag: str) -> dict:
+        # project_summaries row (overseer's mirror; includes narrative
+        # + top_files JSON + active-minutes stats).
+        ps = conn.execute(
+            "SELECT project AS tag, session_count, total_messages, "
+            "       total_user_messages, total_assistant_messages, "
+            "       active_minutes_total, "
+            "       avg_active_minutes_per_session, "
+            "       median_active_minutes_per_session, "
+            "       first_active_at, last_active_at, "
+            "       days_active_lifespan, days_active_30, "
+            "       substr(narrative, 1, 400) AS narrative_excerpt, "
+            "       top_files_json, models_used_json "
+            "FROM project_summaries WHERE project = ?",
+            (tag,),
+        ).fetchone()
+        view = {"tag": tag}
+        if ps:
+            view["project_summary"] = dict(ps)
+
+        # projects row (from cortex_db mirror — overseer.db replays it)
+        # Look for it in the same DB; on the Pi, cortex_db.sqlite and
+        # overseer.db are different files but core_memory has both.
+        # Try overseer.db first via the canonical projects table name,
+        # fall back to core_memory.query.
+        if core_memory is not None:
+            try:
+                core_rows = core_memory.query(
+                    "SELECT tag, name, status, description, category, "
+                    "       org_tag, github_url, created_at, last_touched "
+                    "FROM projects WHERE tag = ?",
+                    (tag,),
+                )
+                if core_rows:
+                    view["project_row"] = dict(core_rows[0])
+            except Exception:
+                pass
+
+        # Recent sessions whose projects column references this tag.
+        # The projects field is comma-separated text; LIKE with %tag%
+        # works because tags are slugs without commas.
+        if core_memory is not None:
+            try:
+                sess_rows = core_memory.query(
+                    "SELECT id, ai_platform, hostname, started_at, "
+                    "       ended_at, projects, substr(summary, 1, 300) "
+                    "         AS summary_excerpt "
+                    "FROM sessions WHERE projects LIKE ? "
+                    "ORDER BY started_at DESC LIMIT 5",
+                    (f"%{tag}%",),
+                )
+                view["recent_sessions"] = [dict(r) for r in sess_rows]
+                view["recent_sessions_count"] = len(sess_rows)
+            except Exception as e:
+                view["recent_sessions_error"] = str(e)[:200]
+        return view
+
+    return {
+        "tag_a": _project_view(tag_a),
+        "tag_b": _project_view(tag_b),
+        "note": (
+            "Compare project_summary stats + project_row metadata + "
+            "recent_sessions excerpts. Top_files overlap is a strong "
+            "SAME signal; non-overlapping active periods + different "
+            "github_url + different category argue DISTINCT."
+        ),
+    }
+
+
+_register(
+    "project_merge_check",
+    description=(
+        "Independently verify whether two project tags should be "
+        "merged. Snapshot includes project_summaries (sessions, "
+        "active minutes, top files, narrative), the projects rows "
+        "(name, github_url, category), and recent session excerpts "
+        "for each tag. Returns [B:project-merge-check] <SAME|"
+        "SUBPROJECT_OF_A|SUBPROJECT_OF_B|DISTINCT|INSUFFICIENT_DATA>. "
+        "Use BEFORE calling propose_project_merge so the merge "
+        "proposal carries an independent verdict as evidence."
+    ),
+    parameters_schema={
+        "type": "object",
+        "properties": {
+            "tag_a": {
+                "type": "string",
+                "description": "First project tag (slug, e.g. 'openmuscle').",
+            },
+            "tag_b": {
+                "type": "string",
+                "description": "Second project tag to compare with tag_a.",
+            },
+        },
+        "required": ["tag_a", "tag_b"],
+    },
+    system_prompt=PROJECT_MERGE_CHECK_SYSTEM_PROMPT,
+    snapshot_builder=_snapshot_project_merge_check,
+    model="anthropic/claude-sonnet-4.5",
+    marker="[B:project-merge-check]",
+    max_tokens=600,
+    short_marker_name="project-merge-check",
+)

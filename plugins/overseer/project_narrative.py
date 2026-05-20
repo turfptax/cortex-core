@@ -114,6 +114,12 @@ CONSTRAINTS:
 - No hedging openers ("It seems that…"). State observations directly.
 - Don't apologize for missing data. If something's unclear, say what \
   IS clear instead.
+
+AUTHORSHIP MARKERS — DO NOT FLATTEN:
+If the inputs above (gists, themes, journal entries) contain text \
+matching `[B:<name>]` or `[C:<name>]`, PRESERVE them verbatim in \
+your narrative. Stripping them collapses audit provenance — readers \
+need to tell B/C work apart from the overseer's own thinking.
 """
 
 

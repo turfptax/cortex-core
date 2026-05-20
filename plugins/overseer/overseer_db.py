@@ -874,6 +874,37 @@ CREATE INDEX IF NOT EXISTS idx_b_trans_gc
     ON b_invocation_transcripts(retained_until);
 CREATE INDEX IF NOT EXISTS idx_b_trans_agent
     ON b_invocation_transcripts(b_agent_name, created_at);
+
+-- ── Slice 10 CP5 (2026-05-20): C-agent registry ──────────────────
+-- C agents are scheduled, specialized agents that graduated from
+-- a B pattern. A B becomes a C when it has demonstrated:
+--   - ≥10 dispatches in the past 7 days
+--   - ≥7 of those rated ≥4 by overseer
+-- AND Tory accepts the proposal. Graduation is NEVER automatic.
+--
+-- A C row captures the snapshot of its B parent's system_prompt at
+-- graduation time. C may later evolve (e.g. via fine-tuning into a
+-- specialized model) but until then, it's just "the B with a
+-- schedule and its own audit row". The graduated_from_b_name field
+-- preserves provenance.
+CREATE TABLE IF NOT EXISTS c_agents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,             -- e.g. 'theme-check-daily'
+    graduated_from_b_name TEXT NOT NULL,   -- e.g. 'theme_check'
+    cadence_minutes INTEGER NOT NULL DEFAULT 1440,  -- 24h default
+    system_prompt TEXT NOT NULL,           -- frozen at graduation; B parent's prompt
+    model TEXT NOT NULL DEFAULT 'anthropic/claude-sonnet-4.5',
+    status TEXT NOT NULL DEFAULT 'active', -- active | paused | retired
+    graduated_from_b_dispatches_count INTEGER NOT NULL DEFAULT 0,
+    graduated_from_b_rated_4plus_count INTEGER NOT NULL DEFAULT 0,
+    last_run_at TEXT,
+    last_run_sibling_task_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_c_agents_status
+    ON c_agents(status, last_run_at);
+CREATE INDEX IF NOT EXISTS idx_c_agents_parent
+    ON c_agents(graduated_from_b_name);
 """
 
 
@@ -1411,17 +1442,22 @@ class OverseerDB(CortexDB):
         self._migrate_10_b_agents()
 
     def _migrate_10_b_agents(self):
-        """Slice 10 (2026-05-20): Category B agent transcripts table.
+        """Slice 10 (2026-05-20): Category B agent transcripts table +
+        marker-preservation meta-blindspot.
 
-        Fresh installs get it via CREATE TABLE IF NOT EXISTS in
-        OVERSEER_SCHEMA_SQL; existing installs (the .25 we deploy
-        to) need it created additively on startup. The schema bootstrap
-        already runs OVERSEER_SCHEMA_SQL on every open(), so this
-        migration is a no-op safety check rather than a manual ALTER.
+        Fresh installs get the b_invocation_transcripts table via
+        CREATE TABLE IF NOT EXISTS in OVERSEER_SCHEMA_SQL; existing
+        installs (the .25 we deploy to) need it created additively
+        on startup. The schema bootstrap already runs OVERSEER_SCHEMA_
+        SQL on every open(), so this migration is a no-op safety
+        check rather than a manual ALTER.
 
-        We also use this hook to verify the table exists and warn
-        loudly if not — much easier to debug a missing-table error at
-        boot than at first B invocation.
+        We also use this hook to:
+          - verify the table exists and warn loudly if not
+          - insert the marker-preservation meta-blindspot if missing
+            (CP4 — declares the failure mode prompt-language is
+            guarding against, so overseer reads it next to other
+            blindspots even when no real drop has been observed)
         """
         row = self._conn.execute(
             "SELECT name FROM sqlite_master "
@@ -1432,6 +1468,58 @@ class OverseerDB(CortexDB):
                 "_migrate_10_b_agents: b_invocation_transcripts table "
                 "missing after schema bootstrap — B-agent dispatches "
                 "will fail until this is resolved"
+            )
+
+        # Insert Slice 10 marker-preservation blindspot if absent.
+        marker_text = "Consolidation pass drops [B:...] / [C:...] markers"
+        existing = self._conn.execute(
+            "SELECT id FROM known_blindspots WHERE body LIKE ?",
+            (f"%{marker_text}%",),
+        ).fetchone()
+        if not existing:
+            self._conn.execute(
+                "INSERT INTO known_blindspots (model_pattern, "
+                "topic_pattern, direction, confidence_adjustment, "
+                "body, rationale, source, confidence) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "*", "B-agent|C-agent|authorship|marker|consolidation",
+                    "general", 0,
+                    "Consolidation pass drops [B:...] / [C:...] markers — "
+                    "read-side weighting compromised. When you summarize "
+                    "or consolidate text that contains B/C authorship "
+                    "markers, models tend to flatten them into the "
+                    "narrative voice. Watch for this in temporal "
+                    "narratives, theme consolidations, and project "
+                    "rollups. If you cite a B verdict and lose the "
+                    "marker, future-you reads it as your own claim and "
+                    "loses the audit boundary.",
+                    "Prompt-level defense added in Slice 10 CP4 "
+                    "(2026-05-20). This blindspot is the meta-level "
+                    "acknowledgment that the rule may not always be "
+                    "followed.",
+                    "seed", "med",
+                ),
+            )
+            self._safe_commit()
+            log.info("_migrate_10_b_agents: seeded marker-preservation "
+                     "blindspot")
+        self._migrate_10_c_agents()
+
+    def _migrate_10_c_agents(self):
+        """Slice 10 CP5 (2026-05-20): c_agents table existence check.
+        Same pattern as _migrate_10_b_agents — schema bootstrap
+        creates the table, this migration is the safety check that
+        warns loudly if creation failed."""
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='c_agents'"
+        ).fetchone()
+        if not row:
+            log.warning(
+                "_migrate_10_c_agents: c_agents table missing after "
+                "schema bootstrap — graduation detector will fail "
+                "until this is resolved"
             )
 
     def _migrate_9_6_notification_actions(self):
@@ -4931,3 +5019,122 @@ class OverseerDB(CortexDB):
             "window_days": window_days,
             "by_agent": [dict(r) for r in rows],
         }
+
+    # ── Slice 10 CP5 (2026-05-20): C-agent helpers ─────────────────
+
+    # Graduation thresholds. Kept as class constants so the
+    # graduation detector + the docs/notifications can read the
+    # same numbers. Per locked design (agent_ecosystem_design.md):
+    # ≥10 dispatches AND ≥7 rated 4+ in a rolling 7-day window.
+    C_GRADUATION_MIN_DISPATCHES = 10
+    C_GRADUATION_MIN_RATED_4PLUS = 7
+    C_GRADUATION_WINDOW_DAYS = 7
+
+    def list_c_agents(self, *, status=None, limit=50) -> list:
+        """List C agents. Optional status filter."""
+        sql = "SELECT * FROM c_agents"
+        params: list = []
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(limit))
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def get_c_agent_by_name(self, name) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM c_agents WHERE name = ?", (name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def promote_b_to_c(self, *, b_agent_name, c_agent_name,
+                        system_prompt, model,
+                        cadence_minutes=1440,
+                        dispatches_at_promotion=0,
+                        rated_4plus_at_promotion=0) -> dict:
+        """Create a c_agents row promoting a B pattern to a C agent.
+
+        The B parent's system_prompt is frozen at promotion time —
+        future B changes don't propagate to C. C may diverge over
+        time. Returns {ok, c_agent_id} or {ok: False, error}.
+        """
+        existing = self.get_c_agent_by_name(c_agent_name)
+        if existing:
+            return {
+                "ok": False,
+                "error": f"c_agent '{c_agent_name}' already exists "
+                         f"(id {existing['id']})",
+            }
+        cur = self._conn.execute(
+            "INSERT INTO c_agents (name, graduated_from_b_name, "
+            "  cadence_minutes, system_prompt, model, "
+            "  graduated_from_b_dispatches_count, "
+            "  graduated_from_b_rated_4plus_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (c_agent_name, b_agent_name, int(cadence_minutes),
+             system_prompt, model,
+             int(dispatches_at_promotion),
+             int(rated_4plus_at_promotion)),
+        )
+        self._safe_commit()
+        log.info("promote_b_to_c: %s -> c_agent_id %d", c_agent_name,
+                 cur.lastrowid)
+        return {"ok": True, "c_agent_id": cur.lastrowid,
+                "name": c_agent_name}
+
+    def update_c_agent_run(self, *, c_agent_id, sibling_task_id) -> None:
+        """Update last_run_at + last_run_sibling_task_id after a
+        scheduled C run."""
+        self._conn.execute(
+            "UPDATE c_agents SET last_run_at = datetime('now'), "
+            "  last_run_sibling_task_id = ? "
+            "WHERE id = ?",
+            (int(sibling_task_id), int(c_agent_id)),
+        )
+        self._safe_commit()
+
+    def list_due_c_agents(self) -> list:
+        """List active C agents whose cadence_minutes has elapsed
+        since last_run_at (or that have never run). Used by the
+        _run_scheduled_c_agents tick step."""
+        rows = self._conn.execute(
+            "SELECT * FROM c_agents "
+            "WHERE status = 'active' "
+            "AND (last_run_at IS NULL "
+            "     OR julianday('now') - julianday(last_run_at) "
+            "        >= cadence_minutes / 1440.0) "
+            "ORDER BY last_run_at ASC NULLS FIRST"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def check_c_graduations(self) -> list:
+        """Return list of B agents that meet the C graduation
+        thresholds (≥10 dispatches AND ≥7 rated 4+ in 7-day window)
+        AND don't already have a C row. Caller is responsible for
+        emitting a notification with custom actions.
+
+        Returns: [{"b_agent_name": ..., "dispatches": ...,
+                   "rated_4_plus": ..., "proposed_c_name": ...}]
+        """
+        stats = self.b_agent_stats(
+            window_days=self.C_GRADUATION_WINDOW_DAYS)
+        proposals = []
+        for s in stats.get("by_agent") or []:
+            if (s["dispatches"] >= self.C_GRADUATION_MIN_DISPATCHES
+                    and s["rated_4_plus"] >= self.C_GRADUATION_MIN_RATED_4PLUS):
+                b_name = s["name"]
+                # Don't propose if a C already exists for this B
+                existing = self._conn.execute(
+                    "SELECT id FROM c_agents "
+                    "WHERE graduated_from_b_name = ?",
+                    (b_name,),
+                ).fetchone()
+                if existing:
+                    continue
+                proposals.append({
+                    "b_agent_name": b_name,
+                    "dispatches": s["dispatches"],
+                    "rated_4_plus": s["rated_4_plus"],
+                    "proposed_c_name": b_name.replace("_", "-") + "-daily",
+                })
+        return proposals

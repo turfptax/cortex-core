@@ -125,6 +125,15 @@ CONSTRAINTS:
     actually thinking about.
   • If the day was quiet (≤1 project touched, no journal entry),
     say so plainly in one sentence and stop.
+
+AUTHORSHIP MARKERS — DO NOT FLATTEN:
+If the inputs above contain text matching `[B:<name>]` or
+`[C:<name>]` (e.g. `[B:theme-check]`, `[C:weekly-themer]`), those
+are Category B or C agent authorship markers. PRESERVE them
+verbatim in your narrative. When you reference a sentence the
+overseer wrote that cited a B verdict, keep the marker on the
+quote. Stripping them collapses audit provenance — readers need
+to tell B/C work apart from the overseer's own thinking.
 """
 
 
@@ -357,6 +366,14 @@ CONSTRAINTS:
   • No advice, no recommendations, no "you should" — observe and
     name, don't coach.
   • If the week was quiet, say so plainly in one or two sentences.
+
+AUTHORSHIP MARKERS — DO NOT FLATTEN:
+If the inputs above contain text matching `[B:<name>]` or
+`[C:<name>]` (e.g. `[B:theme-check]`, `[C:weekly-themer]`), those
+are Category B or C agent authorship markers. PRESERVE them
+verbatim in your synthesis. When you reference a sentence that
+cited a B verdict, keep the marker on the quote. Stripping them
+collapses audit provenance.
 """
 
 
@@ -527,6 +544,12 @@ CONSTRAINTS:
     writing the wrong thing.
   • If the month was sparse (fewer than 2 weeklies, no journal
     entries), say so in two sentences and stop.
+
+AUTHORSHIP MARKERS — DO NOT FLATTEN:
+If the inputs above contain text matching `[B:<name>]` or
+`[C:<name>]`, PRESERVE them verbatim. Stripping them collapses
+audit provenance — readers need to tell B/C work apart from the
+overseer's own thinking.
 """
 
 
@@ -721,6 +744,12 @@ CONSTRAINTS:
     entries), say so plainly in two sentences and stop.
   • Write in past tense for the year itself; present tense for
     what's still live.
+
+AUTHORSHIP MARKERS — DO NOT FLATTEN:
+If the inputs above contain text matching `[B:<name>]` or
+`[C:<name>]`, PRESERVE them verbatim. Stripping them across the
+year-long compaction is especially damaging — audit provenance
+becomes invisible at the timescale where it matters most.
 """
 
 

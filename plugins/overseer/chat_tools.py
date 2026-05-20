@@ -1022,6 +1022,49 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "accept_c_promotion",
+            "description": (
+                "Slice 10 CP5 (2026-05-20): accept a B-agent C-"
+                "graduation proposal from Tory. Creates the c_agents "
+                "row, freezing the B parent's system_prompt and model "
+                "at promotion time. Call this ONLY after Tory has "
+                "clicked 'Promote to C' on a c-graduation notification "
+                "(check pending_notification_responses for actions of "
+                "kind='promote_b_to_c'). C runs on a schedule "
+                "(cadence_minutes; default 1440 = 24h) and shares the "
+                "B's snapshot-builder, but its audit rows carry "
+                "target='c-agent:<name>' instead of 'b-agent:<name>'. "
+                "Idempotent: returns error if c_agent_name already "
+                "exists."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "b_agent_name": {
+                        "type": "string",
+                        "description": "Parent B agent name (e.g. "
+                                       "'theme_check'). Must exist in "
+                                       "the live B registry.",
+                    },
+                    "c_agent_name": {
+                        "type": "string",
+                        "description": "Name for the new C agent "
+                                       "(e.g. 'theme-check-daily'). "
+                                       "Must be unique across c_agents.",
+                    },
+                    "cadence_minutes": {
+                        "type": "integer",
+                        "description": "Run interval in minutes. "
+                                       "Default 1440 (24h).",
+                    },
+                },
+                "required": ["b_agent_name", "c_agent_name"],
+            },
+        },
+    },
 ]
 
 # ── Slice 10 (2026-05-20): Category B agent tools ────────────────
@@ -1588,5 +1631,47 @@ def _dispatch(name: str, args: dict, *, db, core_memory,
             return {"ok": True, "marked_count": n}
         except Exception as e:
             return {"error": f"mark_processed failed: {e}"[:200]}
+
+    # ── Slice 10 CP5 (2026-05-20): C-graduation accept handler ────
+
+    if name == "accept_c_promotion":
+        b_agent_name = (args.get("b_agent_name") or "").strip()
+        c_agent_name = (args.get("c_agent_name") or "").strip()
+        cadence_minutes = int(args.get("cadence_minutes") or 1440)
+        if not b_agent_name or not c_agent_name:
+            return {"error": "b_agent_name + c_agent_name required"}
+        try:
+            import b_agents as _ba
+        except Exception as e:
+            return {"error": f"b_agents unavailable: {e}"[:200]}
+        if b_agent_name not in _ba.B_AGENTS:
+            return {"error": f"unknown B parent '{b_agent_name}'"}
+        spec = _ba.B_AGENTS[b_agent_name]
+        # Pull current rolling stats so the promotion row records
+        # the numbers that justified it.
+        try:
+            stats = db.b_agent_stats(
+                window_days=db.C_GRADUATION_WINDOW_DAYS)
+            row = next(
+                (s for s in stats["by_agent"] if s["name"] == b_agent_name),
+                None,
+            )
+            d_at = (row or {}).get("dispatches", 0)
+            r4_at = (row or {}).get("rated_4_plus", 0)
+        except Exception:
+            d_at = 0
+            r4_at = 0
+        try:
+            return db.promote_b_to_c(
+                b_agent_name=b_agent_name,
+                c_agent_name=c_agent_name,
+                system_prompt=spec["system_prompt"],
+                model=spec["model"],
+                cadence_minutes=cadence_minutes,
+                dispatches_at_promotion=d_at,
+                rated_4plus_at_promotion=r4_at,
+            )
+        except Exception as e:
+            return {"error": f"promote_b_to_c failed: {e}"[:200]}
 
     return {"error": "unknown tool: {}".format(name)}

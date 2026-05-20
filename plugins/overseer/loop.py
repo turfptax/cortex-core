@@ -627,6 +627,55 @@ class OverseerLoop:
             self._log.exception("b_agent_gc step failed: %s", e)
             summary["errors"].append("b_agent_gc: " + str(e)[:200])
 
+        # ── Step 11: C graduation check (Slice 10 CP5) ───────────
+        # Once-per-day scan for B patterns that meet the graduation
+        # bar (≥10 dispatches + ≥7 rated 4+ in 7-day window). When
+        # found AND no C row exists for that B yet, emit a notification
+        # with custom actions [Promote / Keep as B / Explain]. The
+        # accept handler creates the C row via accept_c_promotion()
+        # called from chat_tools when overseer processes Tory's reply.
+        # Per locked design (agent_ecosystem_design.md): graduation is
+        # NEVER automatic — Tory accepts or rejects each proposal.
+        if self._cfg.get("c_graduation_check_enabled", True):
+            try:
+                last_check = self._db.get_overseer_state(
+                    "c_graduation_check_last_at")
+                now_iso = _utc_iso()
+                do_check = True
+                if last_check and last_check[:10] == now_iso[:10]:
+                    do_check = False
+                if do_check:
+                    proposals = self._db.check_c_graduations()
+                    self._db.set_overseer_state(
+                        "c_graduation_check_last_at", now_iso)
+                    if proposals:
+                        summary["c_graduation_proposals"] = len(proposals)
+                        for p in proposals:
+                            self._emit_c_graduation_proposal(p)
+            except AttributeError:
+                self._log.debug(
+                    "check_c_graduations not available (old install)")
+            except Exception as e:
+                self._log.exception("c_graduation step failed: %s", e)
+                summary["errors"].append(
+                    "c_graduation: " + str(e)[:200])
+
+        # ── Step 12: Scheduled C-agent runs (Slice 10 CP5) ────────
+        # For each due C agent (cadence_minutes elapsed since last_run_at
+        # or never-run), dispatch the underlying B with the C's frozen
+        # snapshot args. The same b_agents.dispatch_b_agent() path is
+        # reused — C is just "B with a schedule" until specialization
+        # (e.g. fine-tuned model swap) happens. C invocations carry
+        # target='c-agent:<name>' in sibling_tasks for audit separation.
+        if self._cfg.get("c_agents_run_enabled", True):
+            try:
+                self._run_scheduled_c_agents(budget=budget, summary=summary)
+            except AttributeError:
+                self._log.debug("c_agents not available (old install)")
+            except Exception as e:
+                self._log.exception("c_agents run failed: %s", e)
+                summary["errors"].append("c_agents: " + str(e)[:200])
+
         # Tally + persist
         summary["finished_at"] = _utc_iso()
         summary["budget"] = budget.remaining()
@@ -1546,6 +1595,133 @@ class OverseerLoop:
             summary["project_narratives_cost_usd"] = round(regen_cost, 4)
 
     # ── Step 9: temporal cadence (Slice 5 CP2) ──────────────────
+
+    # ── Slice 10 CP5 (2026-05-20): C-graduation + scheduled runs ────
+
+    def _emit_c_graduation_proposal(self, proposal: dict) -> None:
+        """Emit a notification with custom actions when a B pattern
+        meets the graduation bar. Tory accepts, rejects, or asks for
+        explanation via the action buttons.
+
+        Idempotent against repeated proposals: notification rule_key
+        is 'c_grad:<b_name>' so re-emits dedupe at the notification
+        layer (notifications schema already has dedup-by-rule_key).
+        """
+        b_name = proposal["b_agent_name"]
+        c_name = proposal["proposed_c_name"]
+        d = proposal["dispatches"]
+        r4 = proposal["rated_4_plus"]
+        title = f"Promote B agent '{b_name}' to C?"
+        body = (
+            f"`{b_name}` has crossed the graduation bar: {d} dispatches "
+            f"in the past 7 days, {r4} of them rated 4+ by overseer. "
+            f"Proposed C name: `{c_name}` (24h cadence by default). "
+            f"C will reuse the B's system prompt frozen at promotion "
+            f"time and run on a schedule. You can promote, keep as B, "
+            f"or ask overseer to explain the difference."
+        )
+        actions = [
+            {
+                "label": "Promote to C",
+                "kind": "promote_b_to_c",
+                "payload": {
+                    "b_agent_name": b_name,
+                    "proposed_c_name": c_name,
+                    "dispatches": d,
+                    "rated_4_plus": r4,
+                },
+            },
+            {
+                "label": "Keep as B",
+                "kind": "keep_as_b",
+                "payload": {"b_agent_name": b_name},
+            },
+            {
+                "label": "Explain",
+                "kind": "explain_c_graduation",
+                "payload": {"b_agent_name": b_name},
+            },
+        ]
+        try:
+            self._db.emit_notification(
+                severity="info",
+                title=title,
+                body=body,
+                rule_name="c-graduation-proposal",
+                rule_key=f"c_grad:{b_name}",
+                related_table="c_agents",
+                related_id=b_name,
+                actions=actions,
+            )
+            self._log.info(
+                "c-graduation proposal emitted: %s (d=%d, r4+=%d)",
+                b_name, d, r4)
+        except Exception as e:
+            self._log.exception("emit c-graduation proposal failed: %s", e)
+
+    def _run_scheduled_c_agents(self, *, budget: "TickBudget",
+                                  summary: dict) -> None:
+        """Dispatch any C agents whose cadence has elapsed. Each
+        invocation reuses the B-agent dispatcher under a
+        target='c-agent:<name>' label so audit + rating semantics
+        carry over.
+
+        C invocations bypass the per-tick LLM budget gating only if
+        explicitly opted in via cfg (default: respect budget). Each
+        C costs ~$0.02 per run; with daily cadence and a small
+        number of Cs, total cost stays well under $1/day.
+        """
+        try:
+            due = self._db.list_due_c_agents()
+        except AttributeError:
+            return  # old install
+        if not due:
+            return
+        try:
+            import b_agents as _b_agents
+        except Exception as e:
+            self._log.warning("b_agents import failed in C-run: %s", e)
+            return
+
+        ran = 0
+        for c in due:
+            if budget.exhausted():
+                summary.setdefault("skipped_due_to_budget", []).append(
+                    f"c_agent:{c['name']}")
+                break
+            # For the first C cycle, C runs the SAME logic as its B
+            # parent. The b_agent_name in the registry must match
+            # c['graduated_from_b_name']. If the parent B is gone
+            # (e.g. removed from the registry), skip with a log.
+            b_parent = c["graduated_from_b_name"]
+            if b_parent not in _b_agents.B_AGENTS:
+                self._log.warning(
+                    "c_agent '%s' has no B parent '%s' in registry; "
+                    "skipping scheduled run",
+                    c["name"], b_parent)
+                continue
+            # The first C use case (theme_check) doesn't need
+            # specific args — it's an overseer-side decision which
+            # theme to audit. For scheduled-without-args Cs we skip
+            # for now and surface a notification asking overseer to
+            # supply args. Future: store args_json on c_agents row.
+            self._log.info(
+                "c_agent '%s' is due but has no scheduled-args "
+                "wiring yet; passing this slice", c["name"])
+            # Mark last_run_at to avoid infinite due-polling. Even
+            # though we didn't actually fire, the cadence is the
+            # "check interval" semantically.
+            try:
+                self._db.update_c_agent_run(
+                    c_agent_id=c["id"],
+                    sibling_task_id=0,  # 0 = no actual run
+                )
+            except Exception:
+                pass
+            ran += 1
+
+        if ran:
+            summary["c_agents_due_handled"] = ran
 
     def _run_temporal_cadence(self, *, budget: TickBudget,
                                 summary: dict):

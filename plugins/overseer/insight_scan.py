@@ -77,6 +77,14 @@ Return a single JSON object on one line, no surrounding prose:
 ]}}
 
 If nothing genuine: {{"insights": []}}
+
+AUTHORSHIP MARKERS — DO NOT FLATTEN:
+If the GISTS above contain text matching `[B:<name>]` or
+`[C:<name>]` (e.g. `[B:theme-check]`), those are Category B or C
+agent authorship markers. When you cite a gist that contains one
+in your `rationale` or `body`, PRESERVE the marker verbatim.
+Stripping them collapses audit provenance — readers need to tell
+B/C work apart from your own thinking.
 """
 
 

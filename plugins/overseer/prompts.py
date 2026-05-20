@@ -37,6 +37,31 @@ adds system context and feeds to LLMRouter.complete(prompt, ...).
 from __future__ import annotations
 
 
+# ── Slice 10 CP4 (2026-05-20): marker preservation rule ──────────
+# Every consolidation pass that summarizes overseer-authored text
+# (journal entries, gists that already cite B/C output, etc.)
+# must carry this rule. Without it, B/C authorship markers get
+# silently flattened into "overseer said X" and downstream readers
+# (Tory or another agent) lose the audit boundary.
+#
+# Add via str + MARKER_PRESERVATION_RULE wherever the prompt's
+# source content could contain `[B:...]` or `[C:...]` substrings.
+# Where the source has NO chance of containing them (e.g.
+# session_gist_prompt summarizing fresh raw notes) we still include
+# the rule — defense in depth + a single discipline to read.
+
+MARKER_PRESERVATION_RULE = """\
+
+AUTHORSHIP MARKERS — DO NOT FLATTEN:
+If the source content above contains any text matching `[B:<name>]` \
+or `[C:<name>]` (e.g. `[B:theme-check]`, `[C:weekly-themer]`), \
+those are Category B or C agent authorship markers. PRESERVE them \
+verbatim in your output. When you quote or paraphrase a sentence \
+that starts with such a marker, keep the marker on the quote. \
+Stripping them collapses audit provenance — downstream readers \
+need to tell B/C work apart from the overseer's own thinking."""
+
+
 # ── Gists ───────────────────────────────────────────────────────
 # Drop everything but the CHANGE.
 
@@ -60,6 +85,7 @@ def session_gist_prompt(*, session_id: str, started_at: str | None,
         "Write only the one-sentence gist focused on the change. No "
         "preamble. No quotes. If nothing changed, write 'No net change "
         "in user's standing situation.'"
+        + MARKER_PRESERVATION_RULE
     ).format(
         sid=session_id, started=started_at or "?",
         ended=ended_at or "?", platform=platform or "unknown",
@@ -93,6 +119,7 @@ def import_gist_prompt(*, imp_id: str, project: str, cwd: str,
         "TRANSCRIPT:\n{transcript}\n\n"
         "Write only the one-sentence gist focused on the change. No "
         "preamble. No quotes."
+        + MARKER_PRESERVATION_RULE
     ).format(
         sid=imp_id, project=project or "(unknown)",
         cwd=cwd or "(unknown)", branch=branch or "(none)",
@@ -114,6 +141,7 @@ def recent_notes_gist_prompt(*, body: str) -> str:
         "{body}\n\n"
         "Write only the one-sentence gist focused on the change. No "
         "preamble. No quotes."
+        + MARKER_PRESERVATION_RULE
     ).format(body=body)
 
 
@@ -140,6 +168,7 @@ def episode_prompt(*, body: str, source_label: str = "") -> str:
         "Source: {source}\n\n"
         "Content:\n{body}\n\n"
         "Reply with ONLY the structured fields above. No preamble."
+        + MARKER_PRESERVATION_RULE
     ).format(source=source_label or "(unspecified)", body=body)
 
 
@@ -171,6 +200,7 @@ def theme_prompt(*, body: str, prior_themes_summary: str = "") -> str:
         "Source content to find rhymes against:\n{body}\n\n"
         "If no real rhyme is visible, reply with: 'No theme — content "
         "stands alone.'"
+        + MARKER_PRESERVATION_RULE
     ).format(prior=prior_themes_summary or "(none yet)", body=body)
 
 
