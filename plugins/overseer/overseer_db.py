@@ -840,6 +840,40 @@ CREATE INDEX IF NOT EXISTS idx_sibling_status
     ON sibling_tasks(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_sibling_target_status
     ON sibling_tasks(target, status);
+
+-- ── Slice 10 (2026-05-20): Category B agent transcripts ──────────
+-- B agents are stateless Sonnet calls fired from a tool dispatcher,
+-- with frozen system prompts and snapshot-on-demand inputs. They
+-- share the sibling_tasks table for dispatch + result + rating
+-- (target string 'b-agent:<name>'). We keep their full snapshot
+-- transcripts in a separate table so the sibling_tasks row stays
+-- queryable while the (sometimes large) snapshot JSON lives apart.
+--
+-- Retention: 30 days. The daily tick step _b_agent_gc deletes rows
+-- where retained_until < now. The reason for retention at all:
+-- when overseer cites a B verdict in a journal entry weeks later,
+-- we want to be able to drill back to the exact evidence the B
+-- saw (especially for the timestamp-sliced calibration audit
+-- pattern in b_theme_check).
+CREATE TABLE IF NOT EXISTS b_invocation_transcripts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sibling_task_id INTEGER NOT NULL,
+    b_agent_name TEXT NOT NULL,            -- e.g. 'theme_check'
+    snapshot_json TEXT NOT NULL,           -- exact input snapshot the B saw
+    output_text TEXT NOT NULL,             -- full LLM output (marker prefix included)
+    model_used TEXT NOT NULL DEFAULT '',
+    cost_usd REAL NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    retained_until TEXT NOT NULL,          -- ISO timestamp; GC drops rows past this
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (sibling_task_id) REFERENCES sibling_tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_b_trans_task
+    ON b_invocation_transcripts(sibling_task_id);
+CREATE INDEX IF NOT EXISTS idx_b_trans_gc
+    ON b_invocation_transcripts(retained_until);
+CREATE INDEX IF NOT EXISTS idx_b_trans_agent
+    ON b_invocation_transcripts(b_agent_name, created_at);
 """
 
 
@@ -1374,6 +1408,31 @@ class OverseerDB(CortexDB):
                 "redacted_at TEXT"
             )
             self._safe_commit()
+        self._migrate_10_b_agents()
+
+    def _migrate_10_b_agents(self):
+        """Slice 10 (2026-05-20): Category B agent transcripts table.
+
+        Fresh installs get it via CREATE TABLE IF NOT EXISTS in
+        OVERSEER_SCHEMA_SQL; existing installs (the .25 we deploy
+        to) need it created additively on startup. The schema bootstrap
+        already runs OVERSEER_SCHEMA_SQL on every open(), so this
+        migration is a no-op safety check rather than a manual ALTER.
+
+        We also use this hook to verify the table exists and warn
+        loudly if not — much easier to debug a missing-table error at
+        boot than at first B invocation.
+        """
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='b_invocation_transcripts'"
+        ).fetchone()
+        if not row:
+            log.warning(
+                "_migrate_10_b_agents: b_invocation_transcripts table "
+                "missing after schema bootstrap — B-agent dispatches "
+                "will fail until this is resolved"
+            )
 
     def _migrate_9_6_notification_actions(self):
         """Slice 9.6 CP1 (2026-05-19): notifications gain actions_json
@@ -4690,4 +4749,185 @@ class OverseerDB(CortexDB):
             "remaining_today": max(0, daily_cap - today_n),
             "unrated_count": unrated_n,
             "pending_for_me": pending_for_me_n,
+        }
+
+    # ── Slice 10 (2026-05-20): Category B agent helpers ─────────────
+    # B agents are stateless callables (Sonnet calls with frozen
+    # system prompts + snapshot-on-demand inputs) dispatched as tools
+    # by the overseer. They share sibling_tasks for the audit row
+    # (status='completed' immediately because B runs synchronously)
+    # and write their snapshot + full output into b_invocation_-
+    # transcripts. The daily B cap is separate from the A sibling cap.
+
+    def b_agent_dispatch(self, *, b_agent_name, prompt, snapshot,
+                          output_text, model_used, cost_usd, latency_ms,
+                          retention_days=30, daily_cap=50,
+                          marker_required=True) -> dict:
+        """Persist a completed B-agent invocation.
+
+        Creates a sibling_tasks row (target='b-agent:<name>',
+        status='completed') so the existing rate/audit/freshness
+        plumbing works for B tasks without forking it, and writes the
+        snapshot + full output into b_invocation_transcripts with a
+        retention horizon.
+
+        Daily cap is enforced per-B-agent — separate from A's cap
+        because B is cheaper and we want to allow more of them.
+
+        Returns {ok, sibling_task_id, transcript_id, used_today, cap}
+        or {ok: False, error} on cap exhaustion / validation failure.
+        """
+        import json as _json
+        # Cap check first — counts ALL B dispatches today across all
+        # B agents (cheap protection against runaway loops). Per-B
+        # tuning can come later if we observe one B starving others.
+        day_start_iso = self._local_day_start_iso()
+        used_today = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM sibling_tasks "
+            "WHERE created_by = 'overseer' "
+            "AND target LIKE 'b-agent:%' "
+            "AND created_at >= ?",
+            (day_start_iso,),
+        ).fetchone()["n"]
+        if used_today >= daily_cap:
+            return {
+                "ok": False,
+                "error": (f"daily B-agent dispatch cap reached "
+                          f"({used_today}/{daily_cap})"),
+                "cap": daily_cap,
+                "used_today": used_today,
+            }
+
+        # Validate marker if required. The B's job is to prepend a
+        # [B:<short-name>] marker so downstream consolidation can
+        # spot B authorship. Defensive: if the model dropped it,
+        # we caller-decide whether to wrap or error.
+        if marker_required:
+            expected_marker = f"[B:{b_agent_name.replace('_', '-')}]"
+            if expected_marker not in output_text:
+                return {
+                    "ok": False,
+                    "error": (f"output missing required marker "
+                              f"'{expected_marker}'"),
+                    "expected_marker": expected_marker,
+                }
+
+        target = f"b-agent:{b_agent_name}"
+        ctx_json = _json.dumps(
+            {"snapshot_summary":
+                f"<see b_invocation_transcripts for full snapshot>",
+             "b_agent_name": b_agent_name},
+            default=str, ensure_ascii=False,
+        )
+        cur = self._conn.execute(
+            "INSERT INTO sibling_tasks "
+            "  (created_by, target, prompt, context_json, "
+            "   cost_budget_usd, task_type, preferred_model_tier, "
+            "   status, claimed_at, claimed_by, completed_at, "
+            "   result_text, actual_model_used, result_cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, "
+            "        datetime('now'), ?, datetime('now'), ?, ?, ?)",
+            ("overseer", target, prompt, ctx_json,
+             float(cost_usd) + 0.01,  # nominal budget for audit
+             "audit",  # B's task_type is always 'audit' for now
+             "balanced", "completed",
+             f"b-agent:{b_agent_name}",  # claimed_by self-reference
+             output_text, model_used, float(cost_usd)),
+        )
+        sibling_task_id = cur.lastrowid
+
+        # Compute retention timestamp
+        from datetime import datetime, timezone, timedelta
+        retained_until = (
+            datetime.now(timezone.utc) + timedelta(days=retention_days)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+
+        snap_json = _json.dumps(snapshot, default=str, ensure_ascii=False)
+        tcur = self._conn.execute(
+            "INSERT INTO b_invocation_transcripts "
+            "  (sibling_task_id, b_agent_name, snapshot_json, "
+            "   output_text, model_used, cost_usd, latency_ms, "
+            "   retained_until) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (sibling_task_id, b_agent_name, snap_json,
+             output_text, model_used,
+             float(cost_usd), int(latency_ms), retained_until),
+        )
+        transcript_id = tcur.lastrowid
+        self._safe_commit()
+        return {
+            "ok": True,
+            "sibling_task_id": sibling_task_id,
+            "transcript_id": transcript_id,
+            "used_today": used_today + 1,
+            "cap": daily_cap,
+            "retained_until": retained_until,
+        }
+
+    def b_agent_recent(self, *, b_agent_name=None, limit=20) -> list:
+        """Recent B invocations (joined with sibling_tasks for ratings).
+        Used by the C-graduation detector (Slice 10.3) and by the
+        overseer's chat tool that lets it review its own audit history.
+        """
+        sql = (
+            "SELECT t.id AS transcript_id, t.b_agent_name, "
+            "       t.snapshot_json, t.output_text, t.model_used, "
+            "       t.cost_usd, t.latency_ms, t.created_at, "
+            "       t.retained_until, "
+            "       s.id AS sibling_task_id, "
+            "       s.quality_rating, s.quality_notes, "
+            "       s.dataset_candidate "
+            "FROM b_invocation_transcripts t "
+            "JOIN sibling_tasks s ON s.id = t.sibling_task_id "
+            "WHERE 1=1 "
+        )
+        params: list = []
+        if b_agent_name:
+            sql += "AND t.b_agent_name = ? "
+            params.append(b_agent_name)
+        sql += "ORDER BY t.created_at DESC LIMIT ?"
+        params.append(int(limit))
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def b_agent_gc_expired(self) -> int:
+        """Daily GC step: delete transcripts past their retention.
+        Returns deleted row count. The sibling_tasks rows stay so the
+        audit ledger is intact — only the (sometimes large) snapshot
+        JSON drops out."""
+        cur = self._conn.execute(
+            "DELETE FROM b_invocation_transcripts "
+            "WHERE retained_until < datetime('now')"
+        )
+        n = cur.rowcount
+        self._safe_commit()
+        if n:
+            log.info("b_agent_gc_expired: deleted %d expired transcripts", n)
+        return int(n or 0)
+
+    def b_agent_stats(self, *, window_days=7) -> dict:
+        """Per-B-agent dispatch + rating stats over a rolling window.
+        Used by C-graduation detector (≥10 dispatches AND ≥7 rated 4+
+        in past 7 days → propose graduation to Tory)."""
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(days=window_days)).strftime(
+            "%Y-%m-%d %H:%M:%S")
+        rows = self._conn.execute(
+            "SELECT t.b_agent_name AS name, "
+            "       COUNT(*) AS dispatches, "
+            "       SUM(CASE WHEN s.quality_rating >= 4 THEN 1 ELSE 0 END) "
+            "         AS rated_4_plus, "
+            "       SUM(CASE WHEN s.quality_rating IS NULL THEN 1 ELSE 0 END) "
+            "         AS unrated, "
+            "       MAX(t.created_at) AS last_dispatch_at "
+            "FROM b_invocation_transcripts t "
+            "JOIN sibling_tasks s ON s.id = t.sibling_task_id "
+            "WHERE t.created_at >= ? "
+            "GROUP BY t.b_agent_name "
+            "ORDER BY dispatches DESC",
+            (cutoff,),
+        ).fetchall()
+        return {
+            "window_days": window_days,
+            "by_agent": [dict(r) for r in rows],
         }

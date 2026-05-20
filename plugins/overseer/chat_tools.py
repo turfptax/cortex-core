@@ -1024,6 +1024,20 @@ TOOL_DEFINITIONS: list[dict] = [
     },
 ]
 
+# ── Slice 10 (2026-05-20): Category B agent tools ────────────────
+# B agents are stateless Sonnet-backed audit specialists. Their tool
+# defs live in b_agents.B_AGENTS and are merged in here so the chat
+# layer + journal step pick them up automatically.
+try:
+    import b_agents  # noqa: E402
+    TOOL_DEFINITIONS.extend(b_agents.b_agent_tool_definitions())
+    log.info("merged %d Category B agent tool definitions",
+             len(b_agents.B_AGENTS))
+except Exception as _b_imp_err:  # pragma: no cover — import safety net
+    log.warning("failed to merge B-agent tool definitions: %s",
+                _b_imp_err)
+
+
 # Per-call iteration cap — bounds blast radius if the model loops.
 MAX_TOOL_ITER = 8
 
@@ -1074,6 +1088,23 @@ def dispatch_tool(name: str, args: dict, *, db, core_memory,
 
 def _dispatch(name: str, args: dict, *, db, core_memory,
               sibling_daily_cap: int = 20, llm=None):
+    # ── Slice 10: Category B agent dispatch ──────────────────────
+    # Any tool name starting with 'dispatch_b_' routes to the B-agent
+    # dispatcher. Distinguished from dispatch_sibling (A) by the
+    # prefix. The B daily cap is hard-coded at 50 for the first
+    # rollout; will be configurable via plugin.toml in a later slice
+    # if we observe runaway dispatch (Tory's risk #2 in the plan).
+    if name.startswith("dispatch_b_"):
+        b_name = name[len("dispatch_b_"):]
+        try:
+            import b_agents
+        except Exception as e:
+            return {"error": f"b_agents module unavailable: {e}"[:200]}
+        return b_agents.dispatch_b_agent(
+            b_name, args, db=db, core_memory=core_memory,
+            llm=llm, b_daily_cap=50,
+        )
+
     if name == "get_recent_human_journal":
         limit = max(1, min(50, int(args.get("limit", 10))))
         rows = db.list_human_journal_entries(limit=limit)

@@ -602,6 +602,31 @@ class OverseerLoop:
         # Slice 5.5 so time-anchored daily/weekly/monthly narratives
         # run before any other LLM step claims the day's budget.)
 
+        # ── Step 10: Category B agent GC (Slice 10, 2026-05-20) ──
+        # Cheap maintenance — drops b_invocation_transcripts past their
+        # retained_until horizon (default 30 days). Once-per-day gated
+        # so it doesn't run on every tick. Wrapped in try/except because
+        # an old install without the table should never block the loop.
+        try:
+            last_gc = self._db.get_overseer_state("b_agent_gc_last_at")
+            now_iso = _utc_iso()
+            do_gc = True
+            if last_gc:
+                # crude day comparison: same YYYY-MM-DD → skip
+                if last_gc[:10] == now_iso[:10]:
+                    do_gc = False
+            if do_gc:
+                deleted = self._db.b_agent_gc_expired()
+                self._db.set_overseer_state("b_agent_gc_last_at", now_iso)
+                if deleted:
+                    summary["b_agent_gc_deleted"] = deleted
+        except AttributeError:
+            # Old install without b_agent_gc_expired — log once
+            self._log.debug("b_agent_gc_expired not available (old install)")
+        except Exception as e:
+            self._log.exception("b_agent_gc step failed: %s", e)
+            summary["errors"].append("b_agent_gc: " + str(e)[:200])
+
         # Tally + persist
         summary["finished_at"] = _utc_iso()
         summary["budget"] = budget.remaining()

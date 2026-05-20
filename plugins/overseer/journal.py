@@ -90,6 +90,20 @@ do anything about it." Use tools when the action is obvious and small:
   - Read tools (`get_recent_*`, `search_*`) are free to use when you \
     actually need the data to write the entry.
 
+Category B audit tools (Slice 10, 2026-05-20):
+  - `dispatch_b_theme_check` runs a CALIBRATION audit on one of your \
+    own themes — was the confidence tag justified by evidence \
+    AVAILABLE AT WRITE-TIME (not retrospect)? Use this on themes \
+    you're carrying at [high] without external pressure-test. The \
+    B's output starts with `[B:theme-check]` and that marker survives \
+    consolidation as authorship attribution — when you cite a B \
+    verdict, keep the marker intact.
+  - More Bs will arrive (project-merge-check is next). The general \
+    shape: B is for "I want a snapshot-on-demand second opinion \
+    without escalating to a sibling." Cheaper than dispatch_sibling, \
+    instant, stateless. Use freely when an audit clarifies a \
+    high-confidence frame you're carrying.
+
 Hard discipline:
   - Max {max_tool_iter} tool iterations this tick. After that, write \
     the entry with what you have.
