@@ -5107,21 +5107,33 @@ class OverseerDB(CortexDB):
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def check_c_graduations(self) -> list:
+    def check_c_graduations(self, *, min_dispatches=None,
+                              min_rated_4plus=None,
+                              window_days=None) -> list:
         """Return list of B agents that meet the C graduation
-        thresholds (≥10 dispatches AND ≥7 rated 4+ in 7-day window)
-        AND don't already have a C row. Caller is responsible for
-        emitting a notification with custom actions.
+        thresholds AND don't already have a C row. Caller is
+        responsible for emitting a notification with custom actions.
+
+        Thresholds default to the class constants
+        (C_GRADUATION_MIN_DISPATCHES, _MIN_RATED_4PLUS, _WINDOW_DAYS)
+        but can be overridden via kwargs so plugin.toml can ship
+        looser values during shake-out testing. Class constants
+        remain the locked-design reference values.
 
         Returns: [{"b_agent_name": ..., "dispatches": ...,
                    "rated_4_plus": ..., "proposed_c_name": ...}]
         """
-        stats = self.b_agent_stats(
-            window_days=self.C_GRADUATION_WINDOW_DAYS)
+        if min_dispatches is None:
+            min_dispatches = self.C_GRADUATION_MIN_DISPATCHES
+        if min_rated_4plus is None:
+            min_rated_4plus = self.C_GRADUATION_MIN_RATED_4PLUS
+        if window_days is None:
+            window_days = self.C_GRADUATION_WINDOW_DAYS
+        stats = self.b_agent_stats(window_days=int(window_days))
         proposals = []
         for s in stats.get("by_agent") or []:
-            if (s["dispatches"] >= self.C_GRADUATION_MIN_DISPATCHES
-                    and s["rated_4_plus"] >= self.C_GRADUATION_MIN_RATED_4PLUS):
+            if (s["dispatches"] >= int(min_dispatches)
+                    and s["rated_4_plus"] >= int(min_rated_4plus)):
                 b_name = s["name"]
                 # Don't propose if a C already exists for this B
                 existing = self._conn.execute(

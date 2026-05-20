@@ -245,6 +245,23 @@ loop_daily_budget_calls = 250
 # Resets at local midnight (matches Slice 5.5 DailyBudget calendar).
 loop_daily_sibling_dispatches = 20
 
+# ── Slice 10 CP5 (2026-05-20): C-agent graduation thresholds ────────
+# Bar for the daily _check_c_graduations tick step to PROPOSE a B-to-C
+# promotion via Bell notification. Tory accepts/rejects; nothing
+# auto-promotes.
+#
+# Locked design defaults (agent_ecosystem_design.md): 10 dispatches +
+# 7 rated 4+ in a 7-day window. Initial production values below are
+# LOWERED for shake-out testing (2026-05-20 directive): the path
+# can't be exercised in a single day at 10/7/7, and we want to surface
+# runtime bugs before the first real promotion. Revert to the design
+# defaults (10 / 7 / 7) after we've seen one full happy-path graduation.
+c_graduation_min_dispatches = 2
+c_graduation_min_rated_4plus = 1
+c_graduation_window_days = 1
+c_graduation_check_enabled = true
+c_agents_run_enabled = true
+
 # ── Slice 9.4 CP2 (2026-05-16): periodic GitHub ingest ──────────────
 # When enabled, the loop calls imports/github_ingester.py for each repo
 # in loop_git_ingest_repos every loop_git_ingest_interval_hours. Adds a

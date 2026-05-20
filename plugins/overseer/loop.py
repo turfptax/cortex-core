@@ -636,22 +636,37 @@ class OverseerLoop:
         # called from chat_tools when overseer processes Tory's reply.
         # Per locked design (agent_ecosystem_design.md): graduation is
         # NEVER automatic — Tory accepts or rejects each proposal.
+        # NOTE: removed once-per-day gate (2026-05-20 directive from
+        # Tory). Original concern was notification spam, but the
+        # rule_key='c_grad:<b_name>' dedup at the notifications layer
+        # handles that — re-firing the check every tick can't produce
+        # duplicate notifications. Cost is one cheap stats query per
+        # tick. Running every tick keeps the shake-out feedback loop
+        # short: as soon as overseer dispatches enough Bs, the
+        # proposal appears.
         if self._cfg.get("c_graduation_check_enabled", True):
             try:
-                last_check = self._db.get_overseer_state(
-                    "c_graduation_check_last_at")
-                now_iso = _utc_iso()
-                do_check = True
-                if last_check and last_check[:10] == now_iso[:10]:
-                    do_check = False
-                if do_check:
-                    proposals = self._db.check_c_graduations()
-                    self._db.set_overseer_state(
-                        "c_graduation_check_last_at", now_iso)
-                    if proposals:
-                        summary["c_graduation_proposals"] = len(proposals)
-                        for p in proposals:
-                            self._emit_c_graduation_proposal(p)
+                # Slice 10 CP5: thresholds are configurable for
+                # shake-out testing. Defaults (in overseer_db.py
+                # class constants) match the locked design (10/7/7);
+                # plugin.toml ships lower values (2/1/1) for early
+                # production until one happy-path graduation
+                # round-trip confirms the flow.
+                proposals = self._db.check_c_graduations(
+                    min_dispatches=int(self._cfg.get(
+                        "c_graduation_min_dispatches",
+                        self._db.C_GRADUATION_MIN_DISPATCHES)),
+                    min_rated_4plus=int(self._cfg.get(
+                        "c_graduation_min_rated_4plus",
+                        self._db.C_GRADUATION_MIN_RATED_4PLUS)),
+                    window_days=int(self._cfg.get(
+                        "c_graduation_window_days",
+                        self._db.C_GRADUATION_WINDOW_DAYS)),
+                )
+                if proposals:
+                    summary["c_graduation_proposals"] = len(proposals)
+                    for p in proposals:
+                        self._emit_c_graduation_proposal(p)
             except AttributeError:
                 self._log.debug(
                     "check_c_graduations not available (old install)")
