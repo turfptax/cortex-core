@@ -345,6 +345,15 @@ class OverseerPlugin(Plugin):
             # ── Slice 10.4 (2026-05-20): ecosystem visualizer ────
             Route("GET",  "/ecosystem",
                   self._http_ecosystem),
+            # ── Slice 10.4 Phase 2: runs / activity ───────────────
+            Route("GET",  "/runs/recent",
+                  self._http_runs_recent),
+            Route("GET",  "/runs/detail",
+                  self._http_runs_detail),
+            Route("GET",  "/runs/export",
+                  self._http_runs_export),
+            Route("POST", "/runs/rate",
+                  self._http_runs_rate),
         ]
 
     # ── Lifecycle ───────────────────────────────────────────────
@@ -1997,6 +2006,92 @@ class OverseerPlugin(Plugin):
                 "c_agents": len(c_agents),
             },
         }
+
+    # ── Slice 10.4 Phase 2 (2026-05-20): runs / activity tab ────
+
+    def _http_runs_recent(self, payload):
+        """GET /plugins/overseer/runs/recent?hours=24&limit=200&kinds=
+
+        Returns a timeline of recent runs across all overseer
+        surfaces (B/C agents, A-tier siblings, chat turns, journal
+        steps) normalized to a common shape. Used by the Hub's
+        Activity tab to render the left-side timeline list.
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        hours = int((payload or {}).get("hours") or 24)
+        limit = int((payload or {}).get("limit") or 200)
+        kinds_raw = (payload or {}).get("kinds") or ""
+        kinds = (set(k.strip() for k in kinds_raw.split(","))
+                 if kinds_raw else None)
+        try:
+            runs = self.overseer_db.list_recent_runs(
+                hours=hours, limit=limit, kinds=kinds)
+            return {"ok": True, "hours": hours, "count": len(runs),
+                    "runs": runs}
+        except Exception as e:
+            log.exception("runs_recent failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_runs_detail(self, payload):
+        """GET /plugins/overseer/runs/detail?kind=X&id=Y — full
+        detail for one run including flow graph nodes/edges,
+        full prompt, full output. Used by the Activity tab's
+        center panel + detail sidebar."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        kind = ((payload or {}).get("kind") or "").strip()
+        run_id = (payload or {}).get("id")
+        if not kind or run_id is None:
+            return {"ok": False, "error": "kind + id required"}
+        try:
+            return self.overseer_db.get_run_detail(
+                kind=kind, run_id=run_id)
+        except Exception as e:
+            log.exception("runs_detail failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_runs_export(self, payload):
+        """GET /plugins/overseer/runs/export?hours=24 — full bundle
+        of all runs in the past N hours with snapshots + outputs.
+        Frontend triggers a file download from this response."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        hours = int((payload or {}).get("hours") or 24)
+        try:
+            bundle = self.overseer_db.export_runs_bundle(hours=hours)
+            return {"ok": True, **bundle}
+        except Exception as e:
+            log.exception("runs_export failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_runs_rate(self, payload):
+        """POST /plugins/overseer/runs/rate
+        body: {sibling_task_id, rating, notes?, dataset_candidate?}
+
+        Rate a run that has a sibling_task_id (B/C dispatches and
+        A-tier sibling tasks). Threads into the same
+        sibling_rate_result code path the chat tool uses, so the
+        rating shows up wherever sibling stats are surfaced."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        try:
+            tid = int((payload or {}).get("sibling_task_id"))
+            rating = int((payload or {}).get("rating"))
+        except (TypeError, ValueError):
+            return {"ok": False,
+                    "error": "sibling_task_id + rating (int) required"}
+        if rating < 1 or rating > 5:
+            return {"ok": False, "error": "rating must be 1..5"}
+        notes = (payload or {}).get("notes") or ""
+        dc = bool((payload or {}).get("dataset_candidate"))
+        try:
+            return self.overseer_db.sibling_rate_result(
+                tid, rating=rating, notes=notes,
+                dataset_candidate=dc)
+        except Exception as e:
+            log.exception("runs_rate failed")
+            return {"ok": False, "error": str(e)}
 
     def _http_distill_corrections(self, payload):
         """POST /plugins/overseer/insight/distill-corrections

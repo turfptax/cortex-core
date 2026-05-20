@@ -374,8 +374,24 @@ Signals that argue SAME:
 Signals that argue SUBPROJECT_OF_A (or SUBPROJECT_OF_B):
   - One is clearly narrower scope ("openmuscle-firmware" inside \
 "openmuscle"; "cortex-pet" inside "cortex"; etc.)
-  - One has a much smaller session count + tighter time window
   - Description text describes a component of the other
+  - Github_url: subproject is a sub-path of parent's repo, or they \
+share a repo entirely
+  - Parent's first_active_at predates subproject's (parent had to \
+exist before the sub-scope could be split off)
+
+DO NOT use session count or last_active_at as a parent-direction \
+signal. Session count is a RECENCY ARTIFACT — it tells you what's \
+been worked on lately, not which project contains the other. A \
+component being actively shipped (high session count) doesn't make \
+it the parent; it just means it's where the current work lives. \
+The wrapper project that bundles + ships the component may have \
+fewer sessions if its surface is stable while the component churns.
+
+If parent-direction is ambiguous after the structural signals above, \
+prefer INSUFFICIENT_DATA over guessing from recency. A wrong \
+SUBPROJECT_OF verdict produces a worse outcome than \
+INSUFFICIENT_DATA because it can drive a merge in the wrong direction.
 
 Signals that argue DISTINCT:
   - Different categories
@@ -424,6 +440,14 @@ def _snapshot_project_merge_check(db, core_memory, args: dict) -> dict:
     def _project_view(tag: str) -> dict:
         # project_summaries row (overseer's mirror; includes narrative
         # + top_files JSON + active-minutes stats).
+        #
+        # Case-insensitive lookup: project_summaries can hold mis-cased
+        # tag variants (e.g. 'Cortex' alongside 'cortex') because the
+        # table is populated from sessions.projects CSV which doesn't
+        # enforce slug-normalization. The projects table itself uses
+        # lowercase slugs. Without LOWER() comparison, snapshots came
+        # back empty for lowercase tags whose summary lives under a
+        # capitalized variant (Slice 10.4 finding 2026-05-20).
         ps = conn.execute(
             "SELECT project AS tag, session_count, total_messages, "
             "       total_user_messages, total_assistant_messages, "
@@ -434,7 +458,7 @@ def _snapshot_project_merge_check(db, core_memory, args: dict) -> dict:
             "       days_active_lifespan, days_active_30, "
             "       substr(narrative, 1, 400) AS narrative_excerpt, "
             "       top_files_json, models_used_json "
-            "FROM project_summaries WHERE project = ?",
+            "FROM project_summaries WHERE LOWER(project) = LOWER(?)",
             (tag,),
         ).fetchone()
         view = {"tag": tag}

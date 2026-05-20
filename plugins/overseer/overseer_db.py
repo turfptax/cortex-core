@@ -5150,3 +5150,504 @@ class OverseerDB(CortexDB):
                     "proposed_c_name": b_name.replace("_", "-") + "-daily",
                 })
         return proposals
+
+    # ── Slice 10.4 Phase 2 (2026-05-20): unified runs view ──────────
+    # The Activity tab needs a single timeline of "what overseer did"
+    # across 5 source tables: b_invocation_transcripts (B+C agent
+    # runs), sibling_tasks (A-tier sibling dispatches that aren't
+    # B/C — filtered by NOT LIKE 'b-agent:%' AND NOT LIKE 'c-agent:%'),
+    # chat_messages (assistant turns), and overseer_journal (tick
+    # reflections). Each row is normalized to a common shape so the
+    # frontend renders them in one timeline.
+
+    def list_recent_runs(self, *, hours=24, limit=200,
+                          kinds=None) -> list:
+        """Return last N runs across all overseer surfaces, newest
+        first. Each run is a dict with: id, kind, started_at,
+        ended_at, summary, cost_usd, latency_ms, tool_calls_count,
+        rateable (bool), sibling_task_id (or None), current_rating
+        (or None), model (or '').
+
+        kinds: optional set of {'b_agent','c_agent','sibling',
+        'chat_turn','journal_step'} to filter the union. None = all.
+        """
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(hours=int(hours))).strftime(
+            "%Y-%m-%d %H:%M:%S")
+        wanted = set(kinds) if kinds else {
+            "b_agent", "c_agent", "sibling",
+            "chat_turn", "journal_step",
+        }
+        runs: list = []
+
+        # ── B + C agent runs (from b_invocation_transcripts) ──
+        if "b_agent" in wanted or "c_agent" in wanted:
+            rows = self._conn.execute(
+                "SELECT t.id AS trans_id, t.b_agent_name, "
+                "       t.created_at, t.cost_usd, t.latency_ms, "
+                "       t.model_used, substr(t.output_text, 1, 200) "
+                "         AS output_excerpt, "
+                "       s.id AS sibling_task_id, s.target, "
+                "       s.quality_rating "
+                "FROM b_invocation_transcripts t "
+                "LEFT JOIN sibling_tasks s ON s.id = t.sibling_task_id "
+                "WHERE t.created_at >= ? "
+                "ORDER BY t.created_at DESC",
+                (cutoff,),
+            ).fetchall()
+            for r in rows:
+                target = r["target"] or ""
+                kind = ("c_agent" if target.startswith("c-agent:")
+                        else "b_agent")
+                if kind not in wanted:
+                    continue
+                runs.append({
+                    "id": f"b-trans:{r['trans_id']}",
+                    "kind": kind,
+                    "subkind": r["b_agent_name"],
+                    "started_at": r["created_at"],
+                    "ended_at": r["created_at"],
+                    "summary": (r["output_excerpt"] or "").strip(),
+                    "cost_usd": float(r["cost_usd"] or 0),
+                    "latency_ms": int(r["latency_ms"] or 0),
+                    "tool_calls_count": 0,  # B is one LLM call, no tools
+                    "model": r["model_used"] or "",
+                    "rateable": r["sibling_task_id"] is not None,
+                    "sibling_task_id": r["sibling_task_id"],
+                    "current_rating": r["quality_rating"],
+                })
+
+        # ── A-tier sibling dispatches (sibling_tasks NOT b-agent/c-agent) ─
+        if "sibling" in wanted:
+            rows = self._conn.execute(
+                "SELECT id, created_at, completed_at, target, prompt, "
+                "       cost_budget_usd, result_cost_usd, status, "
+                "       actual_model_used, quality_rating, claimed_at "
+                "FROM sibling_tasks "
+                "WHERE target NOT LIKE 'b-agent:%' "
+                "AND target NOT LIKE 'c-agent:%' "
+                "AND created_at >= ? "
+                "ORDER BY created_at DESC",
+                (cutoff,),
+            ).fetchall()
+            for r in rows:
+                runs.append({
+                    "id": f"sibling:{r['id']}",
+                    "kind": "sibling",
+                    "subkind": r["target"] or "any",
+                    "started_at": r["created_at"],
+                    "ended_at": (r["completed_at"] or r["claimed_at"]
+                                 or r["created_at"]),
+                    "summary": (r["prompt"] or "")[:200].strip(),
+                    "cost_usd": float(r["result_cost_usd"] or 0),
+                    "latency_ms": 0,  # sibling runs are async, no in-band ms
+                    "tool_calls_count": 0,
+                    "model": r["actual_model_used"] or "",
+                    "rateable": (r["status"] == "completed"
+                                 and r["quality_rating"] is None),
+                    "sibling_task_id": r["id"],
+                    "current_rating": r["quality_rating"],
+                    "status": r["status"],
+                })
+
+        # ── Chat turns (assistant role only — user is the trigger) ──
+        if "chat_turn" in wanted:
+            import json as _json
+            rows = self._conn.execute(
+                "SELECT id, created_at, model, latency_ms, cost_usd, "
+                "       substr(content, 1, 200) AS content_excerpt, "
+                "       metadata_json "
+                "FROM chat_messages "
+                "WHERE role = 'assistant' "
+                "AND created_at >= ? "
+                "ORDER BY created_at DESC",
+                (cutoff,),
+            ).fetchall()
+            for r in rows:
+                tool_calls_count = 0
+                try:
+                    meta = _json.loads(r["metadata_json"] or "{}")
+                    tool_calls_count = len(meta.get("tool_calls") or [])
+                except Exception:
+                    pass
+                runs.append({
+                    "id": f"chat:{r['id']}",
+                    "kind": "chat_turn",
+                    "subkind": "assistant",
+                    "started_at": r["created_at"],
+                    "ended_at": r["created_at"],
+                    "summary": (r["content_excerpt"] or "").strip(),
+                    "cost_usd": float(r["cost_usd"] or 0),
+                    "latency_ms": int(r["latency_ms"] or 0),
+                    "tool_calls_count": tool_calls_count,
+                    "model": r["model"] or "",
+                    "rateable": False,
+                    "sibling_task_id": None,
+                    "current_rating": None,
+                })
+
+        # ── Journal entries (tool-enabled tick reflections) ──
+        if "journal_step" in wanted:
+            import json as _json
+            rows = self._conn.execute(
+                "SELECT id, written_at, instance_id, triggered_by, "
+                "       substr(body, 1, 200) AS body_excerpt, "
+                "       provisionality, referenced_artifacts, "
+                "       backend, model, cost_usd, latency_ms "
+                "FROM overseer_journal "
+                "WHERE written_at >= ? "
+                "ORDER BY written_at DESC",
+                (cutoff,),
+            ).fetchall()
+            for r in rows:
+                tool_calls_count = 0
+                try:
+                    ra = _json.loads(r["referenced_artifacts"] or "[]")
+                    for art in ra:
+                        if (isinstance(art, dict)
+                                and art.get("type") == "tool_calls"):
+                            tool_calls_count = len(art.get("calls") or [])
+                            break
+                except Exception:
+                    pass
+                runs.append({
+                    "id": f"journal:{r['id']}",
+                    "kind": "journal_step",
+                    "subkind": r["triggered_by"] or "scheduled",
+                    "started_at": r["written_at"],
+                    "ended_at": r["written_at"],
+                    "summary": (r["body_excerpt"] or "").strip(),
+                    "cost_usd": float(r["cost_usd"] or 0),
+                    "latency_ms": int(r["latency_ms"] or 0),
+                    "tool_calls_count": tool_calls_count,
+                    "model": r["model"] or "",
+                    "rateable": False,
+                    "sibling_task_id": None,
+                    "current_rating": None,
+                    "provisionality": r["provisionality"],
+                })
+
+        # Sort all runs by started_at DESC, cap at limit
+        runs.sort(key=lambda x: x["started_at"] or "", reverse=True)
+        return runs[:int(limit)]
+
+    def get_run_detail(self, *, kind, run_id):
+        """Return a single run's full detail for the trace viewer.
+
+        Returns a dict with: trigger, nodes, edges, full_prompt,
+        full_output, raw, plus all the list_recent_runs fields.
+
+        kind ∈ {'b_agent','c_agent','sibling','chat_turn','journal_step'}
+        run_id is the numeric id (after the colon in the unified id).
+        """
+        import json as _json
+        if kind in ("b_agent", "c_agent"):
+            return self._run_detail_b_agent(int(run_id))
+        if kind == "sibling":
+            return self._run_detail_sibling(int(run_id))
+        if kind == "chat_turn":
+            return self._run_detail_chat(int(run_id))
+        if kind == "journal_step":
+            return self._run_detail_journal(int(run_id))
+        return {"ok": False, "error": f"unknown run kind: {kind}"}
+
+    def _run_detail_b_agent(self, trans_id):
+        import json as _json
+        row = self._conn.execute(
+            "SELECT t.*, s.target, s.prompt AS sibling_prompt, "
+            "       s.quality_rating, s.quality_notes "
+            "FROM b_invocation_transcripts t "
+            "LEFT JOIN sibling_tasks s ON s.id = t.sibling_task_id "
+            "WHERE t.id = ?",
+            (trans_id,),
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": "transcript not found"}
+        row = dict(row)
+        try:
+            snapshot = _json.loads(row.get("snapshot_json") or "{}")
+        except Exception:
+            snapshot = {"_parse_error": True}
+        target = row.get("target") or ""
+        kind = "c_agent" if target.startswith("c-agent:") else "b_agent"
+        # Build flow graph: trigger -> snapshot -> LLM -> output
+        nodes = [
+            {"id": "trigger", "kind": "trigger",
+             "label": f"Tool: dispatch_{kind}_{row['b_agent_name']}",
+             "sublabel": f"target={target}"},
+            {"id": "snapshot", "kind": "snapshot",
+             "label": "Snapshot built",
+             "sublabel": f"{len(row.get('snapshot_json') or '')} chars"},
+            {"id": "llm", "kind": "llm_call",
+             "label": row.get("model_used") or "(model)",
+             "sublabel": (f"${row.get('cost_usd') or 0:.4f} · "
+                          f"{row.get('latency_ms') or 0}ms")},
+            {"id": "output", "kind": "output",
+             "label": "Output",
+             "sublabel": (row.get("output_text") or "")[:80]},
+        ]
+        edges = [
+            {"source": "trigger", "target": "snapshot"},
+            {"source": "snapshot", "target": "llm"},
+            {"source": "llm", "target": "output"},
+        ]
+        return {
+            "ok": True,
+            "id": f"b-trans:{trans_id}",
+            "kind": kind,
+            "subkind": row.get("b_agent_name"),
+            "started_at": row.get("created_at"),
+            "ended_at": row.get("created_at"),
+            "cost_usd": float(row.get("cost_usd") or 0),
+            "latency_ms": int(row.get("latency_ms") or 0),
+            "model": row.get("model_used") or "",
+            "sibling_task_id": row.get("sibling_task_id"),
+            "current_rating": row.get("quality_rating"),
+            "current_notes": row.get("quality_notes"),
+            "rateable": row.get("sibling_task_id") is not None,
+            "nodes": nodes,
+            "edges": edges,
+            "full_prompt": (
+                f"=== Snapshot ===\n"
+                f"{_json.dumps(snapshot, indent=2, default=str)}"
+            ),
+            "full_output": row.get("output_text") or "",
+            "raw": row,
+        }
+
+    def _run_detail_sibling(self, sid):
+        row = self._conn.execute(
+            "SELECT * FROM sibling_tasks WHERE id = ?", (sid,)
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": "sibling task not found"}
+        row = dict(row)
+        # Build flow graph: dispatch -> claim -> complete
+        nodes = [
+            {"id": "dispatch", "kind": "trigger",
+             "label": f"Dispatched by {row.get('created_by') or '?'}",
+             "sublabel": f"target={row.get('target') or '?'}"},
+        ]
+        edges = []
+        if row.get("claimed_at"):
+            nodes.append({
+                "id": "claim", "kind": "step",
+                "label": f"Claimed by {row.get('claimed_by') or '?'}",
+                "sublabel": row.get("claimed_at"),
+            })
+            edges.append({"source": "dispatch", "target": "claim"})
+        if row.get("completed_at"):
+            nodes.append({
+                "id": "complete", "kind": "output",
+                "label": f"Status: {row.get('status') or '?'}",
+                "sublabel": (f"${row.get('result_cost_usd') or 0:.4f} · "
+                             f"{row.get('actual_model_used') or '?'}"),
+            })
+            edges.append({
+                "source": "claim" if row.get("claimed_at") else "dispatch",
+                "target": "complete",
+            })
+        return {
+            "ok": True,
+            "id": f"sibling:{sid}",
+            "kind": "sibling",
+            "subkind": row.get("target") or "any",
+            "started_at": row.get("created_at"),
+            "ended_at": row.get("completed_at") or row.get("created_at"),
+            "cost_usd": float(row.get("result_cost_usd") or 0),
+            "latency_ms": 0,
+            "model": row.get("actual_model_used") or "",
+            "sibling_task_id": sid,
+            "current_rating": row.get("quality_rating"),
+            "current_notes": row.get("quality_notes"),
+            "rateable": (row.get("status") == "completed"),
+            "status": row.get("status"),
+            "nodes": nodes,
+            "edges": edges,
+            "full_prompt": row.get("prompt") or "",
+            "full_output": row.get("result_text") or "",
+            "raw": row,
+        }
+
+    def _run_detail_chat(self, msg_id):
+        import json as _json
+        # Get this assistant message + the preceding user message
+        row = self._conn.execute(
+            "SELECT * FROM chat_messages WHERE id = ?", (msg_id,)
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": "chat message not found"}
+        row = dict(row)
+        user_row = self._conn.execute(
+            "SELECT id, content, created_at FROM chat_messages "
+            "WHERE role = 'user' AND created_at <= ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (row.get("created_at"),),
+        ).fetchone()
+        meta = {}
+        try:
+            meta = _json.loads(row.get("metadata_json") or "{}")
+        except Exception:
+            pass
+        tool_calls = meta.get("tool_calls") or []
+        # Build flow graph
+        nodes = [
+            {"id": "user", "kind": "trigger",
+             "label": "User message",
+             "sublabel": ((user_row["content"] or "")[:60]
+                          if user_row else "(no preceding user msg)")},
+            {"id": "llm0", "kind": "llm_call",
+             "label": row.get("model") or "(model)",
+             "sublabel": (f"${row.get('cost_usd') or 0:.4f} · "
+                          f"{row.get('latency_ms') or 0}ms")},
+        ]
+        edges = [{"source": "user", "target": "llm0"}]
+        # Tool calls fan out from the LLM
+        for i, tc in enumerate(tool_calls):
+            nid = f"tc{i}"
+            nodes.append({
+                "id": nid, "kind": "tool_call",
+                "label": tc.get("name") or "?",
+                "sublabel": (f"iter={tc.get('iter', 0)} · "
+                             f"{tc.get('result_chars', 0)} chars"),
+            })
+            edges.append({"source": "llm0", "target": nid})
+        nodes.append({
+            "id": "reply", "kind": "output",
+            "label": "Reply",
+            "sublabel": (row.get("content") or "")[:80],
+        })
+        # Reply edge comes from last tool call, else from LLM directly
+        if tool_calls:
+            edges.append({"source": f"tc{len(tool_calls)-1}", "target": "reply"})
+        else:
+            edges.append({"source": "llm0", "target": "reply"})
+        return {
+            "ok": True,
+            "id": f"chat:{msg_id}",
+            "kind": "chat_turn",
+            "subkind": "assistant",
+            "started_at": row.get("created_at"),
+            "ended_at": row.get("created_at"),
+            "cost_usd": float(row.get("cost_usd") or 0),
+            "latency_ms": int(row.get("latency_ms") or 0),
+            "model": row.get("model") or "",
+            "rateable": False,
+            "nodes": nodes,
+            "edges": edges,
+            "full_prompt": (user_row["content"] if user_row else ""),
+            "full_output": row.get("content") or "",
+            "tool_calls": tool_calls,
+            "raw": {
+                "message": row,
+                "user_message": dict(user_row) if user_row else None,
+                "metadata": meta,
+            },
+        }
+
+    def _run_detail_journal(self, jid):
+        import json as _json
+        row = self._conn.execute(
+            "SELECT * FROM overseer_journal WHERE id = ?", (jid,)
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": "journal entry not found"}
+        row = dict(row)
+        try:
+            ra = _json.loads(row.get("referenced_artifacts") or "[]")
+        except Exception:
+            ra = []
+        tool_calls = []
+        for art in ra:
+            if (isinstance(art, dict)
+                    and art.get("type") == "tool_calls"):
+                tool_calls = art.get("calls") or []
+                break
+        try:
+            tick_summary = _json.loads(
+                row.get("tick_summary_json") or "{}")
+        except Exception:
+            tick_summary = {}
+        # Build flow graph
+        nodes = [
+            {"id": "tick", "kind": "trigger",
+             "label": f"Tick: {row.get('triggered_by') or 'scheduled'}",
+             "sublabel": row.get("instance_id") or ""},
+            {"id": "llm0", "kind": "llm_call",
+             "label": row.get("model") or "(model)",
+             "sublabel": (f"${row.get('cost_usd') or 0:.4f} · "
+                          f"{row.get('latency_ms') or 0}ms")},
+        ]
+        edges = [{"source": "tick", "target": "llm0"}]
+        for i, tc in enumerate(tool_calls):
+            nid = f"tc{i}"
+            nodes.append({
+                "id": nid, "kind": "tool_call",
+                "label": tc.get("name") or "?",
+                "sublabel": (f"iter={tc.get('iter', 0)} · "
+                             f"{tc.get('result_chars', 0)} chars"
+                             + (" · BLOCKED"
+                                if tc.get("blocked") else "")),
+            })
+            edges.append({"source": "llm0", "target": nid})
+        nodes.append({
+            "id": "entry", "kind": "output",
+            "label": f"Entry [prov:{row.get('provisionality') or '?'}]",
+            "sublabel": (row.get("body") or "")[:80],
+        })
+        if tool_calls:
+            edges.append({
+                "source": f"tc{len(tool_calls)-1}", "target": "entry",
+            })
+        else:
+            edges.append({"source": "llm0", "target": "entry"})
+        return {
+            "ok": True,
+            "id": f"journal:{jid}",
+            "kind": "journal_step",
+            "subkind": row.get("triggered_by") or "scheduled",
+            "started_at": row.get("written_at"),
+            "ended_at": row.get("written_at"),
+            "cost_usd": float(row.get("cost_usd") or 0),
+            "latency_ms": int(row.get("latency_ms") or 0),
+            "model": row.get("model") or "",
+            "provisionality": row.get("provisionality"),
+            "rateable": False,
+            "nodes": nodes,
+            "edges": edges,
+            "full_prompt": "(journal prompt — see prompts source)",
+            "full_output": row.get("body") or "",
+            "tool_calls": tool_calls,
+            "tick_summary": tick_summary,
+            "raw": row,
+        }
+
+    def export_runs_bundle(self, *, hours=24) -> dict:
+        """Build a JSON bundle of all runs in the past N hours with
+        FULL detail (prompts, outputs, snapshots). Used by the
+        Activity tab's "Export 24h" button to produce a debug
+        bundle that can be attached to bug reports or read offline.
+        """
+        from datetime import datetime, timezone
+        runs = self.list_recent_runs(hours=hours, limit=1000)
+        details = []
+        for r in runs:
+            kind = r["kind"]
+            # Extract numeric id from unified "kind:N" form
+            raw_id = r["id"].split(":", 1)[1] if ":" in r["id"] else r["id"]
+            try:
+                detail = self.get_run_detail(kind=kind, run_id=raw_id)
+                if detail.get("ok"):
+                    details.append(detail)
+            except Exception as e:
+                details.append({
+                    "ok": False, "id": r["id"], "error": str(e)[:200],
+                })
+        return {
+            "generated_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+            "window_hours": int(hours),
+            "run_count": len(details),
+            "runs": details,
+        }
