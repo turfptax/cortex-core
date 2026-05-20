@@ -26,11 +26,14 @@ cortex.db + the bundled Session 0 seed is supported.
 """
 
 import json
+import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
 
 from cortex_db import CortexDB
+
+log = logging.getLogger("plugin.overseer.db")
 
 
 OVERSEER_SCHEMA_SQL = """
@@ -234,7 +237,13 @@ CREATE TABLE IF NOT EXISTS imported_sessions (
     bytes_size INTEGER NOT NULL DEFAULT 0,
     file_hash TEXT NOT NULL DEFAULT '',    -- sha256 of file content for dedup
     metadata_json TEXT NOT NULL DEFAULT '{}',
-    imported_at TEXT NOT NULL DEFAULT (datetime('now'))
+    imported_at TEXT NOT NULL DEFAULT (datetime('now')),
+    -- Slice 9.8 (2026-05-20): mark_redacted mode replaces .jsonl on
+    -- disk with a [REDACTED] placeholder and sets redacted_at, while
+    -- keeping the row + metadata so session counts / project
+    -- summaries don't lie. delete_row mode (in the redact tool)
+    -- removes the row + file entirely.
+    redacted_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_imported_hash
     ON imported_sessions(source, file_hash) WHERE file_hash != '';
@@ -1351,6 +1360,21 @@ class OverseerDB(CortexDB):
         """
         self._migrate_9_6_notification_actions()
 
+    def _migrate_9_8_imported_redacted(self):
+        """Slice 9.8 (2026-05-20): additive column for mark-redacted
+        mode on imported_sessions. Fresh installs get it via CREATE
+        TABLE in OVERSEER_SCHEMA_SQL; existing installs need this
+        ALTER."""
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(imported_sessions)"
+        ).fetchall()}
+        if "redacted_at" not in cols:
+            self._conn.execute(
+                "ALTER TABLE imported_sessions ADD COLUMN "
+                "redacted_at TEXT"
+            )
+            self._safe_commit()
+
     def _migrate_9_6_notification_actions(self):
         """Slice 9.6 CP1 (2026-05-19): notifications gain actions_json
         column for per-notification custom action buttons. Fresh
@@ -1370,6 +1394,7 @@ class OverseerDB(CortexDB):
                 "TEXT NOT NULL DEFAULT '[]'"
             )
             self._safe_commit()
+        self._migrate_9_8_imported_redacted()
 
     # ── overseer_state ──────────────────────────────────────────
 
@@ -2403,6 +2428,261 @@ class OverseerDB(CortexDB):
         )
         self._safe_commit()
         return cur.rowcount
+
+    # ── Slice 9.8 (2026-05-20): imported session redaction ─────
+
+    REDACTED_PLACEHOLDER_LINE = (
+        '{"type":"user","message":{"role":"user",'
+        '"content":"[REDACTED]"},"_redacted":true}\n'
+    )
+
+    def redact_imported_session(self, imported_id, *, mode="mark_redacted"):
+        """Redact an imported session in one of two modes:
+
+          mark_redacted (default, recoverable-via-backup-only):
+            - Overwrites the on-disk .jsonl with a single [REDACTED]
+              placeholder line so subsequent reads return harmless
+              content but the file still exists.
+            - Sets redacted_at on the row.
+            - Keeps metadata (timestamps, project, source) so session
+              counts + project_summaries don't lie.
+            - Sets bytes_size to the placeholder length, file_hash to
+              the new hash, so downstream code sees consistent state.
+            - If the row was processed_imported_sessions, that record
+              is preserved (the gist is independent).
+
+          delete_row (destructive):
+            - Deletes the .jsonl file from disk.
+            - Removes the imported_sessions row + any
+              processed_imported_sessions record.
+
+        Returns dict {ok, mode, imported_id, path, action}.
+        """
+        import os, hashlib
+        from pathlib import Path
+
+        row = self._conn.execute(
+            "SELECT id, source_path FROM imported_sessions WHERE id = ?",
+            (imported_id,),
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": "imported_session not found"}
+        sp = row[1] or ""
+
+        if mode == "delete_row":
+            # Remove file from disk first (best-effort), then DB rows.
+            deleted_file = False
+            if sp and Path(sp).is_file():
+                try:
+                    os.remove(sp)
+                    deleted_file = True
+                except Exception as e:
+                    log.warning("delete_row: file remove failed: %s", e)
+            self._conn.execute(
+                "DELETE FROM processed_imported_sessions "
+                "WHERE imported_id = ?", (imported_id,),
+            )
+            cur = self._conn.execute(
+                "DELETE FROM imported_sessions WHERE id = ?",
+                (imported_id,),
+            )
+            self._safe_commit()
+            return {
+                "ok": True, "mode": "delete_row",
+                "imported_id": imported_id, "path": sp,
+                "row_deleted": cur.rowcount > 0,
+                "file_deleted": deleted_file,
+            }
+
+        # default: mark_redacted
+        if mode != "mark_redacted":
+            return {"ok": False, "error": f"unknown mode: {mode}"}
+
+        placeholder = self.REDACTED_PLACEHOLDER_LINE.encode("utf-8")
+        wrote_file = False
+        if sp:
+            try:
+                Path(sp).parent.mkdir(parents=True, exist_ok=True)
+                Path(sp).write_bytes(placeholder)
+                wrote_file = True
+            except Exception as e:
+                log.warning("mark_redacted: file overwrite failed: %s", e)
+
+        new_hash = hashlib.sha256(placeholder).hexdigest()
+        new_size = len(placeholder)
+        self._conn.execute(
+            "UPDATE imported_sessions "
+            "SET redacted_at = datetime('now'), "
+            "    bytes_size = ?, file_hash = ?, "
+            "    message_count = 1, user_message_count = 1, "
+            "    assistant_message_count = 0, tool_use_count = 0 "
+            "WHERE id = ?",
+            (new_size, new_hash, imported_id),
+        )
+        self._safe_commit()
+        return {
+            "ok": True, "mode": "mark_redacted",
+            "imported_id": imported_id, "path": sp,
+            "file_overwritten": wrote_file,
+            "new_bytes_size": new_size,
+        }
+
+    # ── Slice 9.8 (2026-05-20): sensitivity scan ───────────────
+
+    # Hardcoded default sensitive-content regexes. Conservative — we
+    # want true positives to dominate so Tory's review queue stays
+    # short. Custom patterns can be passed by overseer in the scan
+    # call for project-specific things (Tory's address, names of
+    # people he wants kept private, internal API endpoints, etc.).
+    DEFAULT_SENSITIVE_PATTERNS = [
+        # name              regex pattern                                     description
+        ("openai_key",      r"sk-[A-Za-z0-9]{20,}",                            "OpenAI-style API key"),
+        ("anthropic_key",   r"sk-ant-[A-Za-z0-9_-]{20,}",                      "Anthropic API key"),
+        ("github_pat",      r"(github_pat_|ghp_)[A-Za-z0-9_]{20,}",            "GitHub Personal Access Token"),
+        ("aws_key",         r"AKIA[0-9A-Z]{16}",                               "AWS Access Key ID"),
+        ("stripe_secret",   r"sk_(live|test)_[A-Za-z0-9]{24,}",                "Stripe secret key"),
+        ("slack_token",     r"xox[baprs]-[A-Za-z0-9-]{10,}",                   "Slack token"),
+        ("bearer_token",    r"[Bb]earer\s+[A-Za-z0-9._-]{20,}",                "HTTP Bearer token"),
+        ("private_key",     r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----",        "PEM private key block"),
+        ("ssh_key",         r"ssh-(?:rsa|ed25519|dss) [A-Za-z0-9+/=]{60,}",    "SSH public key (often paired with private)"),
+        # Tightened to require proper 4-4-4-4 separators or a contiguous
+        # 16-digit run — the original \b(?:\d[ -]?){13,16}\b matched
+        # timestamps and session IDs ("332 2026-05-17 23"). False
+        # negatives on 15-digit Amex / 14-digit Diners are acceptable
+        # given the noise reduction.
+        ("credit_card",     r"\b(?:\d{4}[\s-]\d{4}[\s-]\d{4}[\s-]\d{4}|\d{16})\b", "Possible credit-card number (4-4-4-4 or 16 contiguous digits)"),
+        ("ssn",             r"\b\d{3}-\d{2}-\d{4}\b",                           "US Social Security Number pattern"),
+        # Tightened: require at least one separator between number
+        # groups so we don't match raw 10-digit session IDs.
+        ("us_phone",        r"\b(?:\+?1[-.\s])?(?:\(\d{3}\)|\d{3})[-.\s]\d{3}[-.\s]\d{4}\b", "US phone number (formatted)"),
+        ("password_assign", r"(?i)(?:password|passwd|pwd|api[_-]?key|secret)\s*[:=]\s*[\"']?[A-Za-z0-9!@#$%^&*_-]{6,}",
+                            "Inline password/secret assignment"),
+        ("jwt",             r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+                            "JSON Web Token"),
+    ]
+
+    def scan_imported_session_for_sensitive(self, imported_id, *,
+                                              extra_patterns=None,
+                                              use_defaults=True,
+                                              max_matches=20):
+        """Scan one imported_session's on-disk content for sensitive
+        regex matches. Returns dict with the matches found.
+
+        extra_patterns: optional list of (name, regex_str,
+            description) tuples added on top of (or in place of when
+            use_defaults=False) DEFAULT_SENSITIVE_PATTERNS.
+
+        Each match: {pattern_name, description, snippet, char_offset,
+            line_no}.  snippet is the surrounding ±60 chars, with the
+            matched text intact (so Tory can verify before redacting).
+        """
+        import re
+        from pathlib import Path
+
+        row = self._conn.execute(
+            "SELECT id, source_path, source, project, redacted_at "
+            "FROM imported_sessions WHERE id = ?", (imported_id,),
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": "imported_session not found"}
+        if row[4]:  # already redacted
+            return {
+                "ok": True, "imported_id": imported_id,
+                "already_redacted": True, "matches": [],
+            }
+        sp = row[1]
+        if not sp or not Path(sp).is_file():
+            return {
+                "ok": False, "error": f"source_path missing or not a file: {sp}",
+            }
+
+        try:
+            content = Path(sp).read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return {"ok": False, "error": f"read failed: {e}"[:200]}
+
+        patterns = list(self.DEFAULT_SENSITIVE_PATTERNS) if use_defaults else []
+        if extra_patterns:
+            for ep in extra_patterns:
+                if isinstance(ep, (list, tuple)) and len(ep) >= 2:
+                    name = ep[0]
+                    pat = ep[1]
+                    desc = ep[2] if len(ep) >= 3 else "custom pattern"
+                    patterns.append((name, pat, desc))
+
+        matches = []
+        for name, pat, desc in patterns:
+            try:
+                rx = re.compile(pat)
+            except re.error:
+                continue
+            for m in rx.finditer(content):
+                start = max(0, m.start() - 60)
+                end = min(len(content), m.end() + 60)
+                snippet = content[start:end].replace("\n", " ")
+                line_no = content.count("\n", 0, m.start()) + 1
+                matches.append({
+                    "pattern_name": name,
+                    "description": desc,
+                    "snippet": snippet,
+                    "match_text_preview": m.group(0)[:40],
+                    "char_offset": m.start(),
+                    "line_no": line_no,
+                })
+                if len(matches) >= max_matches:
+                    break
+            if len(matches) >= max_matches:
+                break
+
+        return {
+            "ok": True,
+            "imported_id": imported_id,
+            "source": row[2],
+            "project": row[3],
+            "match_count": len(matches),
+            "matches": matches,
+            "patterns_run": len(patterns),
+        }
+
+    def scan_imported_sessions_batch(self, *, source=None, since=None,
+                                       limit=20, extra_patterns=None,
+                                       use_defaults=True):
+        """Scan up to `limit` imported_sessions (newest first, optionally
+        filtered by source + since). Skip already-redacted rows. Returns
+        a list of dicts (one per scanned session) with match counts."""
+        sql = ("SELECT id FROM imported_sessions "
+               "WHERE redacted_at IS NULL")
+        params = []
+        if source:
+            sql += " AND source = ?"
+            params.append(source)
+        if since:
+            sql += " AND started_at >= ?"
+            params.append(since)
+        sql += " ORDER BY started_at DESC LIMIT ?"
+        params.append(int(limit))
+        ids = [r[0] for r in self._conn.execute(sql, params).fetchall()]
+
+        results = []
+        for iid in ids:
+            res = self.scan_imported_session_for_sensitive(
+                iid, extra_patterns=extra_patterns,
+                use_defaults=use_defaults,
+            )
+            if res.get("ok") and res.get("match_count", 0) > 0:
+                results.append({
+                    "imported_id": iid,
+                    "match_count": res["match_count"],
+                    "source": res.get("source", ""),
+                    "project": res.get("project", ""),
+                    "matches": res["matches"],
+                })
+        return {
+            "ok": True,
+            "scanned": len(ids),
+            "with_matches": len(results),
+            "results": results,
+        }
 
     def is_imported_processed(self, imported_id):
         row = self._conn.execute(

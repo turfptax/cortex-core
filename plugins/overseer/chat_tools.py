@@ -852,6 +852,110 @@ TOOL_DEFINITIONS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "redact_imported_session",
+            "description": (
+                "Scrub an imported AI-conversation session (Claude "
+                "Code, ChatGPT, Grok, etc.) from cortex. Two modes:\n\n"
+                "- mark_redacted (DEFAULT): replaces the on-disk "
+                "  .jsonl with a [REDACTED] placeholder line; keeps "
+                "  the imported_sessions row + metadata (timestamps, "
+                "  project, source) so session counts and project "
+                "  summaries don't lie. The redacted_at timestamp is "
+                "  set. Existing gist(s) generated from this session "
+                "  are NOT scrubbed — they live independently and "
+                "  contain Sonnet's summary of the content. If the "
+                "  gist itself is sensitive, surface it for separate "
+                "  handling.\n"
+                "- delete_row: destructive. Removes the .jsonl file "
+                "  AND the imported_sessions row AND any "
+                "  processed_imported_sessions record. The session "
+                "  count drops. Existing gists still survive (they "
+                "  point at a now-dead source).\n\n"
+                "Use sparingly. When Tory asks for a session to be "
+                "redacted, prefer mark_redacted unless he explicitly "
+                "says 'delete' or the row should never have been "
+                "imported in the first place."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "imported_id": {
+                        "type": "string",
+                        "description": "The imported_sessions.id (e.g. 'claude-code:UUID')",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "mark_redacted (default) | delete_row",
+                    },
+                },
+                "required": ["imported_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scan_for_sensitive_content",
+            "description": (
+                "Scan imported sessions for sensitive content "
+                "candidates Tory may want to redact. Regex-based, "
+                "fast, no LLM cost. Default patterns cover: API "
+                "keys (OpenAI, Anthropic, GitHub PATs, AWS, Stripe, "
+                "Slack), Bearer/JWT tokens, PEM private keys, SSH "
+                "keys, credit cards, US SSNs, US phone numbers, "
+                "inline password/secret assignments.\n\n"
+                "Pass extra_patterns as a list of [name, regex, "
+                "description] triples for project-specific things "
+                "(Tory's address, names of people he wants kept "
+                "private, internal API URLs, etc.).\n\n"
+                "Returns per-session match summaries. Workflow: scan "
+                "→ emit_notification per session-with-matches → Tory "
+                "clicks Redact/Keep → on next tick fetch responses + "
+                "call redact_imported_session for the ones marked. "
+                "Skips sessions already redacted."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": (
+                            "Optional filter: only scan sessions "
+                            "with this source (e.g. 'claude-code', "
+                            "'grok-com', 'chatgpt')"
+                        ),
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": (
+                            "Optional ISO date — only scan sessions "
+                            "started on or after this date"
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max sessions to scan (default 20)",
+                    },
+                    "extra_patterns": {
+                        "type": "array",
+                        "description": (
+                            "Optional list of [name, regex, "
+                            "description] triples added on top of "
+                            "defaults"
+                        ),
+                        "items": {"type": "array"},
+                    },
+                    "use_defaults": {
+                        "type": "boolean",
+                        "description": "Include default patterns (default true)",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "redact_human_journal",
             "description": (
                 "DESTRUCTIVE: delete a human_journal_entries row. Use "
@@ -1381,6 +1485,47 @@ def _dispatch(name: str, args: dict, *, db, core_memory,
             return {"error": str(e)}
         except Exception as e:
             return {"error": f"propose_project_merge failed: {e}"[:200]}
+
+    if name == "redact_imported_session":
+        iid = (args.get("imported_id") or "").strip()
+        if not iid:
+            return {"error": "imported_id required"}
+        mode = (args.get("mode") or "mark_redacted").strip()
+        if mode not in ("mark_redacted", "delete_row"):
+            return {"error": "mode must be 'mark_redacted' or 'delete_row'"}
+        try:
+            return db.redact_imported_session(iid, mode=mode)
+        except Exception as e:
+            return {"error": f"redact_imported_session failed: {e}"[:200]}
+
+    if name == "scan_for_sensitive_content":
+        source = (args.get("source") or "").strip() or None
+        since = (args.get("since") or "").strip() or None
+        limit = max(1, min(100, int(args.get("limit") or 20)))
+        extra = args.get("extra_patterns") or []
+        use_defaults = bool(args.get("use_defaults", True))
+        # Normalize extra_patterns into the (name, regex, desc) shape
+        # the DB helper expects. Be permissive about input shape since
+        # this comes from the LLM and may be slightly off.
+        normalized = []
+        if isinstance(extra, list):
+            for ep in extra:
+                if isinstance(ep, (list, tuple)) and len(ep) >= 2:
+                    normalized.append(tuple(ep[:3]))
+                elif isinstance(ep, dict):
+                    normalized.append((
+                        ep.get("name", "custom"),
+                        ep.get("regex", ep.get("pattern", "")),
+                        ep.get("description", "custom pattern"),
+                    ))
+        try:
+            return db.scan_imported_sessions_batch(
+                source=source, since=since, limit=limit,
+                extra_patterns=normalized or None,
+                use_defaults=use_defaults,
+            )
+        except Exception as e:
+            return {"error": f"scan_for_sensitive_content failed: {e}"[:200]}
 
     if name == "redact_human_journal":
         eid = args.get("entry_id")
