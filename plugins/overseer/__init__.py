@@ -342,6 +342,9 @@ class OverseerPlugin(Plugin):
                   self._http_sibling_recent),
             Route("GET",  "/sibling/stats",
                   self._http_sibling_stats),
+            # ── Slice 10.4 (2026-05-20): ecosystem visualizer ────
+            Route("GET",  "/ecosystem",
+                  self._http_ecosystem),
         ]
 
     # ── Lifecycle ───────────────────────────────────────────────
@@ -1777,6 +1780,223 @@ class OverseerPlugin(Plugin):
         except Exception as e:
             log.exception("sibling_stats failed")
             return {"ok": False, "error": str(e)}
+
+    # ── Slice 10.4 (2026-05-20): ecosystem visualizer ───────────
+
+    def _http_ecosystem(self, payload):
+        """GET /plugins/overseer/ecosystem — static map of tools,
+        tick steps, hooks, B-agents, C-agents for the Hub's
+        ecosystem visualizer (Slice 10.4 Phase 1).
+
+        Returns the structure the Hub renders as a React Flow graph.
+        Tools + B-agents are read live from the registries; tick
+        steps + hook surfaces are hard-coded since they reflect the
+        actual loop.py + chat.py + journal.py wiring."""
+        try:
+            import chat_tools
+            import b_agents as _b_agents
+        except Exception as e:
+            return {"ok": False, "error": f"registry load failed: {e}"}
+
+        # Categorize each chat tool by name prefix. Categories drive
+        # color + grouping in the React Flow rendering.
+        def _categorize(name: str) -> str:
+            if name.startswith("dispatch_b_"):
+                return "b_agent_tool"
+            if name == "dispatch_sibling":
+                return "sibling_dispatch"
+            if name == "compress_chat":
+                return "chat_mgmt"
+            if name == "accept_c_promotion":
+                return "c_promotion"
+            if name.startswith(("get_", "search_", "list_")):
+                return "read"
+            if name in ("file_evidence", "propose_project_merge"):
+                return "synthesis"
+            if name.startswith(("update_", "create_", "delete_",
+                                 "redact_", "emit_", "mark_")):
+                return "write"
+            if name.startswith("scan_"):
+                return "scan"
+            return "other"
+
+        # Journal-step block list (mirrors journal.py defensive check).
+        # If we add tools here that journal mustn't call, also update
+        # journal.py — keeping the same list in two places is OK because
+        # it's tiny + the block is defense in depth.
+        JOURNAL_BLOCKED = {"dispatch_sibling", "compress_chat"}
+
+        tools = []
+        for td in chat_tools.TOOL_DEFINITIONS:
+            fn = td.get("function") or {}
+            name = fn.get("name") or ""
+            if not name:
+                continue
+            callable_from = ["chat"]
+            if name not in JOURNAL_BLOCKED:
+                callable_from.append("journal_step")
+            tools.append({
+                "name": name,
+                "description": (fn.get("description") or "")[:400],
+                "category": _categorize(name),
+                "callable_from": callable_from,
+            })
+
+        b_agents = []
+        for n, spec in _b_agents.B_AGENTS.items():
+            b_agents.append({
+                "name": n,
+                "marker": spec["marker"],
+                "model": spec["model"],
+                "max_tokens": spec["max_tokens"],
+                "description": (spec["description"]
+                                if "description" in spec
+                                else "")[:200],
+            })
+
+        # Hard-coded tick step structure. Matches the actual order in
+        # OverseerLoop._run_one_tick_locked as of Slice 10 CP5. When
+        # you reorder or rename steps in loop.py, mirror that here so
+        # the visualizer doesn't lie.
+        tick_steps = [
+            {"id": 0, "name": "temporal_cadence",
+             "label": "Step 0: Temporal Cadence",
+             "fires_when": "22:00 local trigger (daily/weekly/monthly/yearly)",
+             "uses_llm": True,
+             "description": "BYPASSES daily budget. Time-anchored "
+                            "narratives; missing the window is permanent."},
+            {"id": 1, "name": "summarize_completed_sessions",
+             "label": "Step 1: Summarize Sessions",
+             "fires_when": "every tick if sessions ended since high-water",
+             "uses_llm": True,
+             "description": "One-line gist per session (the CHANGE)."},
+            {"id": 2, "name": "auto_classify_projects",
+             "label": "Step 1b: Classify Projects",
+             "fires_when": "every tick",
+             "uses_llm": False,
+             "description": "Cheap COUNT/AVG; routes imports by class."},
+            {"id": 3, "name": "summarize_imported_sessions",
+             "label": "Step 1c: Summarize Imports",
+             "fires_when": "every tick if unprocessed imports exist",
+             "uses_llm": True,
+             "description": "Per-classification routing. Drains backlog."},
+            {"id": 4, "name": "git_ingest",
+             "label": "Step 1c.5: Git Ingest",
+             "fires_when": "every N hours (loop_git_ingest_interval_hours)",
+             "uses_llm": False,
+             "description": "Periodic GitHub commit ingester."},
+            {"id": 5, "name": "generate_missing_rollups",
+             "label": "Step 1d: Rollups",
+             "fires_when": "every tick if pending rollups",
+             "uses_llm": True,
+             "description": "Cheap Sonnet rollups of automation imports."},
+            {"id": 6, "name": "tag_untagged_notes",
+             "label": "Step 2: Tag Notes",
+             "fires_when": "every tick if untagged notes",
+             "uses_llm": True,
+             "description": "Auto-tag user notes."},
+            {"id": 7, "name": "build_working_memory",
+             "label": "Step 3: Build Working Memory",
+             "fires_when": "every tick",
+             "uses_llm": False,
+             "description": "No LLM — assembles WM snapshot for chat + journal."},
+            {"id": 8, "name": "run_notifications",
+             "label": "Step 4: Notifications",
+             "fires_when": "every tick",
+             "uses_llm": False,
+             "description": "Deterministic rule evaluation."},
+            {"id": 9, "name": "journal_step",
+             "label": "Step 5: Journal (TOOL-ENABLED)",
+             "fires_when": "every notable tick (cadence-gated)",
+             "uses_llm": True,
+             "description": "Slice 9.9: first-person reflection WITH "
+                            "tool access. Most tools callable here."},
+            {"id": 10, "name": "insight_scans",
+             "label": "Step 6: Insight Scans",
+             "fires_when": "per-project cadence",
+             "uses_llm": True,
+             "description": "Sonnet scans gist arcs for theme/pattern/drift."},
+            {"id": 11, "name": "distill_corrections",
+             "label": "Step 7: Distill Corrections",
+             "fires_when": "periodic (loop config)",
+             "uses_llm": True,
+             "description": "Cluster corrections into proposed blindspots."},
+            {"id": 12, "name": "project_narrative_refresh",
+             "label": "Step 8: Project Narratives",
+             "fires_when": "24h cadence + ≥3 new sessions",
+             "uses_llm": True,
+             "description": "Per-project Sonnet narrative refresh."},
+            {"id": 13, "name": "b_agent_gc",
+             "label": "Step 10: B-Agent GC",
+             "fires_when": "once per local day",
+             "uses_llm": False,
+             "description": "Slice 10: drops expired b_invocation_transcripts."},
+            {"id": 14, "name": "check_c_graduations",
+             "label": "Step 11: C-Graduation Check",
+             "fires_when": "every tick (rule_key dedup)",
+             "uses_llm": False,
+             "description": "Slice 10 CP5: scans B stats; emits proposal "
+                            "notification if bar met."},
+            {"id": 15, "name": "run_scheduled_c_agents",
+             "label": "Step 12: Scheduled C Runs",
+             "fires_when": "every tick, fires due C agents",
+             "uses_llm": True,
+             "description": "Slice 10 CP5: dispatches due C agents."},
+        ]
+
+        # Hook surfaces — where execution paths begin.
+        hooks = [
+            {"id": "boot", "label": "Plugin Boot",
+             "description": "Service startup. Loads schema, seeds, "
+                            "registries; reads recent journal entries "
+                            "as boot context."},
+            {"id": "chat", "label": "Chat Turn",
+             "description": "User message arrives via POST "
+                            "/plugins/overseer/chat. Full tool surface "
+                            "(35 tools); includes dispatch_sibling and "
+                            "compress_chat which are chat-only."},
+            {"id": "journal_step", "label": "Journal Step (Slice 9.9)",
+             "description": "Tool-enabled reflection inside a tick. All "
+                            "tools EXCEPT dispatch_sibling + compress_chat "
+                            "are available (defense-in-depth block). Max "
+                            "4 tool iterations per tick."},
+            {"id": "tick_scheduled", "label": "Scheduled Tick",
+             "description": "Background loop at tick_interval_s (default "
+                            "900s = 15min). Runs all 16 steps with budget "
+                            "gates. Step 0 (temporal) bypasses daily budget."},
+            {"id": "bell_action", "label": "Bell Action",
+             "description": "Tory clicks a button in the Hub Bell tab. "
+                            "Custom actions on a notification thread "
+                            "through to notification_responses; overseer "
+                            "reads them next journal step."},
+        ]
+
+        # C agents (live registry; usually empty until first graduation)
+        c_agents = []
+        if self.overseer_db is not None:
+            try:
+                c_agents = self.overseer_db.list_c_agents(limit=50)
+            except Exception as e:
+                log.warning("list_c_agents in ecosystem failed: %s", e)
+
+        from datetime import datetime, timezone
+        return {
+            "ok": True,
+            "generated_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+            "hooks": hooks,
+            "tick_steps": tick_steps,
+            "tools": tools,
+            "b_agents": b_agents,
+            "c_agents": c_agents,
+            "counts": {
+                "hooks": len(hooks),
+                "tick_steps": len(tick_steps),
+                "tools": len(tools),
+                "b_agents": len(b_agents),
+                "c_agents": len(c_agents),
+            },
+        }
 
     def _http_distill_corrections(self, payload):
         """POST /plugins/overseer/insight/distill-corrections
