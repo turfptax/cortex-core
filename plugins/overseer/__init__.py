@@ -2802,6 +2802,8 @@ class OverseerPlugin(Plugin):
                 uploads_dir=UPLOADS_DIR,
                 # Slice 9.3: cap on dispatch_sibling calls from chat tools
                 sibling_daily_cap=self._sibling_daily_cap(),
+                # Slice 14: voice-mode succinctness directive
+                voice_mode=bool(payload.get("voice_mode", False)),
             )
         except Exception as e:
             self.api.log.exception("chat failed: %s", e)

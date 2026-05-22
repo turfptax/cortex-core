@@ -39,6 +39,29 @@ import chat_tools
 log = logging.getLogger("plugin.overseer.chat")
 
 
+# ── Slice 14 (2026-05-21): voice mode ───────────────────────────
+# When the chat turn arrives from the Hub's voice mode, the reply
+# is going to be spoken aloud via TTS — long markdown answers are
+# wrong for that channel. This directive is appended to the system
+# block on voice-mode turns.
+VOICE_MODE_DIRECTIVE = """\
+── VOICE MODE ──
+This turn arrived by speech and your reply will be SPOKEN ALOUD to \
+the user via text-to-speech. Adjust accordingly:
+  - Keep it SHORT — 1 to 3 sentences. Aim for what's natural to hear, \
+not read.
+  - Plain spoken prose only. No markdown, no bullet lists, no headers, \
+no code blocks, no tables, no URLs.
+  - Lead with the answer. Skip preamble and meta-commentary.
+  - If the honest answer needs more depth than voice allows, give the \
+one-sentence version and offer: "I can go deeper if you switch back \
+to text."
+  - Don't spell out long IDs, file paths, or numbers digit-by-digit — \
+summarize them ("the most recent run", "about forty sessions").
+This is a constraint on FORM, not honesty. A short true answer still \
+beats a padded one."""
+
+
 # ── Slice 8: file attachment handling ───────────────────────────
 #
 # The Hub uploads files to /files/uploads on the Pi (raw body, 100MB
@@ -804,7 +827,8 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
                        insight_snippet_enabled: bool = True,
                        attachments: list[dict] | None = None,
                        uploads_dir: str | None = None,
-                       sibling_daily_cap: int = 20) -> dict:
+                       sibling_daily_cap: int = 20,
+                       voice_mode: bool = False) -> dict:
     """End-to-end: append user msg to chat_messages, build prompt,
     call LLM, persist assistant response, return result dict.
 
@@ -1047,6 +1071,10 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
         base_system = base_system + "\n\n" + blindspots_block
     if insight_snippet_enabled:
         base_system = base_system + "\n\n" + CHAT_INSIGHT_MARKER_INSTRUCTION
+    # Slice 14: voice-mode succinctness directive — appended LAST so
+    # it's the freshest instruction in the system block.
+    if voice_mode:
+        base_system = base_system + "\n\n" + VOICE_MODE_DIRECTIVE
 
     t0 = time.monotonic()
     total_cost = 0.0
