@@ -354,6 +354,16 @@ class OverseerPlugin(Plugin):
                   self._http_runs_export),
             Route("POST", "/runs/rate",
                   self._http_runs_rate),
+            # ── Work-org (2026-05-21): targeted import processing ─
+            Route("POST", "/imports/tag-machine",
+                  self._http_imports_tag_machine),
+            Route("POST", "/imports/process-targeted",
+                  self._http_imports_process_targeted),
+            # ── Slice 13 (2026-05-21): sensitivity tiers ──────────
+            Route("GET",  "/sensitivity/status",
+                  self._http_sensitivity_status),
+            Route("POST", "/sensitivity/backfill",
+                  self._http_sensitivity_backfill),
         ]
 
     # ── Lifecycle ───────────────────────────────────────────────
@@ -2091,6 +2101,108 @@ class OverseerPlugin(Plugin):
                 dataset_candidate=dc)
         except Exception as e:
             log.exception("runs_rate failed")
+            return {"ok": False, "error": str(e)}
+
+    # ── Work-org (2026-05-21): targeted import processing ───────
+
+    def _http_imports_tag_machine(self, payload):
+        """POST /plugins/overseer/imports/tag-machine
+        body: {machine: "work-ClientA", cwd_likes: ["%ClientA%", ...]}
+
+        Stamp metadata_json.machine on every imported_session whose
+        cwd matches one of the LIKE patterns. Non-destructive — only
+        adds/overwrites the `machine` key inside the existing JSON
+        blob. Lets the work-computer cohort be queried as a unit."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        import json as _json
+        machine = (payload or {}).get("machine") or ""
+        cwd_likes = (payload or {}).get("cwd_likes") or []
+        if not machine or not cwd_likes:
+            return {"ok": False,
+                    "error": "machine + cwd_likes (non-empty) required"}
+        conn = self.overseer_db._conn
+        where = " OR ".join(["cwd LIKE ?"] * len(cwd_likes))
+        rows = conn.execute(
+            f"SELECT id, metadata_json FROM imported_sessions "
+            f"WHERE ({where})",
+            tuple(cwd_likes),
+        ).fetchall()
+        tagged = 0
+        for r in rows:
+            try:
+                meta = _json.loads(r["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            meta["machine"] = machine
+            conn.execute(
+                "UPDATE imported_sessions SET metadata_json = ? "
+                "WHERE id = ?",
+                (_json.dumps(meta, ensure_ascii=False), r["id"]),
+            )
+            tagged += 1
+        self.overseer_db._safe_commit()
+        return {"ok": True, "machine": machine, "tagged": tagged}
+
+    def _http_imports_process_targeted(self, payload):
+        """POST /plugins/overseer/imports/process-targeted
+        body: {cwd_likes: [...], limit: int, max_cost_usd: float}
+
+        Process ONLY imported_sessions matching the cwd LIKE
+        patterns. Used to drain a specific cohort (the work-computer
+        ClientA sessions) with a hard cost cap, without touching the
+        rest of the unprocessed backlog."""
+        if self.loop is None:
+            return {"ok": False, "error": "loop not initialized"}
+        cwd_likes = (payload or {}).get("cwd_likes") or []
+        if not cwd_likes:
+            return {"ok": False, "error": "cwd_likes (non-empty) required"}
+        limit = int((payload or {}).get("limit") or 100)
+        max_cost = float((payload or {}).get("max_cost_usd") or 4.0)
+        try:
+            summary = self.loop.process_imports_targeted(
+                cwd_likes=cwd_likes, limit=limit,
+                max_cost_usd=max_cost)
+            return {"ok": summary.get("ok", True), "summary": summary}
+        except Exception as e:
+            log.exception("process_imports_targeted failed")
+            return {"ok": False, "error": str(e)}
+
+    # ── Slice 13 (2026-05-21): sensitivity tiers ────────────────
+
+    def _http_sensitivity_status(self, payload):
+        """GET /plugins/overseer/sensitivity/status — active rules +
+        per-tier session counts."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        try:
+            return {
+                "ok": True,
+                "rules": self.overseer_db.get_sensitivity_rules(
+                    active_only=False),
+                "stats": self.overseer_db.sensitivity_stats(),
+            }
+        except Exception as e:
+            log.exception("sensitivity_status failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_sensitivity_backfill(self, payload):
+        """POST /plugins/overseer/sensitivity/backfill — apply the
+        active rules to existing imported_sessions.
+
+        body: {only_unset: bool (default true)}
+        only_unset=true skips rows that already carry a sensitivity
+        so user overrides + scanner promotions aren't clobbered."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        only_unset = bool((payload or {}).get("only_unset", True))
+        try:
+            result = self.overseer_db.backfill_sensitivity(
+                only_unset=only_unset)
+            return {"ok": True, **result,
+                    "stats": self.overseer_db.sensitivity_stats()}
+        except Exception as e:
+            log.exception("sensitivity_backfill failed")
             return {"ok": False, "error": str(e)}
 
     def _http_distill_corrections(self, payload):

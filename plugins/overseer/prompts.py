@@ -129,6 +129,67 @@ def import_gist_prompt(*, imp_id: str, project: str, cwd: str,
     )
 
 
+def import_gist_prompt_sanitized(*, imp_id: str, project: str, cwd: str,
+                                  branch: str, started: str, ended: str,
+                                  dur: int, n_total: int, u: int, a: int,
+                                  n_used: int, n_omit: int, strategy: str,
+                                  transcript: str) -> str:
+    """Slice 13 (2026-05-21): the high-level-only gist variant for
+    `confidential`-tier sessions.
+
+    Same job as import_gist_prompt — capture THE CHANGE — but with a
+    hard sanitization contract: the resulting gist persists in the
+    memory store, so it must carry org-structure-level signal and
+    NONE of the reconstructable minutia. Per the locked sensitivity
+    policy: 'remember the shape of confidential work, be useless for
+    reconstructing it.'
+    """
+    return (
+        "You are summarizing a CONFIDENTIAL imported work session "
+        "into ONE LINE that captures THE CHANGE — at a structural "
+        "level only.\n\n"
+        "This session is sensitivity-tier CONFIDENTIAL. The gist you "
+        "write will be stored in a long-lived memory system. It MUST "
+        "be safe to keep: it should capture the SHAPE of the work and "
+        "be useless for RECONSTRUCTING it.\n\n"
+        "CAPTURE (structural signal — keep this):\n"
+        "  - what KIND of work happened (e.g. 'contract review', "
+        "'financial modeling', 'compliance audit', 'recruitment ops')\n"
+        "  - which workstream / milestone it moved\n"
+        "  - decisions at the level of 'a decision was made about X', "
+        "not the content of the decision\n"
+        "  - whether something shipped / closed / stalled\n\n"
+        "NEVER RECORD (sanitization contract — exclude all of this):\n"
+        "  - dollar figures, valuations, prices, salary numbers\n"
+        "  - contract terms, deal points, percentages, dates of "
+        "specific commitments\n"
+        "  - counterparty names, client names, vendor names, partner "
+        "company names\n"
+        "  - personal names of non-Tory individuals, patient data, "
+        "any PHI / PII\n"
+        "  - credentials, keys, tokens, internal URLs, IP addresses\n"
+        "  - verbatim quotes from the transcript\n\n"
+        "If the only substantive 'change' is itself sensitive, write: "
+        "'Confidential work session — <domain> — detail withheld by "
+        "sensitivity policy.' That is a COMPLETE and ACCEPTABLE gist. "
+        "Do not strain to say more.\n\n"
+        "Session: {sid}\n"
+        "Project (cwd basename): {project}\n"
+        "Started: {started}  Ended: {ended}  Duration: {dur} min\n"
+        "Messages: {n_total} total ({u} user, {a} assistant)\n\n"
+        "TRANSCRIPT (confidential — do not echo specifics):\n"
+        "{transcript}\n\n"
+        "Write only the one-sentence structural gist. No preamble. "
+        "No quotes. No figures. No names."
+        + MARKER_PRESERVATION_RULE
+    ).format(
+        sid=imp_id, project=project or "(unknown)",
+        started=started or "?", ended=ended or "?", dur=dur,
+        n_total=n_total, u=u, a=a, n_used=n_used, n_omit=n_omit,
+        strategy=strategy, transcript=transcript,
+    )
+
+
 def recent_notes_gist_prompt(*, body: str) -> str:
     return (
         "You are summarizing the user's recent notes into ONE LINE "

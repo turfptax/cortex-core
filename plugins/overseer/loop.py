@@ -49,7 +49,8 @@ from claude_jsonl import (
 from automation_rollup import generate_rollup
 from notifications import evaluate_rules
 from dialectic import paired_generate, write_dialectic_row
-from prompts import session_gist_prompt, import_gist_prompt
+from prompts import (session_gist_prompt, import_gist_prompt,
+                     import_gist_prompt_sanitized)
 from journal import write_tick_journal_entry
 from question_routing import route_evidence_to_questions
 from blindspots import applicable_blindspots
@@ -870,8 +871,14 @@ class OverseerLoop:
         transcript, stats = build_transcript_for_summary(
             messages, max_chars=max_chars)
 
-        # Slice 3f.5 reframed prompt: gist drops everything but THE CHANGE
-        prompt = import_gist_prompt(
+        # Slice 13 (2026-05-21): sensitivity-aware prompt selection.
+        # confidential / restricted sessions get the sanitized gist
+        # prompt so the persisted gist carries structural signal but
+        # no reconstructable minutia. `restricted` shouldn't normally
+        # reach here (retention_policy='no-import'), but if one does,
+        # the strictest prompt is the safe default.
+        sensitivity = (imp.get("sensitivity") or "public").lower()
+        gist_args = dict(
             imp_id=imp.get("id") or "",
             project=imp.get("project") or "(unknown)",
             cwd=imp.get("cwd") or "(unknown)",
@@ -887,6 +894,14 @@ class OverseerLoop:
             strategy=stats["strategy"],
             transcript=transcript,
         )
+        if sensitivity in ("confidential", "restricted"):
+            prompt = import_gist_prompt_sanitized(**gist_args)
+            self._log.info(
+                "import %s: sensitivity=%s → sanitized gist prompt",
+                imp.get("id"), sensitivity)
+        else:
+            # Slice 3f.5 reframed prompt: gist drops all but THE CHANGE
+            prompt = import_gist_prompt(**gist_args)
         if self._cfg.get("loop_paired_generation", True):
             paired = paired_generate(
                 llm=self._llm, prompt=prompt,
@@ -1012,6 +1027,97 @@ class OverseerLoop:
             except Exception as e:
                 self._log.warning(
                     "reactivation notification failed: %s", e)
+
+    def process_imports_targeted(self, *, cwd_likes, limit=100,
+                                  max_cost_usd=4.0,
+                                  max_calls=None) -> dict:
+        """Slice work-org (2026-05-21): process ONLY imported_sessions
+        whose cwd matches one of the LIKE patterns in ``cwd_likes``.
+
+        Used by POST /imports/process-targeted to drain a specific
+        cohort (e.g. the work-computer ClientA sessions) without
+        touching the rest of the unprocessed backlog. Bypasses the
+        daily budget (escape hatch, like /backfill) but enforces a
+        hard ``max_cost_usd`` cap so the caller controls spend.
+
+        cwd_likes: list of SQL LIKE patterns, e.g.
+            ['%ClientA%', '%workuser%', '%/home/workuser%']
+        Returns a summary dict.
+        """
+        if not self._tick_lock.acquire(blocking=False):
+            return {"ok": False,
+                    "skipped": "a tick or backfill is already running"}
+        try:
+            if max_calls is None:
+                max_calls = int(limit) + 10
+            budget = TickBudget(
+                max_calls=int(max_calls),
+                max_cost_usd=float(max_cost_usd),
+            )  # daily_budget=None → escape hatch, same as /backfill
+            summary = {
+                "ok": True, "kind": "imports-targeted",
+                "started_at": _utc_iso(),
+                "cwd_likes": list(cwd_likes),
+                "skipped_due_to_budget": [],
+                "errors": [],
+            }
+            # Find matching unprocessed sessions.
+            where = " OR ".join(["cwd LIKE ?"] * len(cwd_likes))
+            rows = self._db._conn.execute(
+                f"SELECT * FROM imported_sessions "
+                f"WHERE ({where}) "
+                f"ORDER BY started_at ASC LIMIT ?",
+                (*cwd_likes, int(limit) * 3),
+            ).fetchall()
+            candidates = [dict(r) for r in rows]
+            unprocessed = [
+                imp for imp in candidates
+                if not self._db.is_imported_processed(imp["id"])
+            ][:int(limit)]
+            summary["matched_total"] = len(candidates)
+            summary["unprocessed_targeted"] = len(unprocessed)
+
+            for imp in unprocessed:
+                if budget.exhausted():
+                    summary["skipped_due_to_budget"].append(
+                        "imported:" + imp["id"])
+                    continue
+                try:
+                    outcome = self._summarize_one_imported(
+                        imp, budget, summary)
+                    key = {
+                        "summarized": "imports_summarized",
+                        "empty": "imports_empty",
+                        "failed": "imports_failed",
+                        "deferred": "imports_deferred",
+                        "ignored": "imports_ignored",
+                    }.get(outcome, "imports_failed")
+                    summary.setdefault(key, 0)
+                    summary[key] += 1
+                except Exception as e:
+                    self._log.exception(
+                        "targeted import %s failed: %s", imp["id"], e)
+                    summary.setdefault("imports_failed", 0)
+                    summary["imports_failed"] += 1
+                    self._db.mark_imported_processed(
+                        imp["id"], error=str(e)[:500])
+
+            # Rebuild working memory so the new gists land in context.
+            try:
+                wm = self.build_working_memory()
+                self._db.set_overseer_state(
+                    "working_memory_json", json.dumps(wm))
+                self._db.set_overseer_state(
+                    "working_memory_built_at", _utc_iso())
+                summary["working_memory_rebuilt"] = True
+            except Exception as e:
+                summary["errors"].append("wm_rebuild: " + str(e)[:200])
+
+            summary["finished_at"] = _utc_iso()
+            summary["budget"] = budget.remaining()
+            return summary
+        finally:
+            self._tick_lock.release()
 
     def _summarize_one_session(self, session: dict, budget: TickBudget,
                                summary: dict | None = None) -> str:

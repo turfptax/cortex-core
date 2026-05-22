@@ -1333,6 +1333,31 @@ def _dispatch(name: str, args: dict, *, db, core_memory,
         prompt = (args.get("prompt") or "").strip()
         if not prompt:
             return {"error": "prompt is required"}
+        # ── Slice 13 CP3: outbound sensitivity filter ──────────────
+        # A sibling dispatch sends prompt + context to the Anthropic
+        # API — it LEAVES the Pi. Scan the combined outbound text for
+        # credentials / PII / references to confidential-tier
+        # sessions. If it trips, refuse and tell the overseer to
+        # sanitize rather than silently shipping a leak.
+        try:
+            _outbound = prompt + " " + json.dumps(
+                args.get("context") or {}, default=str)
+            _hits = db.scan_outbound_text_for_sensitive(_outbound)
+        except Exception:
+            _hits = []
+        if _hits:
+            _names = ", ".join(sorted({h["name"] for h in _hits}))
+            return {
+                "error": (
+                    "dispatch blocked by the Slice 13 sensitivity "
+                    "filter — the prompt or context would ship "
+                    "sensitive content off-Pi to a sibling. Hits: "
+                    + _names + ". Rewrite the dispatch with the "
+                    "specifics removed (refer to work structurally, "
+                    "not by figure/name/credential/confidential-"
+                    "session-id), then try again."),
+                "sensitivity_hits": _hits[:10],
+            }
         # Bound the budget — model can ask for higher but we clamp.
         try:
             budget = float(args.get("cost_budget_usd") or 0.50)
