@@ -342,18 +342,33 @@ direction, forecasting, long-term memory reconciliation, the high-
 judgment synthesis that needs full context AND full reasoning.
 
 The Cortex system has a roster of models who work for you:
-  - Gemini 2.0 Flash — your routine staff. Handles auto-tagging,
-    evidence routing, insight scans, distill passes. ~30x cheaper
-    than Sonnet. Default tool for structured short tasks.
+  - **Router (Gemini 2.0 Flash, front-line)** — Slice 14.7 layer.
+    Handles most user conversation in front of you. Sees thin
+    context, answers routine factual/lookup questions in 1-3
+    sentences, escalates to you when a turn genuinely needs full
+    overseer attention. ~30-100x cheaper per turn than you. The
+    user's default chat path now hits the router; you only see
+    a turn when the router escalates OR the user uses direct
+    override.
+  - Gemini 2.0 Flash (loop) — your routine staff for auto-tagging,
+    evidence routing, insight scans, distill passes. Same model
+    as the router, different purpose.
   - Sonnet 4.6 — your mid-tier specialist. Handles the journal
     layer and the B-agent audits (theme_check, project_merge_check).
-    Use when interpretation matters but doesn't need Opus.
   - Opus 4.7 — you. Most expensive seat at the table. Reserve
     yourself for the work that genuinely needs your reasoning.
   - Claude Code siblings — outside contractors. Billed against
     Tory's Anthropic budget; significant per-task cost. Dispatch
     only for genuine judgment-call asks that you can't resolve
     via tools or B agents.
+
+Default to the router for normal user conversation. You only get
+engaged when the router escalates (it'll tag the message with an
+escalation reason — trigger word, direct override, consecutive
+router turns, Flash self-escalate) or when Tory uses the direct
+override button. If you find yourself answering something that
+WAS routine, that's a signal the router should have caught it —
+note it for tuning.
 
 The core operating rule: **do not do work yourself that can be
 delegated.** Your goal is to minimize your own token usage while
@@ -947,7 +962,18 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
                        attachments: list[dict] | None = None,
                        uploads_dir: str | None = None,
                        sibling_daily_cap: int = 20,
-                       voice_mode: bool = False) -> dict:
+                       voice_mode: bool = False,
+                       # ── Slice 14.7 (2026-05-22) ────────────────
+                       # Skip persisting the user message — the
+                       # router has already persisted it before
+                       # deciding to escalate. Without this, an
+                       # escalation would double-persist.
+                       skip_user_persist: bool = False,
+                       # Tag the assistant message that this call
+                       # writes. Defaults to 'overseer' since this
+                       # function IS the full Opus overseer path.
+                       answered_by: str = "overseer",
+                       escalation_reason: str = "") -> dict:
     """End-to-end: append user msg to chat_messages, build prompt,
     call LLM, persist assistant response, return result dict.
 
@@ -1004,7 +1030,17 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
             "chat correction detection failed: %s", e,
         )
 
-    user_id = db.append_chat_message(role="user", content=user_message)
+    # Slice 14.7: when escalating from the router, the user message
+    # was already persisted by respond_via_router. Re-use that id.
+    if skip_user_persist:
+        recent = db.recent_chat_messages(limit=4)
+        existing_user = next(
+            (m for m in reversed(recent) if m.get("role") == "user"),
+            None,
+        )
+        user_id = existing_user["id"] if existing_user else None
+    else:
+        user_id = db.append_chat_message(role="user", content=user_message)
 
     # 1.5: Slice 8 — read attachments off disk and persist refs FK'd to
     # the user turn we just created. Records are read independently of
@@ -1304,6 +1340,9 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
                   "history_turns_used": max(0, len(messages) - 2),
                   "tool_calls": tool_call_audit,
                   "tool_iterations": len(tool_call_audit)},
+        # Slice 14.7: layer attribution
+        answered_by=answered_by,
+        escalation_reason=escalation_reason,
     )
 
     # Now strip insight markers and queue candidates. The user-visible
@@ -1344,6 +1383,295 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
         "chat_correction_id": chat_correction_id,   # 3i CP2
         "attachments": persisted_attachments,        # Slice 8
     }
+
+
+# ── Slice 14.7 (2026-05-22): router layer ──────────────────────────
+#
+# A Flash-tier router that handles routine chat in front of Opus-
+# overseer. Most user turns ($0.0003-0.001) land here; the router
+# either answers with thin context, or emits "ESCALATE: <reason>"
+# and the call falls through to respond_to_message (Opus, full
+# context, ~$0.10-0.15). Cost target: typical conversation drops
+# from $0.107/turn average to ~$0.005/turn average.
+
+# Trigger words in a user message force escalation regardless of
+# what Flash would have chosen. Case-insensitive substring match
+# on the raw user message.
+ROUTER_TRIGGER_WORDS = [
+    "overseer",       # direct address
+    "@boss",          # CEO framing
+    "think hard",     # explicit deep-mode request
+    "deep think",
+    "strategize",
+    "long-term",      # memory reconciliation cue
+    "reconcile",
+    "synthesize",     # cross-corpus pass
+    "synthesis",
+]
+
+# After this many consecutive router answers on the same thread,
+# the next turn auto-escalates to overseer — the assumption being
+# the conversation has built up state the thin context is missing.
+ROUTER_MAX_CONSECUTIVE = 3
+
+# How much router-output prefix-checking does for escalation. The
+# router is instructed to emit lines that start with ESCALATE:
+# verbatim when it wants to defer.
+ROUTER_ESCALATE_PREFIX = "ESCALATE:"
+
+ROUTER_SYSTEM_PROMPT = """\
+You are the front-line router for Cortex's overseer agent. You sit \
+in front of the full overseer (Opus 4.7) and handle most user turns \
+yourself using a cheaper model + thin context.
+
+The user is Tory. He is direct, intellectually serious, and prefers \
+short, accurate answers to padded ones.
+
+Your job, in order of preference:
+
+1. If the question is answerable from the thin context below — \
+factual lookup, simple acknowledgement, routine confirmation — \
+answer it in 1-3 sentences. No preamble, no markdown headers, no \
+closing meta. State the answer.
+
+2. If you can answer but have moderate uncertainty, answer concisely \
+AND flag the uncertainty in the same sentence ("X — though I only \
+see the top-5 here").
+
+3. If the question needs the FULL overseer — depth, judgment, \
+long-term memory reconciliation, cross-corpus synthesis, project \
+planning, strategy, invention work, emotional or supportive \
+conversation, or anything you genuinely can't answer well with this \
+thin context — DO NOT answer. Instead, your ENTIRE reply must be \
+ONE LINE starting with ESCALATE: followed by a one-sentence reason.
+
+Examples of correct ESCALATE: lines:
+  ESCALATE: needs cross-project synthesis the thin context can't see
+  ESCALATE: strategic planning request — needs overseer judgment
+  ESCALATE: emotional/supportive register, hand to overseer
+  ESCALATE: invention/design question, needs full corpus
+
+Do NOT escalate to look diligent — you have real cost, and \
+escalation flips a $0.0003 turn into a $0.10 turn. Escalate only \
+when the answer genuinely needs what you can't give.
+
+Form rules:
+- Plain prose. No bullet lists, no headers, no code fences.
+- 1-3 sentences for normal answers.
+- "I don't see X in my context" is better than guessing.
+- Never pad. Never close with "let me know if you need more."
+"""
+
+
+def build_router_context_block(*, db, core_memory) -> str:
+    """Slice 14.7: thin context for the router — a tight ~500-1000
+    token sketch of what Cortex knows so Flash can answer routine
+    factual asks without escalating. Deliberately MUCH smaller than
+    build_context_block() (which loads working memory + themes +
+    questions + future_notes + the full institutional layer).
+
+    What's here:
+      - Headline corpus stats (gist count, sessions, projects)
+      - Top 5 active projects (tag + name only)
+      - 5 most recent gist titles (one-line summaries)
+      - Active question count
+    """
+    parts: list[str] = []
+    try:
+        snap = db.overseer_snapshot()
+        parts.append(
+            f"Corpus: {snap.get('summaries_gist',0)} gists, "
+            f"{snap.get('summaries_theme',0)} themes, "
+            f"{snap.get('open_questions',0)} open questions, "
+            f"{snap.get('overseer_journal',0)} journal entries, "
+            f"{snap.get('imported_sessions',0)} imported sessions."
+        )
+    except Exception:
+        pass
+    if core_memory is not None:
+        try:
+            stats = core_memory.get_stats()
+            parts.append(
+                f"Core: {stats.get('notes_total',0)} notes, "
+                f"{stats.get('sessions_total',0)} sessions, "
+                f"{stats.get('active_projects',0)} active projects, "
+                f"latest_note={stats.get('latest_note_at') or '?'}."
+            )
+        except Exception:
+            pass
+        try:
+            rows = core_memory.query(
+                "SELECT tag, name FROM projects "
+                "WHERE status = 'active' "
+                "ORDER BY last_touched DESC LIMIT 5"
+            )
+            if rows:
+                tags = ", ".join(f"{r['tag']}" for r in rows)
+                parts.append(f"Top-5 recently active projects: {tags}.")
+        except Exception:
+            pass
+    # Recent gist titles
+    try:
+        rows = db._conn.execute(
+            "SELECT substr(body, 1, 100) AS body "
+            "FROM summaries_gist ORDER BY id DESC LIMIT 5"
+        ).fetchall()
+        if rows:
+            parts.append("Most recent gists (last 5, first line each):")
+            for r in rows:
+                parts.append(f"  - {r['body']}")
+    except Exception:
+        pass
+    return "\n".join(parts)
+
+
+def _check_trigger_words(message: str) -> str | None:
+    """Return the matched trigger word if any, else None."""
+    if not message:
+        return None
+    low = message.lower()
+    for t in ROUTER_TRIGGER_WORDS:
+        if t.lower() in low:
+            return t
+    return None
+
+
+def respond_via_router(*, db, llm, core_memory, user_message: str,
+                       direct_override: bool = False,
+                       sibling_daily_cap: int = 20) -> dict:
+    """Slice 14.7: the router-tier chat handler. Persists the user
+    turn once, decides whether to answer with Flash (cheap) or
+    escalate to respond_to_message (Opus), and tags the assistant
+    row with answered_by + escalation_reason.
+
+    Returns the same response shape as respond_to_message, plus
+    extra fields:
+      - answered_by: 'router' | 'overseer'
+      - escalation_reason: '' or one of the escalation reason tags
+      - router_attempted: bool (False if direct_override bypassed)
+    """
+    user_message = (user_message or "").strip()
+    if not user_message:
+        return {"ok": False, "error": "empty message"}
+
+    # 1. Persist user turn once. The downstream escalation path is
+    # told not to re-persist (skip_user_persist=True).
+    user_id = db.append_chat_message(role="user", content=user_message)
+
+    # 2. Escalation checks BEFORE spending any LLM call.
+    if direct_override:
+        return _escalate_to_overseer(
+            db=db, llm=llm, core_memory=core_memory,
+            user_message=user_message, user_id=user_id,
+            sibling_daily_cap=sibling_daily_cap,
+            reason="direct_override")
+
+    trigger = _check_trigger_words(user_message)
+    if trigger:
+        return _escalate_to_overseer(
+            db=db, llm=llm, core_memory=core_memory,
+            user_message=user_message, user_id=user_id,
+            sibling_daily_cap=sibling_daily_cap,
+            reason=f"trigger_word:{trigger}")
+
+    try:
+        consec = db.count_consecutive_router_turns()
+    except Exception:
+        consec = 0
+    if consec >= ROUTER_MAX_CONSECUTIVE:
+        return _escalate_to_overseer(
+            db=db, llm=llm, core_memory=core_memory,
+            user_message=user_message, user_id=user_id,
+            sibling_daily_cap=sibling_daily_cap,
+            reason=f"consecutive_router_turns:{consec}")
+
+    # 3. Build thin context + call Flash.
+    ctx = build_router_context_block(db=db, core_memory=core_memory)
+    router_prompt = (
+        "Context (thin — escalate if you need more):\n"
+        + ctx
+        + "\n\nUser: " + user_message
+    )
+    t0 = time.monotonic()
+    result = llm.complete(
+        router_prompt,
+        system=ROUTER_SYSTEM_PROMPT,
+        max_tokens=400,
+        temperature=0.4,
+        purpose="router-chat",
+    )
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    if not result.get("ok"):
+        # Router is unavailable — fall back to overseer rather than
+        # leave the user with a silent failure.
+        return _escalate_to_overseer(
+            db=db, llm=llm, core_memory=core_memory,
+            user_message=user_message, user_id=user_id,
+            sibling_daily_cap=sibling_daily_cap,
+            reason="router_unavailable")
+
+    reply = (result.get("text") or "").strip()
+
+    # 4. Self-escalation: Flash itself decided this needs overseer.
+    if reply.startswith(ROUTER_ESCALATE_PREFIX):
+        flash_reason = reply[len(ROUTER_ESCALATE_PREFIX):].strip()[:200]
+        return _escalate_to_overseer(
+            db=db, llm=llm, core_memory=core_memory,
+            user_message=user_message, user_id=user_id,
+            sibling_daily_cap=sibling_daily_cap,
+            reason=f"flash_self_escalate:{flash_reason}")
+
+    # 5. Router answered. Persist + return.
+    asst_id = db.append_chat_message(
+        role="assistant", content=reply,
+        backend=result.get("backend", ""),
+        model=result.get("model", ""),
+        latency_ms=elapsed_ms,
+        cost_usd=float(result.get("cost_usd") or 0),
+        prompt_tokens=int(result.get("prompt_tokens") or 0),
+        response_tokens=int(result.get("completion_tokens") or 0),
+        metadata={"router": True, "context_chars": len(ctx)},
+        answered_by="router",
+        escalation_reason="",
+    )
+    return {
+        "ok": True,
+        "reply": reply,
+        "model": result.get("model"),
+        "backend": result.get("backend"),
+        "latency_ms": elapsed_ms,
+        "cost_usd": float(result.get("cost_usd") or 0),
+        "prompt_tokens": int(result.get("prompt_tokens") or 0),
+        "completion_tokens": int(result.get("completion_tokens") or 0),
+        "user_message_id": user_id,
+        "assistant_message_id": asst_id,
+        "answered_by": "router",
+        "escalation_reason": "",
+        "router_attempted": True,
+    }
+
+
+def _escalate_to_overseer(*, db, llm, core_memory, user_message,
+                           user_id, sibling_daily_cap, reason) -> dict:
+    """Hand off to respond_to_message with the user message already
+    persisted. Tags the resulting assistant message as answered_by=
+    'overseer' with the escalation reason."""
+    out = respond_to_message(
+        db=db, llm=llm, core_memory=core_memory,
+        user_message=user_message,
+        sibling_daily_cap=sibling_daily_cap,
+        skip_user_persist=True,
+        answered_by="overseer",
+        escalation_reason=reason,
+    )
+    if isinstance(out, dict):
+        out.setdefault("user_message_id", user_id)
+        out["answered_by"] = "overseer"
+        out["escalation_reason"] = reason
+        out["router_attempted"] = (
+            reason not in ("direct_override",))
+    return out
 
 
 # ── Slice 9.5 CP3 (2026-05-19): chat history compression ───────────

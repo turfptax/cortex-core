@@ -42,7 +42,7 @@ from claude_jsonl import (
     file_sha256,
     parse_claude_code_jsonl,
 )
-from chat import respond_to_message
+from chat import respond_to_message, respond_via_router
 from dialectic import paired_generate, write_dialectic_row
 from prompts import recent_notes_gist_prompt
 from detail import resolve_detail, TokenError
@@ -240,6 +240,8 @@ class OverseerPlugin(Plugin):
             Route("GET",  "/rollups",               self._http_list_rollups),
             # ── Slice 3e: chat ──────────────────────────────────
             Route("POST", "/chat",                  self._http_chat),
+            # ── Slice 14.7 (2026-05-22): router-tier chat ───────
+            Route("POST", "/quick-chat",            self._http_quick_chat),
             Route("GET",  "/chat/history",          self._http_chat_history),
             Route("POST", "/chat/clear",            self._http_chat_clear),
             Route("POST", "/chat/compress",         self._http_chat_compress),
@@ -2821,6 +2823,39 @@ class OverseerPlugin(Plugin):
             )
         except Exception as e:
             self.api.log.exception("chat failed: %s", e)
+            return {"ok": False, "error": str(e)}
+
+    def _http_quick_chat(self, payload):
+        """Slice 14.7 (2026-05-22): POST /plugins/overseer/quick-chat
+
+        Router-tier chat. Persists the user message once, then either:
+          - answers via Gemini Flash with thin context (~$0.0003-0.001)
+          - or escalates to the full respond_to_message path (Opus,
+            full context, ~$0.10-0.15) when the question needs it
+
+        Body: {"message": "...", "direct_override"?: bool}
+        Returns the same shape as /chat, plus:
+          - answered_by: 'router' | 'overseer'
+          - escalation_reason: '' or one of the tagged reasons
+          - router_attempted: bool
+        """
+        if (self.overseer_db is None or self.llm is None
+                or self.core_memory is None):
+            return {"ok": False, "error": "overseer not initialized"}
+        message = (payload.get("message") or "").strip()
+        if not message:
+            return {"ok": False, "error": "missing 'message' field"}
+        direct_override = bool(payload.get("direct_override", False))
+        try:
+            return respond_via_router(
+                db=self.overseer_db, llm=self.llm,
+                core_memory=self.core_memory,
+                user_message=message,
+                direct_override=direct_override,
+                sibling_daily_cap=self._sibling_daily_cap(),
+            )
+        except Exception as e:
+            self.api.log.exception("quick-chat failed: %s", e)
             return {"ok": False, "error": str(e)}
 
     def _http_chat_history(self, payload):

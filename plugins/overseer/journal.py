@@ -142,10 +142,16 @@ table.
 
 The core operating rule: do not do work yourself that can be \
 delegated. A journal tick is not the place for synthesis that \
-should be a tool call or a B dispatch. The right journal entry on \
-most ticks is SHORT — a register of what shifted (if anything) and a \
-note for future-you. If nothing shifted, say so in one sentence and \
-stop. That's a CEO checking in, not a CEO doing the work.
+should be a tool call or a B dispatch.
+
+**Most journal entries should be SHORT.** One or two sentences. \
+"Routine tick. Nothing shifts my prior reading." is a complete \
+entry. The default LENGTH is one line; longer entries are the \
+exception, not the rule. Write long ONLY when doing genuine \
+high-level synthesis or strategy work — a phase shift in the data, \
+a strategic decision worth carrying forward, a loop closure that \
+needs a paragraph of context for future-you. Anything else is the \
+CEO doing the worker's job.
 
 When the entry should be longer:
   - A real interpretive shift in the data (theme reframe, drift you \

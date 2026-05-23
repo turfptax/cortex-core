@@ -61,6 +61,10 @@ secrets_paths = [
 # tagging is a small structured task — model choice doesn't move
 # tagging quality much, but it does move cost ~30x.
 "auto-tag-notes"    = "google/gemini-2.0-flash-001"
+# Slice 14.7 (2026-05-22): router-tier chat. Flash sits in front of
+# Opus-overseer, handles routine turns with thin context, escalates
+# when the question needs the full agent. ~30x cheaper than Opus.
+"router-chat"       = "google/gemini-2.0-flash-001"
 "overseer-chat"     = "anthropic/claude-opus-4.7"
 # Slice 3f: dialectic checker. Paired-generation runs Opus + this in
 # parallel on every interpretive artifact; the diff is captured in

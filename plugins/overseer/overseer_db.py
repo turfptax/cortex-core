@@ -361,7 +361,16 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     cost_usd REAL NOT NULL DEFAULT 0,
     prompt_tokens INTEGER NOT NULL DEFAULT 0,
     response_tokens INTEGER NOT NULL DEFAULT 0,
-    metadata_json TEXT NOT NULL DEFAULT '{}'
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    -- Slice 14.7 (2026-05-22): which layer handled this turn.
+    -- 'router'    = Flash router answered with thin context
+    -- 'overseer'  = escalated to Opus + full context
+    -- ''/NULL     = legacy / not tagged (pre-Slice-14.7 rows + user rows)
+    answered_by TEXT NOT NULL DEFAULT '',
+    -- For escalated assistant turns: what triggered the escalation
+    -- ('trigger_word','direct_override','consecutive_router_turns',
+    --  'flash_self_escalate','router_unavailable','user_role')
+    escalation_reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_chat_created ON chat_messages(created_at);
 
@@ -1629,6 +1638,25 @@ class OverseerDB(CortexDB):
             self._safe_commit()
             log.info("_migrate_13_sensitivity: seeded %d rules",
                      len(seeds))
+        self._migrate_14_7_router_columns()
+
+    def _migrate_14_7_router_columns(self):
+        """Slice 14.7 (2026-05-22): add answered_by + escalation_reason
+        columns to chat_messages so each assistant turn carries
+        attribution to the layer that produced it (router-Flash vs
+        escalated-overseer-Opus) + why an escalation happened. Fresh
+        installs get the columns via OVERSEER_SCHEMA_SQL; existing
+        installs (.25) need ALTERs."""
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(chat_messages)"
+        ).fetchall()}
+        for col in ("answered_by", "escalation_reason"):
+            if col not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE chat_messages ADD COLUMN "
+                    f"{col} TEXT NOT NULL DEFAULT ''"
+                )
+        self._safe_commit()
 
     def _migrate_9_6_notification_actions(self):
         """Slice 9.6 CP1 (2026-05-19): notifications gain actions_json
@@ -2565,7 +2593,8 @@ class OverseerDB(CortexDB):
           - by_model: rolled up across purposes — total spend per model
         """
         days_str = "-{} days".format(int(days))
-        # Per model+purpose
+        # Per model+purpose — Slice 14.7 adds avg input/output tokens
+        # so we can see token-mix per task type, not just $ aggregates.
         rows = self._conn.execute(
             "SELECT model, COALESCE(NULLIF(purpose,''),'(unspecified)') "
             "    AS purpose, "
@@ -2575,7 +2604,9 @@ class OverseerDB(CortexDB):
             "  ROUND(AVG(cost_usd), 6) AS avg_cost_usd, "
             "  ROUND(AVG(latency_ms)) AS avg_latency_ms, "
             "  SUM(prompt_tokens) AS total_prompt_tokens, "
-            "  SUM(response_tokens) AS total_response_tokens "
+            "  SUM(response_tokens) AS total_response_tokens, "
+            "  ROUND(AVG(prompt_tokens), 1) AS avg_prompt_tokens, "
+            "  ROUND(AVG(response_tokens), 1) AS avg_response_tokens "
             "FROM llm_calls "
             "WHERE created_at >= datetime('now', ?) "
             "GROUP BY model, purpose "
@@ -2606,11 +2637,57 @@ class OverseerDB(CortexDB):
             (days_str,),
         ).fetchall()
         by_model = [dict(r) for r in rows]
+        # Slice 14.7: by-layer rollup. Buckets every purpose into one
+        # of four layers so the daily dashboard shows where the spend
+        # actually lives — without the user having to read every
+        # purpose name.
+        LAYER_MAP = {
+            "router-chat":          "router",
+            "overseer-chat":        "overseer",
+            "overseer-journal":     "overseer",
+            "summarize-session":    "routine",
+            "summarize-recent":     "routine",
+            "working-memory":       "routine",
+            "auto-tag-notes":       "routine",
+            "evidence-routing":     "routine",
+            "insight-scan":         "routine",
+            "distill-corrections":  "routine",
+            "project-narrative":    "routine",
+            "temporal-daily":       "routine",
+            "temporal-weekly":      "routine",
+            "temporal-monthly":     "routine",
+            "temporal-yearly":      "routine",
+            "dialectic-check":      "dialectic",
+            "chat-compress":        "overseer",
+        }
+        by_layer_acc: dict = {}
+        for r in by_purpose:
+            layer = LAYER_MAP.get(r["purpose"], "other")
+            acc = by_layer_acc.setdefault(
+                layer, {"layer": layer, "calls": 0,
+                        "total_cost_usd": 0.0})
+            acc["calls"] += int(r["calls"] or 0)
+            acc["total_cost_usd"] += float(r["total_cost_usd"] or 0)
+        total_cost = sum(
+            v["total_cost_usd"] for v in by_layer_acc.values()) or 1.0
+        by_layer = []
+        for layer in ("router", "overseer", "routine", "dialectic",
+                       "other"):
+            v = by_layer_acc.get(layer)
+            if not v:
+                continue
+            v["total_cost_usd"] = round(v["total_cost_usd"], 4)
+            v["pct_of_spend"] = round(
+                100.0 * v["total_cost_usd"] / total_cost, 1)
+            by_layer.append(v)
+
         return {
             "days": int(days),
             "by_model_purpose": by_model_purpose,
             "by_purpose": by_purpose,
             "by_model": by_model,
+            "by_layer": by_layer,
+            "total_cost_usd": round(total_cost, 4),
         }
 
     # ── processed_sessions / processed_notes (loop idempotency) ─
@@ -3234,17 +3311,41 @@ class OverseerDB(CortexDB):
     def append_chat_message(self, *, role, content, backend="", model="",
                             latency_ms=0, cost_usd=0.0,
                             prompt_tokens=0, response_tokens=0,
-                            metadata=None):
+                            metadata=None,
+                            answered_by="",
+                            escalation_reason=""):
         cur = self._conn.execute(
             "INSERT INTO chat_messages (role, content, backend, model, "
             "latency_ms, cost_usd, prompt_tokens, response_tokens, "
-            "metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "metadata_json, answered_by, escalation_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (role, content, backend, model, int(latency_ms),
              float(cost_usd), int(prompt_tokens), int(response_tokens),
-             json.dumps(metadata or {})),
+             json.dumps(metadata or {}),
+             answered_by, escalation_reason),
         )
         self._safe_commit()
         return cur.lastrowid
+
+    def count_consecutive_router_turns(self, limit=8) -> int:
+        """Slice 14.7: count assistant turns at the end of the chat
+        thread that were answered by the router (answered_by='router')
+        without an overseer escalation breaking the streak. Used by
+        the router to escalate when it's been answering on the same
+        thread for too long without resolution."""
+        rows = self._conn.execute(
+            "SELECT role, answered_by FROM chat_messages "
+            "WHERE role = 'assistant' "
+            "ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        n = 0
+        for r in rows:
+            if (r["answered_by"] or "") == "router":
+                n += 1
+            else:
+                break
+        return n
 
     def recent_chat_messages(self, limit=40, *, include_files=True):
         """Most-recent N rows in chronological order. When include_files
