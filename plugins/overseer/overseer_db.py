@@ -2551,6 +2551,68 @@ class OverseerDB(CortexDB):
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def llm_attribution_stats(self, days=7):
+        """Slice 14.6 CP1: per-model + per-purpose breakdown of
+        LLM spend. Lets us see which model did how much work for
+        which task type at what cost — the data we need to decide
+        whether a routing choice is paying off.
+
+        Returns three tables (each a list of dicts):
+          - by_model_purpose: rows of (model, purpose, calls, ok,
+            total_cost_usd, avg_cost_usd, avg_latency_ms,
+            total_prompt_tokens, total_response_tokens)
+          - by_purpose: rolled up across models — total spend per task
+          - by_model: rolled up across purposes — total spend per model
+        """
+        days_str = "-{} days".format(int(days))
+        # Per model+purpose
+        rows = self._conn.execute(
+            "SELECT model, COALESCE(NULLIF(purpose,''),'(unspecified)') "
+            "    AS purpose, "
+            "  COUNT(*) AS calls, "
+            "  SUM(ok) AS oks, "
+            "  ROUND(SUM(cost_usd), 4) AS total_cost_usd, "
+            "  ROUND(AVG(cost_usd), 6) AS avg_cost_usd, "
+            "  ROUND(AVG(latency_ms)) AS avg_latency_ms, "
+            "  SUM(prompt_tokens) AS total_prompt_tokens, "
+            "  SUM(response_tokens) AS total_response_tokens "
+            "FROM llm_calls "
+            "WHERE created_at >= datetime('now', ?) "
+            "GROUP BY model, purpose "
+            "ORDER BY total_cost_usd DESC",
+            (days_str,),
+        ).fetchall()
+        by_model_purpose = [dict(r) for r in rows]
+        # Rolled up by purpose
+        rows = self._conn.execute(
+            "SELECT COALESCE(NULLIF(purpose,''),'(unspecified)') AS purpose, "
+            "  COUNT(*) AS calls, "
+            "  ROUND(SUM(cost_usd), 4) AS total_cost_usd, "
+            "  ROUND(AVG(cost_usd), 6) AS avg_cost_usd "
+            "FROM llm_calls "
+            "WHERE created_at >= datetime('now', ?) "
+            "GROUP BY purpose ORDER BY total_cost_usd DESC",
+            (days_str,),
+        ).fetchall()
+        by_purpose = [dict(r) for r in rows]
+        # Rolled up by model
+        rows = self._conn.execute(
+            "SELECT model, COUNT(*) AS calls, "
+            "  ROUND(SUM(cost_usd), 4) AS total_cost_usd, "
+            "  ROUND(AVG(cost_usd), 6) AS avg_cost_usd "
+            "FROM llm_calls "
+            "WHERE created_at >= datetime('now', ?) "
+            "GROUP BY model ORDER BY total_cost_usd DESC",
+            (days_str,),
+        ).fetchall()
+        by_model = [dict(r) for r in rows]
+        return {
+            "days": int(days),
+            "by_model_purpose": by_model_purpose,
+            "by_purpose": by_purpose,
+            "by_model": by_model,
+        }
+
     # ── processed_sessions / processed_notes (loop idempotency) ─
 
     def is_session_processed(self, session_id):

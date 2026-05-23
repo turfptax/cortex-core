@@ -214,6 +214,8 @@ class OverseerPlugin(Plugin):
             Route("POST", "/llm/test",              self._http_llm_test),
             Route("GET",  "/llm/calls",             self._http_llm_calls),
             Route("GET",  "/llm/stats",             self._http_llm_stats),
+            # Slice 14.6 CP1: per-model + per-purpose cost attribution.
+            Route("GET",  "/llm/attribution",       self._http_llm_attribution),
             Route("POST", "/summarize-recent",      self._http_summarize_recent),
             Route("GET",  "/themes",                self._http_themes),
             Route("GET",  "/episodes",              self._http_episodes),
@@ -586,6 +588,18 @@ class OverseerPlugin(Plugin):
         days = _as_int(payload, "days", 7, max_value=365)
         return {"ok": True, "stats": self.overseer_db.llm_call_stats(days),
                 "period_days": days}
+
+    def _http_llm_attribution(self, payload):
+        """GET /plugins/overseer/llm/attribution?days=7 — Slice 14.6
+        CP1: per-model + per-purpose cost breakdown. Surfaces which
+        model did how much work for which task type, at what cost —
+        the data needed to decide whether a routing choice is paying
+        off (or to spot a routine task that quietly drifted onto an
+        expensive model)."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        days = _as_int(payload, "days", 7, max_value=365)
+        return {"ok": True, **self.overseer_db.llm_attribution_stats(days)}
 
     def _http_summarize_recent(self, payload):
         """POST /plugins/overseer/summarize-recent — end-to-end smoke test.
