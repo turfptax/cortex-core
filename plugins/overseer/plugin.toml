@@ -57,7 +57,10 @@ secrets_paths = [
 "summarize-session" = "anthropic/claude-opus-4.7"
 "summarize-recent"  = "anthropic/claude-opus-4.7"
 "working-memory"    = "anthropic/claude-opus-4.7"
-"auto-tag-notes"    = "anthropic/claude-sonnet-4.6"
+# Slice 14.5 (2026-05-22): moved Sonnet → Gemini 2.0 Flash. Auto-
+# tagging is a small structured task — model choice doesn't move
+# tagging quality much, but it does move cost ~30x.
+"auto-tag-notes"    = "google/gemini-2.0-flash-001"
 "overseer-chat"     = "anthropic/claude-opus-4.7"
 # Slice 3f: dialectic checker. Paired-generation runs Opus + this in
 # parallel on every interpretive artifact; the diff is captured in
@@ -69,16 +72,18 @@ secrets_paths = [
 # stays trivial. Override to Opus for deeper introspection if desired.
 "overseer-journal"  = "anthropic/claude-sonnet-4.6"
 # Slice 3f.5 #2: question-centered routing. Each new gist gets routed
-# (or "unfiled") against active open_questions via Sonnet. Cheap +
-# structured task; ~$0.005 per gist.
-"evidence-routing"  = "anthropic/claude-sonnet-4.6"
-# Slice 3h: insight scan. Sonnet reads recent gist arcs per project
-# and proposes new theme/pattern/drift candidates to the pending
-# queue. Conservative single-call-per-scan budget (~$0.005-0.01/scan).
-"insight-scan"      = "anthropic/claude-sonnet-4.6"
+# (or "unfiled") against active open_questions.
+# Slice 14.5 (2026-05-22): moved Sonnet → Gemini 2.0 Flash. ~30x
+# cheaper, plenty of capability for structured short tasks, large
+# input window. Routine routing doesn't need Sonnet.
+"evidence-routing"  = "google/gemini-2.0-flash-001"
+# Slice 3h: insight scan. Reads recent gist arcs per project and
+# proposes new theme/pattern/drift candidates to the pending queue.
+# Slice 14.5: Sonnet → Gemini Flash for the same reason.
+"insight-scan"      = "google/gemini-2.0-flash-001"
 # Slice 3i CP2: distill corrections → blindspot proposals.
-# Same model as insight-scan; cheap clustering of small text rows.
-"distill-corrections" = "anthropic/claude-sonnet-4.6"
+# Cheap clustering of small text rows — Flash territory.
+"distill-corrections" = "google/gemini-2.0-flash-001"
 
 [hooks]
 subscribe = [
@@ -233,7 +238,13 @@ loop_rollups_max_per_tick = 5           # cheap (Sonnet) but still bound
 # 250/day puts gist work back inside the daily budget. Dollar cap raised
 # proportionally so calls stay the single binding control surface (today's
 # call mix would have hit $2 at ~175 calls otherwise).
-loop_daily_budget_usd = 5.00
+# Slice 14.5 (2026-05-22): pulled cost $5 → $3 in lockstep with
+# moving auto-tag / evidence-routing / insight-scan / distill from
+# Sonnet to Gemini 2.0 Flash (~30x cheaper). Tory's stated target:
+# ~$1/day typical, hard ceiling $3. Calls cap stays 250 — with most
+# calls now on Flash, calls-vs-cost is comfortably decoupled and
+# cost is the binding constraint.
+loop_daily_budget_usd = 3.00
 loop_daily_budget_calls = 250
 
 # Slice 9.3 (2026-05-16): daily cap on overseer-initiated sibling task
