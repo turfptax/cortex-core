@@ -54,7 +54,17 @@ secrets_paths = [
 # back to [llm].model if the purpose isn't listed. Cheaper models for
 # small structured tasks; Opus for the high-stakes interpretive work.
 [llm.model_overrides]
-"summarize-session" = "anthropic/claude-opus-4.7"
+# Slice 14.7.1 (2026-05-26): moved Opus → Gemini 2.0 Flash. Gist
+# creation from a Claude Code .jsonl transcript is routine structured
+# extraction (read messages, emit a paragraph + tags). Opus was
+# ~$0.028/gist; Flash is ~$0.001/gist — 30x cheaper. With the
+# imported_sessions backlog drain unblocked (752c022), keeping this
+# on Opus would have cost ~$31 over ~10 days at the daily $3 budget
+# cap; Flash brings the same drain to ~$1.20 and clears the queue
+# in a single day. Quality is rechecked against the next 20 gists;
+# if any regress meaningfully, fall back to "anthropic/claude-sonnet-4.6"
+# (~$0.005/gist) before going back to Opus.
+"summarize-session" = "google/gemini-2.0-flash-001"
 "summarize-recent"  = "anthropic/claude-opus-4.7"
 "working-memory"    = "anthropic/claude-opus-4.7"
 # Slice 14.5 (2026-05-22): moved Sonnet → Gemini 2.0 Flash. Auto-
