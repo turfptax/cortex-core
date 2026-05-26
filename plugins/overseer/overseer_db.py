@@ -1697,6 +1697,15 @@ class OverseerDB(CortexDB):
         )
         self._safe_commit()
 
+    def delete_overseer_state(self, key):
+        """Slice 14.7.2 (2026-05-26): delete a state row. Used by the
+        daily-budget override expiry path (override clears at the
+        local-midnight rollover handled in DailyBudget._refresh_date).
+        """
+        self._conn.execute(
+            "DELETE FROM overseer_state WHERE key = ?", (key,))
+        self._safe_commit()
+
     # ── raw_pointers ────────────────────────────────────────────
 
     def add_raw_pointer(self, source_kind, source_path="", source_id="", notes=""):

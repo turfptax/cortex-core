@@ -252,6 +252,8 @@ class OverseerPlugin(Plugin):
             Route("POST", "/notifications/respond", self._http_notifications_respond),
             # ── Slice 3e: budget visibility ─────────────────────
             Route("GET",  "/budget",                self._http_budget),
+            # Slice 14.7.2 (2026-05-26): manual cap override.
+            Route("POST", "/budget/override",       self._http_budget_override),
             # ── Slice 3f: dialectic checker ─────────────────────
             Route("GET",  "/dialectic",             self._http_list_dialectic),
             Route("GET",  "/dialectic/get",         self._http_get_dialectic),
@@ -3245,6 +3247,83 @@ class OverseerPlugin(Plugin):
         if self.overseer_db is None:
             return {"ok": False, "error": "overseer not initialized"}
         from loop import DailyBudget
+        daily = DailyBudget(
+            db=self.overseer_db,
+            max_cost_usd=float(self.api.config.get(
+                "loop_daily_budget_usd", 1.00)),
+            max_calls=int(self.api.config.get(
+                "loop_daily_budget_calls", 25)),
+        )
+        return {"ok": True, "budget": daily.snapshot()}
+
+    def _http_budget_override(self, payload):
+        """POST /plugins/overseer/budget/override — set or clear the
+        manual daily-cap override (Slice 14.7.2, 2026-05-26).
+
+        body:
+          {cost_usd: float, calls: int}  — set override values
+          {cost_usd: null}               — clear cost override (calls
+                                           field optional, same idea)
+          {clear: true}                  — clear both overrides
+
+        Override auto-expires at the next local-midnight rollover so
+        a forgotten bump doesn't quietly raise tomorrow's ceiling.
+        Returns the resulting budget snapshot.
+
+        Use case: bulk-backfill work (drain a large import queue,
+        regenerate temporal narratives) that needs more than the
+        plugin.toml ceiling for a few hours, without editing config
+        or restarting the service.
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        from loop import DailyBudget
+        payload = payload or {}
+
+        # Branch 1: explicit clear.
+        if payload.get("clear"):
+            self.overseer_db.delete_overseer_state(
+                DailyBudget.KEY_OVERRIDE_COST)
+            self.overseer_db.delete_overseer_state(
+                DailyBudget.KEY_OVERRIDE_CALLS)
+        else:
+            # Branch 2: per-field. null clears just that field; a
+            # numeric value sets it. Missing field = leave alone.
+            if "cost_usd" in payload:
+                v = payload["cost_usd"]
+                if v is None:
+                    self.overseer_db.delete_overseer_state(
+                        DailyBudget.KEY_OVERRIDE_COST)
+                else:
+                    try:
+                        cost = float(v)
+                        if cost < 0:
+                            return {"ok": False,
+                                    "error": "cost_usd must be >= 0"}
+                        self.overseer_db.set_overseer_state(
+                            DailyBudget.KEY_OVERRIDE_COST,
+                            round(cost, 4))
+                    except (TypeError, ValueError):
+                        return {"ok": False,
+                                "error": "cost_usd must be a number"}
+            if "calls" in payload:
+                v = payload["calls"]
+                if v is None:
+                    self.overseer_db.delete_overseer_state(
+                        DailyBudget.KEY_OVERRIDE_CALLS)
+                else:
+                    try:
+                        n = int(float(v))
+                        if n < 0:
+                            return {"ok": False,
+                                    "error": "calls must be >= 0"}
+                        self.overseer_db.set_overseer_state(
+                            DailyBudget.KEY_OVERRIDE_CALLS, n)
+                    except (TypeError, ValueError):
+                        return {"ok": False,
+                                "error": "calls must be an integer"}
+
+        # Return fresh snapshot reflecting the new cap.
         daily = DailyBudget(
             db=self.overseer_db,
             max_cost_usd=float(self.api.config.get(

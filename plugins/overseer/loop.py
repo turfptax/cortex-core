@@ -140,12 +140,50 @@ class DailyBudget:
     KEY_DATE = "overseer_today_date"
     KEY_COST = "overseer_today_cost_usd"
     KEY_CALLS = "overseer_today_calls"
+    # Slice 14.7.2 (2026-05-26): manual cap override. Tory needs to
+    # be able to bump the daily ceiling for bulk-backfill work (drain
+    # the grok import, regenerate temporal narratives, etc.) without
+    # editing plugin.toml. Set via POST /budget/override. Auto-clears
+    # at the next local-midnight rollover (see _refresh_date).
+    KEY_OVERRIDE_COST = "daily_budget_override_cost_usd"
+    KEY_OVERRIDE_CALLS = "daily_budget_override_calls"
 
     def __init__(self, *, db, max_cost_usd: float, max_calls: int):
         self._db = db
-        self.max_cost_usd = float(max_cost_usd)
-        self.max_calls = int(max_calls)
+        self._default_cost = float(max_cost_usd)
+        self._default_calls = int(max_calls)
+        self._apply_caps()  # picks up any active override
         self._date, self._cost, self._calls = self._load()
+
+    def _apply_caps(self) -> None:
+        """Read override from state; fall back to constructor defaults.
+
+        Called at __init__ and on every _refresh_date so live override
+        changes propagate without a restart. snapshot() / exhausted() /
+        the daily-budget check all path through here.
+        """
+        raw_cost = self._db.get_overseer_state(self.KEY_OVERRIDE_COST)
+        if raw_cost is not None:
+            try:
+                self.max_cost_usd = float(raw_cost)
+                self._cost_overridden = True
+            except (TypeError, ValueError):
+                self.max_cost_usd = self._default_cost
+                self._cost_overridden = False
+        else:
+            self.max_cost_usd = self._default_cost
+            self._cost_overridden = False
+        raw_calls = self._db.get_overseer_state(self.KEY_OVERRIDE_CALLS)
+        if raw_calls is not None:
+            try:
+                self.max_calls = int(float(raw_calls))
+                self._calls_overridden = True
+            except (TypeError, ValueError):
+                self.max_calls = self._default_calls
+                self._calls_overridden = False
+        else:
+            self.max_calls = self._default_calls
+            self._calls_overridden = False
 
     def _today(self) -> str:
         # Local date — uses host's TZ. Matches temporal_narratives
@@ -185,6 +223,17 @@ class DailyBudget:
             self._db.set_overseer_state(self.KEY_DATE, today)
             self._db.set_overseer_state(self.KEY_COST, "0")
             self._db.set_overseer_state(self.KEY_CALLS, "0")
+            # Slice 14.7.2: overrides expire at the local-midnight
+            # rollover by design — manual bumps are scoped to "today"
+            # so a forgotten override doesn't quietly raise tomorrow's
+            # ceiling too.
+            self._db.delete_overseer_state(self.KEY_OVERRIDE_COST)
+            self._db.delete_overseer_state(self.KEY_OVERRIDE_CALLS)
+            self._apply_caps()
+        else:
+            # Same day — pick up any override the user just set via
+            # POST /budget/override mid-day.
+            self._apply_caps()
 
     def charge(self, *, cost: float) -> None:
         self._refresh_date()
@@ -213,6 +262,13 @@ class DailyBudget:
             "calls_max": self.max_calls,
             "calls_remaining": max(0, self.max_calls - self._calls),
             "exhausted": self.exhausted(),
+            # Slice 14.7.2: visible override state so /budget can show
+            # "active override: $X (default $Y)" and the next reader
+            # knows the cap isn't the plugin.toml value.
+            "cost_override_active": self._cost_overridden,
+            "cost_default_usd": self._default_cost,
+            "calls_override_active": self._calls_overridden,
+            "calls_default": self._default_calls,
         }
 
 
