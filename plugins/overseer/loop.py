@@ -791,10 +791,18 @@ class OverseerLoop:
         No high-water mark — imports are explicit user actions, so we
         process every unprocessed one (subject to budget). Big bulk
         imports drain across multiple ticks at the per-tick cap.
+
+        Slice 14.7.1 (2026-05-25): use list_unprocessed_imported_
+        sessions for SQL-level filtering. The previous list_imported_
+        sessions(limit=200) + Python-side filter starved the 1,129-row
+        Slice 9.1 historical backlog — the top-200-by-started_at
+        window was 100% already-processed recent rows, the filter saw
+        zero unprocessed, and the loop bailed every tick. With no
+        imports summarized, imports_summarized stayed 0, the journal
+        notability gate stayed False, and overseer's thinking layer
+        went silent for ~35h.
         """
-        rows = self._db.list_imported_sessions(limit=200)
-        unprocessed = [r for r in rows
-                       if not self._db.is_imported_processed(r["id"])]
+        unprocessed = self._db.list_unprocessed_imported_sessions(limit=200)
         if not unprocessed:
             return
 

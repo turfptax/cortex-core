@@ -2812,6 +2812,39 @@ class OverseerDB(CortexDB):
             rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
+    def list_unprocessed_imported_sessions(self, *, source=None, limit=200):
+        """Return unprocessed imported_sessions only — SQL-level filter.
+
+        The loop's _summarize_imported_sessions used to call
+        list_imported_sessions(limit=200) and then filter in Python.
+        That starved the 1,129-row historical backlog (Slice 9.1
+        grok-com / tweets), because the top-200-by-started_at window
+        was fully covered by already-processed recent imports — the
+        Python filter saw zero unprocessed rows and bailed.
+
+        This method does the filter at the SQL layer (LEFT JOIN +
+        WHERE processed.imported_id IS NULL) and orders by
+        imported_at DESC so freshly-pushed imports still get priority,
+        with the historical backlog draining behind them.
+
+        Returns up to `limit` rows. Returned dicts match the
+        imported_sessions schema (same shape as list_imported_sessions).
+        """
+        sql = (
+            "SELECT i.* FROM imported_sessions i "
+            "LEFT JOIN processed_imported_sessions p "
+            "  ON p.imported_id = i.id "
+            "WHERE p.imported_id IS NULL"
+        )
+        params: list = []
+        if source:
+            sql += " AND i.source = ?"
+            params.append(source)
+        sql += " ORDER BY i.imported_at DESC, i.started_at DESC LIMIT ?"
+        params.append(int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
     def delete_imported_session(self, imported_id):
         self._conn.execute(
             "DELETE FROM processed_imported_sessions WHERE imported_id = ?",
