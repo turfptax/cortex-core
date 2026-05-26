@@ -342,6 +342,9 @@ YOUR (the user's) JOURNAL ENTRIES THIS WEEK:
 CATEGORY ACTIVITY THIS WEEK:
 {category_breakdown_block}
 
+SESSION-LEVEL CONTENT THIS WEEK (gist body per session, grouped by category):
+{session_gists_block}
+
 PROJECT MOMENTUM THIS WEEK (each tagged with dominant category):
   Active (touched this week, sorted by hours):
 {active_projects_block}
@@ -468,6 +471,26 @@ def gather_weekly_context(*, db, period_start, period_end, period_label,
         p["_dominant_category"] = project_categories.get(
             p.get("project", ""), "unclassified")
 
+    # Slice 14.7.4 (2026-05-26): the gatherer above is fine for
+    # CURRENT-period narratives (live dailies + journal + project_
+    # summaries-by-last_active_at). For HISTORICAL windows none of
+    # those tables hold useful rows, leaving the LLM with only
+    # category counts → empty stub narratives. Fix: pull actual
+    # session→gist content for the window so the LLM has substance
+    # to narrate, and derive project momentum from the same window.
+    session_gists = _session_gists_in_window(
+        db, period_start, period_end, limit=40)
+    session_project_momentum = _session_project_momentum(
+        db, period_start, period_end, limit=15)
+    # If the live-data 'active' list is empty (historical window),
+    # fall back to session-derived momentum so the active-projects
+    # block isn't blank.
+    if not active and session_project_momentum:
+        for p in session_project_momentum:
+            p["_dominant_category"] = project_categories.get(
+                p.get("project", ""), "unclassified")
+        active = session_project_momentum
+
     return {
         "dailies": dailies,
         "human_entries": human_entries,
@@ -475,6 +498,7 @@ def gather_weekly_context(*, db, period_start, period_end, period_label,
         "stalled": stalled,
         "questions": questions,
         "category_counts": category_counts,
+        "session_gists": session_gists,
         "period_label": period_label,
         "window_end_local": local_now.strftime("%Y-%m-%d"),
     }
@@ -523,6 +547,113 @@ def _project_dominant_categories(db, period_start, period_end) -> dict:
             cats.items(),
             key=lambda kv: (-kv[1], priority.get(kv[0], 9)))[0][0]
     return result
+
+
+def _session_gists_in_window(db, period_start, period_end,
+                              limit: int = 40) -> list:
+    """Slice 14.7.4: pull session→gist rows in the window for
+    historical narrative coverage.
+
+    Returns list of dicts with the gist body + session metadata,
+    ordered by category (work first, then cortex, personal,
+    unclassified) then by started_at. Capped at `limit` so a
+    full-week prompt stays under context limits.
+
+    The LLM needs gist BODIES to narrate; counts alone leave it
+    inventing content (or being correctly empty). This is the data
+    that closes the historical-narrative gap.
+    """
+    # Priority: work > cortex > personal > unclassified for ordering
+    rows = db._conn.execute(
+        """SELECT i.id, i.source, i.project, i.cwd, i.category,
+                  i.started_at, i.duration_minutes, i.message_count,
+                  i.metadata_json, g.body AS gist_body
+           FROM imported_sessions i
+           JOIN processed_imported_sessions p
+             ON p.imported_id = i.id
+           JOIN summaries_gist g ON g.id = p.gist_id
+           WHERE i.started_at >= ? AND i.started_at < ?
+             AND COALESCE(g.body, '') != ''
+           ORDER BY
+             CASE COALESCE(NULLIF(i.category,''),'unclassified')
+                 WHEN 'work' THEN 0
+                 WHEN 'cortex' THEN 1
+                 WHEN 'personal' THEN 2
+                 ELSE 3
+             END,
+             i.started_at ASC
+           LIMIT ?""",
+        (period_start, period_end, int(limit)),
+    ).fetchall()
+    out: list = []
+    for r in rows:
+        d = dict(r)
+        # Extract title from metadata_json (best-effort)
+        try:
+            meta = json.loads(d.get("metadata_json") or "{}")
+            d["_title"] = (meta.get("title") or "").strip()
+        except Exception:
+            d["_title"] = ""
+        out.append(d)
+    return out
+
+
+def _session_project_momentum(db, period_start, period_end,
+                                limit: int = 15) -> list:
+    """Slice 14.7.4: per-project session counts + duration in the
+    window. Used as fallback for the active-projects block when the
+    project_summaries.last_active_at filter returns nothing (historical
+    windows). Returns rows shaped like project_summaries so the
+    existing formatter Just Works.
+    """
+    rows = db._conn.execute(
+        """SELECT
+              project,
+              COUNT(*) AS session_count,
+              SUM(COALESCE(duration_minutes, 0)) AS active_minutes_total,
+              MAX(started_at) AS last_active_at,
+              SUM(COALESCE(message_count, 0)) AS message_count_total
+           FROM imported_sessions
+           WHERE started_at >= ? AND started_at < ?
+             AND project IS NOT NULL AND project != ''
+           GROUP BY project
+           ORDER BY active_minutes_total DESC, session_count DESC
+           LIMIT ?""",
+        (period_start, period_end, int(limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _format_session_gists_block(session_gists: list,
+                                  per_session_chars: int = 220) -> str:
+    """Render the session-level gist content block. Groups by category
+    so the LLM can map directly into the [WORK] / [CORTEX] /
+    [PERSONAL] sections. Truncates each gist body to keep prompt
+    size bounded.
+    """
+    if not session_gists:
+        return "  (no session-level gist content in window)"
+    by_cat: dict[str, list] = {}
+    for sg in session_gists:
+        cat = (sg.get("category") or "").strip() or "unclassified"
+        by_cat.setdefault(cat, []).append(sg)
+    order = ["work", "cortex", "personal", "unclassified"]
+    out: list[str] = []
+    for cat in order:
+        rows = by_cat.get(cat, [])
+        if not rows:
+            continue
+        out.append(f"  [{cat.upper()}]  ({len(rows)} session(s))")
+        for sg in rows:
+            day = (sg.get("started_at") or "")[:10]
+            title = sg.get("_title") or "(no title)"
+            body = (sg.get("gist_body") or "").strip()
+            if len(body) > per_session_chars:
+                body = body[:per_session_chars] + "…"
+            out.append(f"    • {day}  {title[:55]}")
+            out.append(f"      {body}")
+        out.append("")
+    return "\n".join(out).rstrip()
 
 
 def _format_category_breakdown(category_counts: dict) -> str:
@@ -603,6 +734,8 @@ def generate_weekly(*, db, llm, period_start, period_end, period_label,
         human_entries_block=_format_human_entries(ctx["human_entries"]),
         category_breakdown_block=_format_category_breakdown(
             ctx.get("category_counts", {})),
+        session_gists_block=_format_session_gists_block(
+            ctx.get("session_gists", [])),
         active_projects_block=_format_active_projects(ctx["active"]),
         stalled_projects_block=_format_stalled_projects(ctx["stalled"]),
         questions_block=_format_questions(ctx["questions"]),
@@ -634,6 +767,9 @@ YOUR (the user's) JOURNAL ENTRIES THIS MONTH (most recent {n_entries}):
 
 CATEGORY ACTIVITY THIS MONTH:
 {category_breakdown_block}
+
+SESSION-LEVEL CONTENT THIS MONTH (gist body per session, grouped by category — used to flesh out months with no weeklies under them):
+{session_gists_block}
 
 PROJECT MOMENTUM (each tagged with dominant category):
   Most active this month (by active hours):
@@ -735,12 +871,26 @@ def gather_monthly_context(*, db, period_start, period_end, period_label,
         p["_dominant_category"] = project_categories.get(
             p.get("project", ""), "unclassified")
 
+    # Slice 14.7.4 (2026-05-26): same historical-data fallbacks as
+    # weekly — pull session-gist content directly so monthlies with
+    # no weeklies under them aren't empty.
+    session_gists = _session_gists_in_window(
+        db, period_start, period_end, limit=60)
+    session_project_momentum = _session_project_momentum(
+        db, period_start, period_end, limit=20)
+    if not active and session_project_momentum:
+        for p in session_project_momentum:
+            p["_dominant_category"] = project_categories.get(
+                p.get("project", ""), "unclassified")
+        active = session_project_momentum
+
     return {
         "weeklies": weeklies,
         "human_entries": human_entries,
         "active": active,
         "questions": questions,
         "category_counts": category_counts,
+        "session_gists": session_gists,
         "period_label": period_label,
     }
 
@@ -775,6 +925,9 @@ def generate_monthly(*, db, llm, period_start, period_end, period_label,
         human_entries_block=_format_human_entries(ctx["human_entries"]),
         category_breakdown_block=_format_category_breakdown(
             ctx.get("category_counts", {})),
+        session_gists_block=_format_session_gists_block(
+            ctx.get("session_gists", []),
+            per_session_chars=180),
         active_projects_block=_format_active_projects(ctx["active"]),
         questions_block=_format_questions(ctx["questions"]),
     )
@@ -964,6 +1117,19 @@ def gather_yearly_context(*, db, period_start, period_end, period_label,
     for p in active:
         p["_dominant_category"] = project_categories.get(
             p.get("project", ""), "unclassified")
+
+    # Slice 14.7.4: yearlies don't need the per-session-gist block —
+    # they synthesize from monthlies and the dataset is too big to
+    # dump session-level. Just lean on per-month aggregates. We DO
+    # add session-derived project momentum so yearly active-projects
+    # works for historical windows.
+    session_project_momentum = _session_project_momentum(
+        db, period_start, period_end, limit=20)
+    if not active and session_project_momentum:
+        for p in session_project_momentum:
+            p["_dominant_category"] = project_categories.get(
+                p.get("project", ""), "unclassified")
+        active = session_project_momentum
 
     return {
         "monthlies": monthlies,
