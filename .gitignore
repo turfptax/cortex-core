@@ -38,3 +38,8 @@ scripts/import_from_torylife.py
 
 # Personal identity dossier — never commit
 dossier/
+
+# Core identity files — real ones gitignored, examples + README tracked
+memory/core/*.md
+!memory/core/example.*.md
+!memory/core/README.md
