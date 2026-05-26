@@ -261,11 +261,17 @@ loop_rollups_max_per_tick = 5           # cheap (Sonnet) but still bound
 # Slice 14.5 (2026-05-22): pulled cost $5 → $3 in lockstep with
 # moving auto-tag / evidence-routing / insight-scan / distill from
 # Sonnet to Gemini 2.0 Flash (~30x cheaper). Tory's stated target:
-# ~$1/day typical, hard ceiling $3. Calls cap stays 250 — with most
-# calls now on Flash, calls-vs-cost is comfortably decoupled and
-# cost is the binding constraint.
+# ~$1/day typical, hard ceiling $3. Slice 14.7.1 (2026-05-26): call
+# cap raised 250 → 1500 after summarize-session moved Opus → Flash.
+# At Flash rates a typical structured-extraction call is ~$0.001,
+# so 1500 calls = ~$1.50 — still well under the $3 dollar cap,
+# which is now the real safety rail. The 250 cap was a relic from
+# when Opus was answering routine work; once routing pushed those
+# off Opus the call counter became the artificially-binding one
+# (single overnight Opus drain hit 250 in ~5h and starved Flash work
+# behind it). Dollar cap stays the floor.
 loop_daily_budget_usd = 3.00
-loop_daily_budget_calls = 250
+loop_daily_budget_calls = 1500
 
 # Slice 9.3 (2026-05-16): daily cap on overseer-initiated sibling task
 # dispatches. Independent of the LLM call cap above — siblings burn the
