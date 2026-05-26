@@ -146,9 +146,20 @@ working_memory_recent_rollups = 5         # daily automation rollups
 # Cost guards prevent a runaway loop from burning credits.
 loop_enabled = true
 loop_first_tick_delay_s = 30            # don't hammer the LLM at startup
-loop_max_llm_calls_per_tick = 20      # bumped from 10 in 3f: each
-                                       # interpretive artifact now does
-                                       # paired generation = 2 calls
+loop_max_llm_calls_per_tick = 30      # Slice 14.7.1 (2026-05-26):
+                                       # bumped 20 → 30. Import drain
+                                       # consumes 2 calls per session
+                                       # (summarize + evidence-routing);
+                                       # at the old cap of 20 a busy
+                                       # tick burned all 20 on imports
+                                       # and starved the journal step
+                                       # behind it (notability gate
+                                       # passes but budget.exhausted
+                                       # short-circuits write_tick_
+                                       # journal_entry). 30 leaves
+                                       # room for ~12 imports + the
+                                       # journal Sonnet call ($0.019)
+                                       # + a few routine bg calls.
 loop_max_cost_usd_per_tick = 0.50     # cost cap unchanged — Gemma is
                                        # cheap so doubling calls barely
                                        # moves the cost dial
