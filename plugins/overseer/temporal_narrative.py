@@ -326,7 +326,7 @@ def generate_daily(*, db, llm, period_start, period_end, period_label,
 WEEKLY_PROMPT_TEMPLATE = """\
 {principle}
 
-You are writing a WEEKLY SYNTHESIS — one paragraph summarizing
+You are writing a WEEKLY SYNTHESIS — short, sectioned summary of
 what the past 7 days looked like. The user will read this Sunday
 night to close the week and on Monday morning to re-orient.
 
@@ -339,7 +339,10 @@ DAILY SNAPSHOTS THIS WEEK ({n_dailies} of 7 days have one):
 YOUR (the user's) JOURNAL ENTRIES THIS WEEK:
 {human_entries_block}
 
-PROJECT MOMENTUM THIS WEEK:
+CATEGORY ACTIVITY THIS WEEK:
+{category_breakdown_block}
+
+PROJECT MOMENTUM THIS WEEK (each tagged with dominant category):
   Active (touched this week, sorted by hours):
 {active_projects_block}
   Stalled (was active last 30d but not this week):
@@ -348,24 +351,43 @@ PROJECT MOMENTUM THIS WEEK:
 OPEN QUESTIONS WITH NEW EVIDENCE THIS WEEK:
 {questions_block}
 
-FORMAT — one clean paragraph, under 220 words:
-  • One sentence on overall cadence (busy/quiet, focused/scattered).
-  • Two-three sentences naming what moved across projects, with
-    real numbers (active hours, cost, top files).
-  • One sentence on cross-project connections IF (and only if)
-    you see a genuine one — same files touched in two projects,
-    same pattern of behavior, theme reinforced from multiple
-    angles. Skip the connection if nothing pulls.
-  • One sentence on what stalled or shifted from prior weeks.
+FORMAT — sectioned synthesis, under 350 words total:
+Organize the narrative into category sections. Use these section
+markers EXACTLY:
+
+  [WORK]
+  Two-three sentences naming what moved on clinical / an employer
+  / ClientA / ProjectX / regulatory / business work this week. Real numbers
+  (hours, sessions, projects). Skip the section entirely if zero
+  activity.
+
+  [CORTEX]
+  Two-three sentences on cortex-core / cortex-desktop / overseer /
+  the memory system itself. What got built, what shifted. Skip if
+  zero activity.
+
+  [PERSONAL]
+  Two-three sentences on Open Muscle / UAP / TruthSea / personal
+  research / curiosity / non-work non-cortex. Skip if zero activity.
+
+  [CONNECTIONS]
+  ONE sentence on cross-category connections IF and only if you see
+  a genuine one (same theme surfacing in both work and personal,
+  cortex tooling enabling work, etc.). Skip entirely if nothing
+  genuinely pulls. Do not invent connections.
+
+CONSTRAINTS:
+  • Plain prose within each section. No bullet lists, no sub-headers,
+    no emoji.
+  • If a category had zero session activity this week, OMIT that
+    section header entirely (not "[WORK] (none)" — just skip it).
+  • No advice, no recommendations, no "you should" — observe and
+    name, don't coach.
   • If the user wrote journal entries, weight them: those are
     your authoritative source for what they were actually
     thinking about.
-
-CONSTRAINTS:
-  • No bullet lists. No headers. One flowing paragraph.
-  • No advice, no recommendations, no "you should" — observe and
-    name, don't coach.
-  • If the week was quiet, say so plainly in one or two sentences.
+  • If the entire week was quiet across all categories, write a
+    single short paragraph (no section markers) saying so plainly.
 
 AUTHORSHIP MARKERS — DO NOT FLATTEN:
 If the inputs above contain text matching `[B:<name>]` or
@@ -429,15 +451,100 @@ def gather_weekly_context(*, db, period_start, period_end, period_label,
     except Exception:
         questions = []
 
+    # Slice 14.7.3 (2026-05-26): category breakdown for [WORK] /
+    # [CORTEX] / [PERSONAL] section split. Count sessions per
+    # category in the window; also annotate each active project
+    # with its dominant category (most common across its sessions
+    # this window). Empty category column → 'unclassified'.
+    category_counts = _category_counts_in_window(
+        db, period_start, period_end)
+    project_categories = _project_dominant_categories(
+        db, period_start, period_end)
+    # Decorate active + stalled rows with category for the formatter
+    for p in active:
+        p["_dominant_category"] = project_categories.get(
+            p.get("project", ""), "unclassified")
+    for p in stalled:
+        p["_dominant_category"] = project_categories.get(
+            p.get("project", ""), "unclassified")
+
     return {
         "dailies": dailies,
         "human_entries": human_entries,
         "active": active,
         "stalled": stalled,
         "questions": questions,
+        "category_counts": category_counts,
         "period_label": period_label,
         "window_end_local": local_now.strftime("%Y-%m-%d"),
     }
+
+
+# ── Slice 14.7.3 helpers: category breakdown ────────────────────
+
+
+def _category_counts_in_window(db, period_start, period_end) -> dict:
+    """Count imported_sessions per category in the [start, end) window.
+    Returns {category: count}; empty/null categories bucketed as
+    'unclassified'."""
+    rows = db._conn.execute(
+        "SELECT COALESCE(NULLIF(category,''),'unclassified') AS cat, "
+        "  COUNT(*) AS n FROM imported_sessions "
+        "WHERE started_at >= ? AND started_at < ? "
+        "GROUP BY cat",
+        (period_start, period_end),
+    ).fetchall()
+    return {r["cat"]: r["n"] for r in rows}
+
+
+def _project_dominant_categories(db, period_start, period_end) -> dict:
+    """For each project that had sessions in the window, return the
+    most-common category across those sessions. Tie-break: 'work' >
+    'cortex' > 'personal' > 'unclassified' (stricter wins)."""
+    rows = db._conn.execute(
+        "SELECT project, "
+        "  COALESCE(NULLIF(category,''),'unclassified') AS cat, "
+        "  COUNT(*) AS n FROM imported_sessions "
+        "WHERE started_at >= ? AND started_at < ? "
+        "  AND project IS NOT NULL AND project != '' "
+        "GROUP BY project, cat",
+        (period_start, period_end),
+    ).fetchall()
+    by_proj: dict = {}
+    for r in rows:
+        proj, cat, n = r["project"], r["cat"], r["n"]
+        by_proj.setdefault(proj, {})[cat] = n
+    priority = {"work": 0, "cortex": 1, "personal": 2,
+                "unclassified": 3}
+    result: dict = {}
+    for proj, cats in by_proj.items():
+        # Sort by count desc, then by priority asc for tiebreak
+        result[proj] = sorted(
+            cats.items(),
+            key=lambda kv: (-kv[1], priority.get(kv[0], 9)))[0][0]
+    return result
+
+
+def _format_category_breakdown(category_counts: dict) -> str:
+    """Render the per-category session count block. Always shows
+    all 4 categories so missing ones are visibly zero (helps the
+    LLM decide which sections to skip).
+    """
+    if not category_counts:
+        return "  (no session activity recorded in this window)"
+    order = ["work", "cortex", "personal", "unclassified"]
+    out = []
+    for cat in order:
+        n = category_counts.get(cat, 0)
+        out.append(f"  {cat:14s}  {n:4d} sessions")
+    extras = {k: v for k, v in category_counts.items()
+              if k not in order}
+    for cat, n in sorted(extras.items()):
+        out.append(f"  {cat:14s}  {n:4d} sessions  (unexpected)")
+    return "\n".join(out)
+
+
+# ── end Slice 14.7.3 helpers ────────────────────────────────────
 
 
 def _format_dailies(dailies):
@@ -459,8 +566,10 @@ def _format_active_projects(active):
     for p in active[:10]:
         am_h = int((p.get("active_minutes_total") or 0) / 60)
         sc = int(p.get("session_count") or 0)
-        out.append("    - {}: {}h active, {} session(s)".format(
-            p.get("project", "?")[:40], am_h, sc))
+        # Slice 14.7.3: include dominant category tag
+        cat = p.get("_dominant_category", "unclassified")
+        out.append("    - [{}] {}: {}h active, {} session(s)".format(
+            cat, p.get("project", "?")[:40], am_h, sc))
     return "\n".join(out)
 
 
@@ -470,8 +579,9 @@ def _format_stalled_projects(stalled):
     out = []
     for p in stalled[:6]:
         last = (p.get("last_active_at") or "")[:10]
-        out.append("    - {} (last active {})".format(
-            p.get("project", "?")[:40], last))
+        cat = p.get("_dominant_category", "unclassified")
+        out.append("    - [{}] {} (last active {})".format(
+            cat, p.get("project", "?")[:40], last))
     return "\n".join(out)
 
 
@@ -491,6 +601,8 @@ def generate_weekly(*, db, llm, period_start, period_end, period_label,
         n_dailies=len(ctx["dailies"]),
         daily_snapshots_block=_format_dailies(ctx["dailies"]),
         human_entries_block=_format_human_entries(ctx["human_entries"]),
+        category_breakdown_block=_format_category_breakdown(
+            ctx.get("category_counts", {})),
         active_projects_block=_format_active_projects(ctx["active"]),
         stalled_projects_block=_format_stalled_projects(ctx["stalled"]),
         questions_block=_format_questions(ctx["questions"]),
@@ -506,10 +618,10 @@ def generate_weekly(*, db, llm, period_start, period_end, period_label,
 MONTHLY_PROMPT_TEMPLATE = """\
 {principle}
 
-You are writing a MONTHLY REVIEW — a short, light reflection on
-the past month. Lighter than weekly. The user will read this
-once and may not return to it; write something they'd want to
-re-read in a year to remember the month.
+You are writing a MONTHLY REVIEW — sectioned reflection on the
+past month. Lighter and more durable than weekly. The user will
+read this once and may not return to it; write something they'd
+want to re-read in a year to remember the month.
 
 PERIOD: {period_label}  (calendar month)
 WINDOW: {period_start} → {period_end} UTC
@@ -520,30 +632,50 @@ WEEKLY SYNTHESES THIS MONTH ({n_weeklies} weeks have one):
 YOUR (the user's) JOURNAL ENTRIES THIS MONTH (most recent {n_entries}):
 {human_entries_block}
 
-PROJECT MOMENTUM:
+CATEGORY ACTIVITY THIS MONTH:
+{category_breakdown_block}
+
+PROJECT MOMENTUM (each tagged with dominant category):
   Most active this month (by active hours):
 {active_projects_block}
 
 OPEN QUESTIONS LIFECYCLE THIS MONTH:
 {questions_block}
 
-FORMAT — one short paragraph, under 250 words:
-  • Lead with the month's overall shape — was this a heads-down
-    month, a scattered month, a quiet month?
-  • Two to three sentences on theme consistency: which threads
-    showed up week after week, which appeared and disappeared.
-  • One sentence on open question lifecycle: did anything resolve,
-    pick up steam, go dormant?
-  • One closing sentence — one observation worth carrying forward.
-    Not advice. Just a thing worth noticing.
+FORMAT — sectioned synthesis, under 400 words total:
+Use these section markers EXACTLY when each has activity:
+
+  [WORK]
+  Two-three sentences on clinical / an employer / ClientA / ProjectX /
+  business/regulatory work. What moved, what stalled, what shifted
+  vs prior month. Skip the section entirely if zero work activity.
+
+  [CORTEX]
+  Two-three sentences on cortex-core / cortex-desktop / overseer /
+  the memory system. Major builds, architectural decisions, slice
+  shipments. Skip if zero activity.
+
+  [PERSONAL]
+  Two-three sentences on Open Muscle / UAP / TruthSea / personal
+  research / curiosity / life. Skip if zero activity.
+
+  [ARC]
+  ONE-TWO sentences. The single observation worth carrying forward
+  about THIS month — pattern of behavior, theme that strengthened,
+  thing that's becoming the signature. Not advice. Just a thing
+  worth noticing. Always include this section if any others fired.
 
 CONSTRAINTS:
-  • No bullet lists. No headers. One flowing paragraph.
+  • Plain prose within each section. No bullet lists, no sub-headers,
+    no emoji.
+  • If the entire month was sparse (fewer than 2 weeklies, no
+    journal entries), write a single short paragraph (no section
+    markers) saying so and stop.
   • Lighter than weekly — the monthly is for orientation, not
-    inventory. If you find yourself listing every project, you're
-    writing the wrong thing.
-  • If the month was sparse (fewer than 2 weeklies, no journal
-    entries), say so in two sentences and stop.
+    inventory. If you find yourself listing every project under
+    [WORK] or [PERSONAL], compress.
+  • No advice, no recommendations, no "you should" — observe and
+    name.
 
 AUTHORSHIP MARKERS — DO NOT FLATTEN:
 If the inputs above contain text matching `[B:<name>]` or
@@ -594,11 +726,21 @@ def gather_monthly_context(*, db, period_start, period_end, period_label,
     except Exception:
         questions = []
 
+    # Slice 14.7.3: category breakdown for monthly section split.
+    category_counts = _category_counts_in_window(
+        db, period_start, period_end)
+    project_categories = _project_dominant_categories(
+        db, period_start, period_end)
+    for p in active:
+        p["_dominant_category"] = project_categories.get(
+            p.get("project", ""), "unclassified")
+
     return {
         "weeklies": weeklies,
         "human_entries": human_entries,
         "active": active,
         "questions": questions,
+        "category_counts": category_counts,
         "period_label": period_label,
     }
 
@@ -631,6 +773,8 @@ def generate_monthly(*, db, llm, period_start, period_end, period_label,
         weekly_block=_format_weeklies(ctx["weeklies"]),
         n_entries=len(ctx["human_entries"]),
         human_entries_block=_format_human_entries(ctx["human_entries"]),
+        category_breakdown_block=_format_category_breakdown(
+            ctx.get("category_counts", {})),
         active_projects_block=_format_active_projects(ctx["active"]),
         questions_block=_format_questions(ctx["questions"]),
     )
@@ -717,33 +861,56 @@ MONTHLY REVIEWS THIS YEAR ({n_monthlies} of 12 months have one):
 YOUR (the user's) JOURNAL ENTRIES THIS YEAR (most recent {n_entries}):
 {human_entries_block}
 
-PROJECTS THAT MOVED THIS YEAR (top by active hours):
+CATEGORY ACTIVITY THIS YEAR:
+{category_breakdown_block}
+
+PROJECTS THAT MOVED THIS YEAR (top by active hours, tagged with category):
 {active_projects_block}
 
 OPEN QUESTIONS THAT GAINED EVIDENCE THIS YEAR:
 {questions_block}
 
-FORMAT — one short paragraph, under 300 words:
-  • One sentence on the year's overall arc — what was this year
-    fundamentally about?
-  • Two-three sentences on the recurring themes / projects /
-    questions that defined it. Name the ones that stayed live
-    across multiple months.
-  • One sentence on what's CARRYING FORWARD — questions still
-    unresolved, projects still active. Not a "next year" plan,
-    just the live threads as they stand.
-  • If you find yourself listing every project, you're writing
-    the wrong thing. The yearly is for orientation across years,
-    not inventory of the year.
+FORMAT — sectioned synthesis, under 500 words total:
+Use these section markers EXACTLY when each has activity:
+
+  [WORK]
+  Two-three sentences on the year's arc in clinical / an employer /
+  ClientA / ProjectX / business — what stayed live across months, what
+  resolved, what kept showing up. Skip if zero work activity.
+
+  [CORTEX]
+  Two-three sentences on the cortex memory system arc — major
+  architectural shifts, the slices that defined the year, what
+  the system became. Skip if zero activity.
+
+  [PERSONAL]
+  Two-three sentences on Open Muscle / UAP / research / personal
+  exploration — the threads that lived across months. Skip if
+  zero activity.
+
+  [ARC]
+  Two-three sentences. What was this YEAR fundamentally about?
+  What's the shape of it from a distance? This is the single
+  observation you'd want to re-read in 5 years to remember what
+  THIS year was. Not a list — a thesis. Always include if any
+  other section fired.
+
+  [CARRYING FORWARD]
+  ONE sentence. The live threads as they stand at year-end —
+  questions still unresolved, projects still active. Not a "next
+  year plan." Just what's still moving. Skip if there's nothing
+  meaningfully live.
 
 CONSTRAINTS:
-  • No bullet lists. No headers. One flowing paragraph.
+  • Plain prose within each section. No bullet lists, no sub-headers,
+    no emoji.
+  • If the entire year was sparse (fewer than 3 monthlies, no
+    journal entries), write a single short paragraph saying so
+    and stop.
   • Lighter than monthly even though the window is bigger — the
-    yearly compresses 12 months into one paragraph by design.
-  • If the year was sparse (fewer than 3 monthlies, no journal
-    entries), say so plainly in two sentences and stop.
+    yearly compresses 12 months by design.
   • Write in past tense for the year itself; present tense for
-    what's still live.
+    [CARRYING FORWARD].
 
 AUTHORSHIP MARKERS — DO NOT FLATTEN:
 If the inputs above contain text matching `[B:<name>]` or
@@ -789,11 +956,21 @@ def gather_yearly_context(*, db, period_start, period_end, period_label,
     except Exception:
         questions = []
 
+    # Slice 14.7.3: category breakdown for yearly section split.
+    category_counts = _category_counts_in_window(
+        db, period_start, period_end)
+    project_categories = _project_dominant_categories(
+        db, period_start, period_end)
+    for p in active:
+        p["_dominant_category"] = project_categories.get(
+            p.get("project", ""), "unclassified")
+
     return {
         "monthlies": monthlies,
         "human_entries": human_entries,
         "active": active,
         "questions": questions,
+        "category_counts": category_counts,
         "period_label": period_label,
     }
 
@@ -826,6 +1003,8 @@ def generate_yearly(*, db, llm, period_start, period_end, period_label,
         monthly_block=_format_monthlies(ctx["monthlies"]),
         n_entries=len(ctx["human_entries"]),
         human_entries_block=_format_human_entries(ctx["human_entries"]),
+        category_breakdown_block=_format_category_breakdown(
+            ctx.get("category_counts", {})),
         active_projects_block=_format_active_projects(ctx["active"]),
         questions_block=_format_questions(ctx["questions"]),
     )

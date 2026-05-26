@@ -370,6 +370,15 @@ class OverseerPlugin(Plugin):
                   self._http_sensitivity_status),
             Route("POST", "/sensitivity/backfill",
                   self._http_sensitivity_backfill),
+            # ── Slice 14.7.3 (2026-05-26): work/cortex/personal ──
+            Route("GET",  "/category/status",
+                  self._http_category_status),
+            Route("POST", "/category/backfill-rules",
+                  self._http_category_backfill_rules),
+            Route("POST", "/category/classify-batch",
+                  self._http_category_classify_batch),
+            Route("POST", "/category/set",
+                  self._http_category_set),
         ]
 
     # ── Lifecycle ───────────────────────────────────────────────
@@ -2230,6 +2239,91 @@ class OverseerPlugin(Plugin):
                     "stats": self.overseer_db.sensitivity_stats()}
         except Exception as e:
             log.exception("sensitivity_backfill failed")
+            return {"ok": False, "error": str(e)}
+
+    # ── Slice 14.7.3 (2026-05-26): category classifier ──────────
+
+    def _http_category_status(self, payload):
+        """GET /plugins/overseer/category/status — counts by category +
+        a per-source breakdown of the still-unclassified rows."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        try:
+            return {"ok": True, **self.overseer_db.category_stats()}
+        except Exception as e:
+            log.exception("category_status failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_category_backfill_rules(self, payload):
+        """POST /plugins/overseer/category/backfill-rules — apply the
+        deterministic rule classifier (cwd patterns + sensitivity)
+        across all imported_sessions.
+
+        body: {only_unset: bool (default true)}
+        only_unset=true skips rows that already carry a non-empty
+        category, so LLM-classifier results and manual overrides
+        aren't clobbered.
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        only_unset = bool((payload or {}).get("only_unset", True))
+        try:
+            result = self.overseer_db.backfill_categories(
+                only_unset=only_unset)
+            return {"ok": True, **result,
+                    "stats": self.overseer_db.category_stats()}
+        except Exception as e:
+            log.exception("category_backfill_rules failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_category_set(self, payload):
+        """POST /plugins/overseer/category/set — manual override.
+        body: {imported_id: str, category: 'work'|'cortex'|'personal'|
+               'unclassified'}"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        imp_id = (payload or {}).get("imported_id") or ""
+        cat = (payload or {}).get("category") or ""
+        if not imp_id or not cat:
+            return {"ok": False,
+                    "error": "imported_id + category required"}
+        try:
+            ok = self.overseer_db.set_session_category(
+                imp_id, category=cat, set_by="manual")
+            return {"ok": ok, "imported_id": imp_id, "category": cat}
+        except Exception as e:
+            log.exception("category_set failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_category_classify_batch(self, payload):
+        """POST /plugins/overseer/category/classify-batch — Flash
+        classifies a batch of unclassified web-AI sessions.
+
+        body: {limit: int (default 200), max_cost_usd: float
+               (default 1.0), source: str (filter, optional)}
+
+        For each unclassified session: parse the first user message
+        from the .jsonl, ask Flash to classify as work/cortex/
+        personal, write the result. Hard cost cap enforced. Returns
+        per-category counts + cost.
+        """
+        if self.overseer_db is None or self.llm is None:
+            return {"ok": False,
+                    "error": "overseer not fully initialized"}
+        limit = int((payload or {}).get("limit") or 200)
+        max_cost = float((payload or {}).get("max_cost_usd") or 1.0)
+        source = (payload or {}).get("source") or None
+        try:
+            from category_classifier import run_batch
+            result = run_batch(
+                db=self.overseer_db, llm=self.llm,
+                limit=limit, max_cost_usd=max_cost,
+                source=source, log=log,
+            )
+            return {"ok": True, **result,
+                    "stats": self.overseer_db.category_stats()}
+        except Exception as e:
+            log.exception("category_classify_batch failed")
             return {"ok": False, "error": str(e)}
 
     def _http_distill_corrections(self, payload):

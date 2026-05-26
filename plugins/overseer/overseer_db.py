@@ -1657,6 +1657,38 @@ class OverseerDB(CortexDB):
                     f"{col} TEXT NOT NULL DEFAULT ''"
                 )
         self._safe_commit()
+        self._migrate_14_7_3_category_column()
+
+    def _migrate_14_7_3_category_column(self):
+        """Slice 14.7.3 (2026-05-26): add category column to
+        imported_sessions for work / cortex / personal / unclassified
+        tagging. Powers the [WORK] / [CORTEX] / [PERSONAL] section
+        split in temporal narrative prompts. Set by:
+          - rule-based classifier (cwd patterns + sensitivity) on
+            schema migrate (one-time backfill of cwd-signal rows)
+          - LLM classifier (Flash) for the web-AI bulk (no cwd)
+          - manual override via /imports/set-category endpoint
+        Default '' = unclassified.
+        """
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(imported_sessions)"
+        ).fetchall()}
+        if "category" not in cols:
+            self._conn.execute(
+                "ALTER TABLE imported_sessions ADD COLUMN "
+                "category TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.execute(
+                "ALTER TABLE imported_sessions ADD COLUMN "
+                "category_set_by TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.execute(
+                "ALTER TABLE imported_sessions ADD COLUMN "
+                "category_set_at TEXT NOT NULL DEFAULT ''"
+            )
+            self._safe_commit()
+            log.info("_migrate_14_7_3: category columns added; run "
+                     "backfill_categories() to populate cwd-signal rows")
 
     def _migrate_9_6_notification_actions(self):
         """Slice 9.6 CP1 (2026-05-19): notifications gain actions_json
@@ -6107,6 +6139,178 @@ class OverseerDB(CortexDB):
             counts[tier] = counts.get(tier, 0) + 1
         self._safe_commit()
         return {"scanned": len(rows), "by_tier": counts}
+
+    # ── Slice 14.7.3 (2026-05-26): work/personal/cortex category ──
+
+    # Rule order: first match wins. Confidential sensitivity short-
+    # circuits to work (ProjectX/ClientB/clinical). Then cwd patterns, then
+    # web-AI fallthrough to unclassified (for LLM classifier later).
+    _CATEGORY_RULES = [
+        # (kind, pattern, category)
+        # kind ∈ {'sensitivity', 'cwd_lower_contains', 'project_lower_contains', 'source_eq'}
+        ("sensitivity",         "confidential",      "work"),
+        ("sensitivity",         "restricted",        "work"),
+        ("cwd_lower_contains",  "ClientA",              "work"),
+        ("cwd_lower_contains",  "workuser",      "work"),
+        ("cwd_lower_contains",  "clientb",          "work"),
+        ("cwd_lower_contains",  "employer",            "work"),
+        ("cwd_lower_contains",  "employer",           "work"),
+        ("cwd_lower_contains",  "infusion",          "work"),
+        ("cwd_lower_contains",  "ClientD",    "work"),
+        ("cwd_lower_contains",  "ProjectX",               "work"),
+        ("cwd_lower_contains",  "sidegig",            "work"),
+        # cortex bucket — Cortex itself + its sibling repos
+        ("cwd_lower_contains",  "cortex-pet",        "cortex"),
+        ("cwd_lower_contains",  "cortex-link",       "cortex"),
+        ("cwd_lower_contains",  "cortex-mcp",        "cortex"),
+        ("cwd_lower_contains",  "cortex-desktop",    "cortex"),
+        ("cwd_lower_contains",  "cortex-core",       "cortex"),
+        ("cwd_lower_contains",  "cortex",            "cortex"),
+        # personal — Tory's own ventures and exploration projects
+        ("cwd_lower_contains",  "openmuscle",        "personal"),
+        ("cwd_lower_contains",  "open-muscle",       "personal"),
+        ("cwd_lower_contains",  "flexgrid",          "personal"),
+        ("cwd_lower_contains",  "truthsea",          "personal"),
+        ("cwd_lower_contains",  "uap-gerb",          "personal"),
+        ("cwd_lower_contains",  "uap_gerb",          "personal"),
+        ("cwd_lower_contains",  "ufosint",           "personal"),
+        ("cwd_lower_contains",  "polymarket",        "personal"),
+        ("cwd_lower_contains",  "monofonic",         "personal"),
+        ("cwd_lower_contains",  "smallcode",         "personal"),
+        ("cwd_lower_contains",  "godisgood",         "personal"),
+        ("cwd_lower_contains",  "lemon",             "personal"),
+        # project field also worth checking
+        ("project_lower_contains", "openmuscle",     "personal"),
+        ("project_lower_contains", "cortex",         "cortex"),
+        ("project_lower_contains", "ClientA",           "work"),
+        ("project_lower_contains", "ProjectX",            "work"),
+        ("project_lower_contains", "client-d", "work"),
+    ]
+
+    def resolve_category(self, *, cwd="", source="", project="",
+                          sensitivity="") -> dict:
+        """Rule-based classifier — Slice 14.7.3.
+
+        Returns {category, set_by, matched_rule}. category is one of:
+          'work' | 'cortex' | 'personal' | 'unclassified'
+
+        'unclassified' is the default for sessions where no rule
+        matches — typically web-AI conversations (chatgpt, grok-com,
+        grok-twitter) that have no cwd. Those get a follow-up pass
+        by the Flash LLM classifier.
+        """
+        cwd_l = (cwd or "").lower()
+        proj_l = (project or "").lower()
+        sens = (sensitivity or "").lower()
+        for kind, pattern, cat in self._CATEGORY_RULES:
+            hit = False
+            if kind == "sensitivity":
+                hit = (sens == pattern)
+            elif kind == "cwd_lower_contains":
+                hit = bool(cwd_l) and (pattern in cwd_l)
+            elif kind == "project_lower_contains":
+                hit = bool(proj_l) and (pattern in proj_l)
+            elif kind == "source_eq":
+                hit = (source == pattern)
+            if hit:
+                return {
+                    "category": cat,
+                    "set_by": "rule",
+                    "matched_rule": f"{kind}:{pattern}",
+                }
+        return {
+            "category": "unclassified",
+            "set_by": "rule-no-match",
+            "matched_rule": None,
+        }
+
+    def backfill_categories(self, *, only_unset=True) -> dict:
+        """Apply rule-based classifier to existing imported_sessions.
+        only_unset=True skips rows that already carry a non-empty
+        category (so LLM-classifier results and manual overrides
+        aren't clobbered).
+
+        Returns {scanned, by_category, by_set_by}.
+        """
+        sql = ("SELECT id, cwd, source, project, sensitivity "
+               "FROM imported_sessions")
+        if only_unset:
+            sql += " WHERE COALESCE(category,'') = ''"
+        rows = self._conn.execute(sql).fetchall()
+        cat_counts: dict = {}
+        for r in rows:
+            res = self.resolve_category(
+                cwd=r["cwd"], source=r["source"],
+                project=r["project"], sensitivity=r["sensitivity"])
+            self._conn.execute(
+                "UPDATE imported_sessions SET category = ?, "
+                "  category_set_by = ?, "
+                "  category_set_at = datetime('now') WHERE id = ?",
+                (res["category"], res["set_by"], r["id"]),
+            )
+            cat_counts[res["category"]] = (
+                cat_counts.get(res["category"], 0) + 1)
+        self._safe_commit()
+        return {"scanned": len(rows), "by_category": cat_counts}
+
+    def set_session_category(self, imported_id: str, *, category: str,
+                              set_by: str = "manual") -> bool:
+        """Explicit category set — used by LLM classifier batch +
+        manual overrides. Allowed categories enforced."""
+        if category not in ("work", "cortex", "personal",
+                             "unclassified"):
+            raise ValueError(f"invalid category: {category}")
+        cur = self._conn.execute(
+            "UPDATE imported_sessions SET category = ?, "
+            "  category_set_by = ?, "
+            "  category_set_at = datetime('now') WHERE id = ?",
+            (category, set_by, imported_id),
+        )
+        self._safe_commit()
+        return cur.rowcount > 0
+
+    def category_stats(self) -> dict:
+        """Headline counts by category."""
+        rows = self._conn.execute(
+            "SELECT COALESCE(NULLIF(category,''),'(unset)') AS cat, "
+            "  COUNT(*) AS n FROM imported_sessions GROUP BY cat "
+            "ORDER BY n DESC"
+        ).fetchall()
+        by_cat = {r["cat"]: r["n"] for r in rows}
+        # Also break down by source within unclassified — that's the
+        # population the LLM classifier needs to chew on.
+        unclassified_by_source = {}
+        for r in self._conn.execute(
+            "SELECT source, COUNT(*) AS n FROM imported_sessions "
+            "WHERE COALESCE(category,'') IN ('','unclassified') "
+            "GROUP BY source ORDER BY n DESC"
+        ).fetchall():
+            unclassified_by_source[r["source"]] = r["n"]
+        return {
+            "by_category": by_cat,
+            "unclassified_by_source": unclassified_by_source,
+        }
+
+    def list_unclassified_sessions(self, *, source=None,
+                                    limit=200) -> list:
+        """For the LLM classifier batch path. Returns sessions where
+        category is empty or 'unclassified', filtered by source if
+        given. Ordered by started_at DESC so newest hit first.
+        """
+        sql = ("SELECT id, source, source_path, project, cwd, "
+               "started_at, metadata_json "
+               "FROM imported_sessions "
+               "WHERE COALESCE(category,'') IN ('','unclassified')")
+        params: list = []
+        if source:
+            sql += " AND source = ?"
+            params.append(source)
+        sql += " ORDER BY started_at DESC LIMIT ?"
+        params.append(int(limit))
+        return [dict(r) for r in
+                self._conn.execute(sql, params).fetchall()]
+
+    # ── end Slice 14.7.3 ────────────────────────────────────────
 
     def sensitivity_stats(self) -> dict:
         """Headline counts by tier across imported_sessions."""

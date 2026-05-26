@@ -71,6 +71,10 @@ secrets_paths = [
 # tagging is a small structured task — model choice doesn't move
 # tagging quality much, but it does move cost ~30x.
 "auto-tag-notes"    = "google/gemini-2.0-flash-001"
+# Slice 14.7.3 (2026-05-26): work/cortex/personal one-word classifier
+# for web-AI sessions (chatgpt/grok-com without cwd). 8-token output,
+# routine pattern match — Flash is exactly the right tier.
+"category-classify" = "google/gemini-2.0-flash-001"
 # Slice 14.7 (2026-05-22): router-tier chat. Flash sits in front of
 # Opus-overseer, handles routine turns with thin context, escalates
 # when the question needs the full agent. ~30x cheaper than Opus.
@@ -85,6 +89,13 @@ secrets_paths = [
 # honest reflection, not literary work, and at 5min ticks the cost
 # stays trivial. Override to Opus for deeper introspection if desired.
 "overseer-journal"  = "anthropic/claude-sonnet-4.6"
+# Slice 14.7.3 (2026-05-26): temporal weeklies on Sonnet. 4-5x
+# cheaper than Opus, plenty of capability for synthesizing 7
+# dailies + the category breakdown into a sectioned paragraph.
+# Monthly + yearly stay on the default (Opus) — those are the
+# durable artifacts Tory will re-read in years and deserve the
+# bigger model.
+"temporal-weekly"   = "anthropic/claude-sonnet-4.6"
 # Slice 3f.5 #2: question-centered routing. Each new gist gets routed
 # (or "unfiled") against active open_questions.
 # Slice 14.5 (2026-05-22): moved Sonnet → Gemini 2.0 Flash. ~30x
@@ -146,20 +157,27 @@ working_memory_recent_rollups = 5         # daily automation rollups
 # Cost guards prevent a runaway loop from burning credits.
 loop_enabled = true
 loop_first_tick_delay_s = 30            # don't hammer the LLM at startup
-loop_max_llm_calls_per_tick = 30      # Slice 14.7.1 (2026-05-26):
-                                       # bumped 20 → 30. Import drain
-                                       # consumes 2 calls per session
-                                       # (summarize + evidence-routing);
-                                       # at the old cap of 20 a busy
-                                       # tick burned all 20 on imports
-                                       # and starved the journal step
-                                       # behind it (notability gate
-                                       # passes but budget.exhausted
-                                       # short-circuits write_tick_
-                                       # journal_entry). 30 leaves
-                                       # room for ~12 imports + the
-                                       # journal Sonnet call ($0.019)
-                                       # + a few routine bg calls.
+loop_max_llm_calls_per_tick = 50      # Slice 14.7.1 (2026-05-26):
+                                       # bumped 20 → 30 → 50. 30 was
+                                       # still tight: ticks were
+                                       # processing exactly 15 imports
+                                       # (30 calls / 2 per session) and
+                                       # then hitting calls_remaining=0
+                                       # right when the journal step's
+                                       # budget.exhausted() check ran.
+                                       # 50 gives ~20 imports + journal
+                                       # Sonnet (~$0.019) + routing
+                                       # overhead + headroom for the
+                                       # working-memory neighbor scan.
+                                       # Cost rail still binding via
+                                       # the $0.50/tick cost cap, which
+                                       # at Flash rates of ~$0.001/call
+                                       # is well under 50 × $0.001.
+                                       # Follow-up: the import step
+                                       # should reserve ~3 calls for
+                                       # downstream steps so it stops
+                                       # before exhausting the tick
+                                       # entirely. Filed in tasks.
 loop_max_cost_usd_per_tick = 0.50     # cost cap unchanged — Gemma is
                                        # cheap so doubling calls barely
                                        # moves the cost dial
