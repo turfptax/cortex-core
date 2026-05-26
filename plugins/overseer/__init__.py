@@ -1344,25 +1344,39 @@ class OverseerPlugin(Plugin):
 
         local_now = temporal_clock.now_local()
 
-        # Period bounds — same per-kind dispatch as the loop.
-        if kind == "daily":
-            period_start, period_end, period_label = (
-                temporal_clock.today_local_bounds(local_now))
-        elif kind == "weekly":
-            period_start, period_end, period_label = (
-                temporal_clock.week_local_bounds(local_now))
-        elif kind == "monthly":
-            period_start, period_end, period_label = (
-                temporal_clock.previous_month_local_bounds(local_now))
-        else:  # yearly
-            period_start, period_end, period_label = (
-                temporal_clock.previous_year_local_bounds(local_now))
-
-        # Allow caller to override period_label (re-generate an
-        # arbitrary historical period for testing).
+        # Period bounds — when caller supplies period_label, derive
+        # bounds FROM the label so historical regens actually pull
+        # historical data. Slice 14.7.3 (2026-05-26) bug-fix: the
+        # earlier code path only replaced the label string while
+        # keeping the current-period bounds, which silently
+        # regenerated current-period content under fake labels.
         override_label = (payload.get("period_label") or "").strip()
         if override_label:
-            period_label = override_label
+            try:
+                period_start, period_end, period_label = (
+                    temporal_clock.bounds_for_label(
+                        kind, override_label, local_now))
+            except Exception as e:
+                return {"ok": False,
+                        "error": (f"invalid period_label "
+                                  f"'{override_label}' for kind "
+                                  f"'{kind}': {e}")}
+        else:
+            # Default: the same per-kind dispatch the loop uses.
+            if kind == "daily":
+                period_start, period_end, period_label = (
+                    temporal_clock.today_local_bounds(local_now))
+            elif kind == "weekly":
+                period_start, period_end, period_label = (
+                    temporal_clock.week_local_bounds(local_now))
+            elif kind == "monthly":
+                period_start, period_end, period_label = (
+                    temporal_clock.previous_month_local_bounds(
+                        local_now))
+            else:  # yearly
+                period_start, period_end, period_label = (
+                    temporal_clock.previous_year_local_bounds(
+                        local_now))
 
         existing = self.overseer_db.get_temporal_narrative(
             kind, period_label)

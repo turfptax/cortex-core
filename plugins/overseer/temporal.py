@@ -200,6 +200,79 @@ def previous_year_local_bounds(local_now: datetime | None = None
     )
 
 
+def bounds_for_label(kind: str, period_label: str,
+                       local_now: datetime | None = None
+                       ) -> tuple[str, str, str]:
+    """Slice 14.7.3 (2026-05-26): convert a kind+label pair to the
+    correct (period_start_utc, period_end_utc, period_label) tuple.
+
+    Used by POST /temporal/generate when the caller supplies a
+    period_label override — previously the endpoint only replaced
+    the label string while keeping the CURRENT-period bounds, which
+    silently regenerated the current period's content under a fake
+    historical label. This function does the inverse mapping cleanly.
+
+    Label formats per kind:
+      daily   — "YYYY-MM-DD"
+      weekly  — "YYYY-Www"      (ISO week, e.g. "2026-W21")
+      monthly — "YYYY-MM"
+      yearly  — "YYYY"
+
+    Returns the same shape as the other *_local_bounds helpers.
+    """
+    if local_now is None:
+        local_now = now_local()
+    tz = local_now.tzinfo
+    s = (period_label or "").strip()
+
+    if kind == "daily":
+        # YYYY-MM-DD
+        from datetime import date
+        y, m, d = (int(x) for x in s.split("-"))
+        start_date = date(y, m, d)
+        start_local = datetime.combine(start_date, time.min, tzinfo=tz)
+        end_local = start_local + timedelta(days=1)
+        return (format_utc_iso(start_local),
+                format_utc_iso(end_local), s)
+
+    if kind == "weekly":
+        # YYYY-Www  (ISO 8601 week)
+        y_str, w_str = s.split("-W")
+        y, w = int(y_str), int(w_str)
+        # ISO week's Monday: fromisocalendar(year, week, 1)
+        from datetime import date
+        monday = date.fromisocalendar(y, w, 1)
+        start_local = datetime.combine(monday, time.min, tzinfo=tz)
+        end_local = start_local + timedelta(days=7)
+        return (format_utc_iso(start_local),
+                format_utc_iso(end_local), s)
+
+    if kind == "monthly":
+        # YYYY-MM
+        y_str, m_str = s.split("-")
+        y, m = int(y_str), int(m_str)
+        from datetime import date
+        first = date(y, m, 1)
+        if m == 12:
+            next_first = date(y + 1, 1, 1)
+        else:
+            next_first = date(y, m + 1, 1)
+        start_local = datetime.combine(first, time.min, tzinfo=tz)
+        end_local = datetime.combine(next_first, time.min, tzinfo=tz)
+        return (format_utc_iso(start_local),
+                format_utc_iso(end_local), s)
+
+    if kind == "yearly":
+        # YYYY
+        y = int(s)
+        start_local = datetime(y, 1, 1, tzinfo=tz)
+        end_local = datetime(y + 1, 1, 1, tzinfo=tz)
+        return (format_utc_iso(start_local),
+                format_utc_iso(end_local), s)
+
+    raise ValueError(f"bounds_for_label: unknown kind '{kind}'")
+
+
 # ── Trigger predicates ──────────────────────────────────────────
 #
 # All cadence triggers are anchored to local-22:00 (10pm). The loop
