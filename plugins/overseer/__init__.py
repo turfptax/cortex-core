@@ -2164,23 +2164,32 @@ class OverseerPlugin(Plugin):
 
     def _http_imports_process_targeted(self, payload):
         """POST /plugins/overseer/imports/process-targeted
-        body: {cwd_likes: [...], limit: int, max_cost_usd: float}
+        body: {cwd_likes: [...], source_likes: [...], limit: int,
+               max_cost_usd: float}
 
-        Process ONLY imported_sessions matching the cwd LIKE
-        patterns. Used to drain a specific cohort (the work-computer
-        ClientA sessions) with a hard cost cap, without touching the
-        rest of the unprocessed backlog."""
+        Process ONLY imported_sessions matching cwd_likes and/or
+        source_likes (provide at least one). Used to drain a specific
+        cohort with a hard cost cap, without touching the rest of the
+        unprocessed backlog.
+
+        Slice 14.7.2 (2026-05-26): source_likes added for the grok
+        backfill drain. Web-archive imports (grok-com, chatgpt,
+        twitter) have no cwd so the cwd filter alone couldn't reach
+        them.
+        """
         if self.loop is None:
             return {"ok": False, "error": "loop not initialized"}
         cwd_likes = (payload or {}).get("cwd_likes") or []
-        if not cwd_likes:
-            return {"ok": False, "error": "cwd_likes (non-empty) required"}
+        source_likes = (payload or {}).get("source_likes") or []
+        if not cwd_likes and not source_likes:
+            return {"ok": False,
+                    "error": "cwd_likes or source_likes (non-empty) required"}
         limit = int((payload or {}).get("limit") or 100)
         max_cost = float((payload or {}).get("max_cost_usd") or 4.0)
         try:
             summary = self.loop.process_imports_targeted(
-                cwd_likes=cwd_likes, limit=limit,
-                max_cost_usd=max_cost)
+                cwd_likes=cwd_likes, source_likes=source_likes,
+                limit=limit, max_cost_usd=max_cost)
             return {"ok": summary.get("ok", True), "summary": summary}
         except Exception as e:
             log.exception("process_imports_targeted failed")

@@ -1092,22 +1092,32 @@ class OverseerLoop:
                 self._log.warning(
                     "reactivation notification failed: %s", e)
 
-    def process_imports_targeted(self, *, cwd_likes, limit=100,
-                                  max_cost_usd=4.0,
+    def process_imports_targeted(self, *, cwd_likes=None, source_likes=None,
+                                  limit=100, max_cost_usd=4.0,
                                   max_calls=None) -> dict:
         """Slice work-org (2026-05-21): process ONLY imported_sessions
-        whose cwd matches one of the LIKE patterns in ``cwd_likes``.
+        matching the given filter(s).
 
-        Used by POST /imports/process-targeted to drain a specific
-        cohort (e.g. the work-computer ClientA sessions) without
-        touching the rest of the unprocessed backlog. Bypasses the
-        daily budget (escape hatch, like /backfill) but enforces a
-        hard ``max_cost_usd`` cap so the caller controls spend.
+        Used to drain a specific cohort without touching the rest of
+        the unprocessed backlog. Bypasses the daily budget (escape
+        hatch, like /backfill) but enforces a hard ``max_cost_usd``
+        cap so the caller controls spend.
 
-        cwd_likes: list of SQL LIKE patterns, e.g.
-            ['%ClientA%', '%workuser%', '%/home/workuser%']
+        Filters (provide at least one):
+          cwd_likes:    list of SQL LIKE patterns matched against cwd
+                        e.g. ['%ClientA%', '%workuser%']
+          source_likes: list of SQL LIKE patterns matched against
+                        source. Added Slice 14.7.2 (2026-05-26) for
+                        the grok-com backfill drain — sessions
+                        imported from web archives have no cwd, so
+                        the cwd filter alone couldn't reach them.
+                        e.g. ['grok-com', 'chatgpt']
+
         Returns a summary dict.
         """
+        if not (cwd_likes or source_likes):
+            return {"ok": False,
+                    "error": "must provide cwd_likes and/or source_likes"}
         if not self._tick_lock.acquire(blocking=False):
             return {"ok": False,
                     "skipped": "a tick or backfill is already running"}
@@ -1121,17 +1131,31 @@ class OverseerLoop:
             summary = {
                 "ok": True, "kind": "imports-targeted",
                 "started_at": _utc_iso(),
-                "cwd_likes": list(cwd_likes),
+                "cwd_likes": list(cwd_likes or []),
+                "source_likes": list(source_likes or []),
                 "skipped_due_to_budget": [],
                 "errors": [],
             }
-            # Find matching unprocessed sessions.
-            where = " OR ".join(["cwd LIKE ?"] * len(cwd_likes))
+            # Build the WHERE: cwd matches OR source matches (union).
+            where_clauses: list[str] = []
+            where_params: list = []
+            if cwd_likes:
+                where_clauses.extend(["cwd LIKE ?"] * len(cwd_likes))
+                where_params.extend(cwd_likes)
+            if source_likes:
+                where_clauses.extend(["source LIKE ?"] * len(source_likes))
+                where_params.extend(source_likes)
+            where = " OR ".join(where_clauses)
+            # Filter out already-processed at SQL level so big cohorts
+            # (e.g. the full grok-com source) don't waste the LIMIT
+            # window on already-done rows.
             rows = self._db._conn.execute(
-                f"SELECT * FROM imported_sessions "
-                f"WHERE ({where}) "
-                f"ORDER BY started_at ASC LIMIT ?",
-                (*cwd_likes, int(limit) * 3),
+                f"SELECT i.* FROM imported_sessions i "
+                f"LEFT JOIN processed_imported_sessions p "
+                f"  ON p.imported_id = i.id "
+                f"WHERE p.imported_id IS NULL AND ({where}) "
+                f"ORDER BY i.started_at ASC LIMIT ?",
+                (*where_params, int(limit) * 3),
             ).fetchall()
             candidates = [dict(r) for r in rows]
             unprocessed = [
