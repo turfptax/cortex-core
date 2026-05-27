@@ -2620,11 +2620,61 @@ class OverseerPlugin(Plugin):
                     caller_id=caller_id,
                 )
 
+        # ── Layered returns (Slice 14.8, 2026-05-27) ───────────────
+        # Per three_layer_architecture_design_seed.md, the response is
+        # grouped into abstractions (Layer 1) / gists (Layer 2) / raw_refs
+        # (Layer 3). The flat `hits` array is kept for backward compat
+        # so existing callers don't break; new consumers should prefer
+        # the layered buckets to walk top-down.
+        ABSTRACTION_KINDS = {
+            "theme", "episode", "pattern", "drift", "future_note",
+            "journal_entry", "temporal_narrative", "question",
+            "blindspot", "human_journal_entry",
+        }
+        abstractions = []
+        gists_out = []
+        raw_refs = []
+        seen_raw_ids = set()
+        for h in hits:
+            kind = h.get("kind", "")
+            if kind == "gist":
+                # Extract raw_id from period_label when it points back
+                # at an imported_session (format: "<source>:<id>" such
+                # as "grok-com:abc123" or "claude-jsonl:def456").
+                period_label = (h.get("extras") or {}).get(
+                    "period_label") or ""
+                raw_id = period_label if ":" in period_label else None
+                gist_out = dict(h)
+                if raw_id:
+                    gist_out["raw_id"] = raw_id
+                    if raw_id not in seen_raw_ids:
+                        raw_refs.append({
+                            "raw_id": raw_id,
+                            "linked_gist_token": h.get("token"),
+                            "note": ("Layer 3 raw source. Drill via "
+                                     "imported_sessions; Slice 13 "
+                                     "sensitivity rules apply at "
+                                     "fetch time."),
+                        })
+                        seen_raw_ids.add(raw_id)
+                gists_out.append(gist_out)
+            elif kind in ABSTRACTION_KINDS:
+                abstractions.append(h)
+            else:
+                # Unknown kind — degrade to abstractions so nothing
+                # disappears from the layered view.
+                abstractions.append(h)
+
         return {
             "ok": True,
             "query": q,
             "kinds_searched": kinds,
+            # Flat list kept for backward compat.
             "hits": hits,
+            # Layered per three_layer_architecture_design_seed.md.
+            "abstractions": abstractions,
+            "gists": gists_out,
+            "raw_refs": raw_refs,
             "total": len(hits),
             "truncated": truncated,
         }
