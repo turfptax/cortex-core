@@ -1780,6 +1780,33 @@ class OverseerDB(CortexDB):
                      "backfill_categories() to populate cwd-signal rows")
         self._migrate_phase1_pull_events()
 
+    def _validate_sub_agent_tiers(self):
+        """Startup check: every distinct tier in sub_agent_tiers must
+        resolve to a real model via llm_router.SUB_AGENT_TIER_TO_MODEL.
+
+        Why: if a future refactor renames or drops a tier, existing
+        DB rows point at a now-missing key. Dispatch would silently
+        fall back to a hard-coded default — silent cost discrepancy.
+        Logging the mismatch at boot makes it visible.
+        """
+        try:
+            from llm_router import SUB_AGENT_TIER_TO_MODEL
+        except Exception:
+            return  # router not importable yet; benign
+        rows = self._conn.execute(
+            "SELECT DISTINCT model_tier FROM sub_agent_tiers"
+        ).fetchall()
+        for r in rows:
+            tier = r[0]
+            if tier and tier not in SUB_AGENT_TIER_TO_MODEL:
+                log.error(
+                    "sub_agent_tiers contains tier %r which doesn't "
+                    "resolve to a model in SUB_AGENT_TIER_TO_MODEL "
+                    "(valid: %s). Dispatches will fall back to spec "
+                    "defaults silently. Migrate or fix the mapping.",
+                    tier, list(SUB_AGENT_TIER_TO_MODEL.keys()),
+                )
+
     def _seed_sub_agent_tiers(self):
         """Seed the sub_agent_tiers table with default rows for the
         known B-agents on first boot. C-agents seed themselves at
@@ -1789,6 +1816,14 @@ class OverseerDB(CortexDB):
         - theme_check  → sonnet (confidence-calibration nuance)
         - project_merge_check → flash (structural comparison, cheap is fine)
         Everything else added later defaults to flash.
+
+        IMPORTANT — DB-wins-after-first-seed rule:
+        The B-agent SPEC in code carries `default_tier` for first-seed
+        only. After the row exists in sub_agent_tiers, the DB row is
+        the source of truth — Tory's overrides via /sub-agents/set-tier
+        are NOT overwritten by code defaults on re-seed (INSERT OR
+        IGNORE). Don't "fix" the code defaults expecting them to apply
+        to existing installs; change the DB row instead.
         """
         defaults = (
             ("b", "theme_check",        "sonnet",
@@ -1850,6 +1885,8 @@ class OverseerDB(CortexDB):
             )
         # Chain: sub-agent tier registry seed (2026-05-27).
         self._seed_sub_agent_tiers()
+        # Then validate every tier still resolves to a real model.
+        self._validate_sub_agent_tiers()
 
     def _migrate_9_6_notification_actions(self):
         """Slice 9.6 CP1 (2026-05-19): notifications gain actions_json
@@ -4810,9 +4847,18 @@ class OverseerDB(CortexDB):
         For B-agents: claimed_by = 'b-agent:<name>'.
         For C-agents: claimed_by = 'c-agent:<name>'.
 
-        Returns:
-          {recent: [{id, rating, claimed_at, model}], n: int,
-           avg_rating: float|None, rated_count: int, unrated_count: int}
+        Returns TWO averages:
+          - avg_rating         — over all `recent` rows (full history
+                                 in the window)
+          - avg_rating_current_tier — over rows whose claimed_at is
+                                 AFTER tier_set_at (i.e. ratings under
+                                 the CURRENT model). This is the
+                                 signal Tory should act on; the
+                                 all-history average blurs across
+                                 tier changes per overseer flag
+                                 2026-05-27.
+
+        Plus tier metadata so the caller doesn't have to round-trip.
         """
         claimed_by = f"{agent_type}-agent:{agent_name}"
         rows = self._conn.execute(
@@ -4829,12 +4875,39 @@ class OverseerDB(CortexDB):
                    if r["quality_rating"] is None]
         avg = (sum(r["quality_rating"] for r in rated) / len(rated)
                if rated else None)
+
+        # Tier-aware sub-average: only ratings recorded under the
+        # current tier (claimed_at > tier_set_at).
+        tier_row = self.get_sub_agent_tier(agent_type, agent_name)
+        tier_set_at = (tier_row or {}).get("tier_set_at") or ""
+        if tier_set_at:
+            current_tier_rated = [
+                r for r in rated
+                if (r.get("claimed_at") or "") > tier_set_at
+            ]
+            avg_current = (
+                sum(r["quality_rating"] for r in current_tier_rated)
+                / len(current_tier_rated)
+                if current_tier_rated else None
+            )
+            current_tier_count = len(current_tier_rated)
+        else:
+            avg_current = avg
+            current_tier_count = len(rated)
+
         return {
             "recent": [dict(r) for r in rows],
             "n": len(rows),
             "avg_rating": round(avg, 2) if avg is not None else None,
+            "avg_rating_current_tier":
+                round(avg_current, 2) if avg_current is not None
+                else None,
+            "current_tier_rated_count": current_tier_count,
             "rated_count": len(rated),
             "unrated_count": len(unrated),
+            "tier": (tier_row or {}).get("model_tier"),
+            "tier_set_at": tier_set_at,
+            "tier_set_by": (tier_row or {}).get("tier_set_by"),
         }
 
     # ── Phase 1 (2026-05-27): pull_events ───────────────────────

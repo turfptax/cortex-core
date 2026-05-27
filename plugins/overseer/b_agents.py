@@ -167,14 +167,38 @@ def dispatch_b_agent(name: str, args: dict, *, db, core_memory,
              len(snapshot_text))
 
     # Resolve the model via the tier registry. Default tier per agent
-    # comes from the spec (DEFAULT_TIER); the registry can override.
+    # comes from the spec (default_tier); the registry can override.
+    # If the registry call fails, fall back to the spec's *default
+    # tier* resolved through SUB_AGENT_TIER_TO_MODEL — NOT to the
+    # bare spec model field. Reason: spec.model is the seed model
+    # (sonnet-4.5 historically) and may not match the current
+    # canonical model for the spec's tier. Falling back to the bare
+    # spec model would be a silent cost-discipline break per overseer
+    # L99 audit 2026-05-27.
     default_tier = spec.get("default_tier", "flash")
-    model_to_use = spec.get("model", "")  # fallback if registry unreachable
-    tier_used = default_tier
     try:
         from llm_router import (
             SUB_AGENT_TIER_TO_MODEL, resolve_sub_agent_model,
         )
+    except Exception as e:
+        log.error(
+            "b_agent %s: llm_router import failed (%s) — cannot "
+            "resolve tier; using spec.model as last-resort fallback",
+            name, e,
+        )
+        SUB_AGENT_TIER_TO_MODEL = {}
+        def resolve_sub_agent_model(t, default_model=None):
+            return default_model or ""
+
+    # Compute the fallback model FIRST (default tier → canonical
+    # model) so a DB failure lands us at the spec-intended tier,
+    # not on whatever model spec.model happens to carry.
+    fallback_model = resolve_sub_agent_model(
+        default_tier, default_model=spec.get("model", ""))
+    model_to_use = fallback_model
+    tier_used = default_tier
+
+    try:
         tier_row = db.ensure_sub_agent_tier(
             "b", name,
             default_tier=default_tier,
@@ -182,11 +206,14 @@ def dispatch_b_agent(name: str, args: dict, *, db, core_memory,
         )
         tier_used = (tier_row or {}).get("model_tier") or default_tier
         model_to_use = resolve_sub_agent_model(
-            tier_used, default_model=spec.get("model", ""))
+            tier_used, default_model=fallback_model)
     except Exception as e:
-        log.warning(
-            "b_agent %s: tier resolution failed (%s); using spec model %s",
-            name, e, model_to_use,
+        # ERROR-level: if this fires we're losing the cost-discipline
+        # signal. Per overseer L99 audit — fall-through must be loud.
+        log.error(
+            "b_agent %s: tier registry unreachable (%s); using "
+            "spec default_tier=%s → model %s. Investigate.",
+            name, e, default_tier, fallback_model,
         )
 
     log.info("b_agent %s: tier=%s model=%s", name, tier_used, model_to_use)
