@@ -28,16 +28,34 @@ Phase 2.2a (2026-05-27) — hash skip + hand-edit preservation
   Siblings are excluded from the orphan sweep so they persist until
   Tory merges by hand (DESIGN.md §4-§5).
 
-What this scaffold STILL DOES NOT YET DO (Phase 2.2b/2.2c)
-----------------------------------------------------------
-- **No atomic swap.** Writes directly into the output tree. A failure
-  mid-render leaves a partial vault. Acceptable for the scaffold
-  because the vault is regenerable; not acceptable for production
-  (DESIGN.md §4). Phase 2.2b will wrap render in vault.tmp/ then
-  atomic rename.
-- **No sensitivity gating.** Emits everything regardless of tier.
-  Slice 13 gating wires up in Phase 2.2c — confidential gets
-  sanitized, restricted gets excluded entirely.
+Phase 2.2b (2026-05-27) — atomic per-file writes
+-------------------------------------------------
+- Every file write goes through `_atomic_write`: write to
+  `<path>.tmp` in the same directory, fsync, then `os.replace` onto
+  the target. Per-file consistency is now guaranteed against
+  mid-render kills, disk-full conditions, and process crashes — the
+  target either holds the previous content or the new content, never
+  a half-written body.
+- `_clean_orphan_tmp_files` runs at the start of every render to
+  sweep `<name>.md.tmp` leftovers from a previous interrupted run.
+- This is a SIMPLER form than DESIGN.md §4's proposed tree-level
+  vault.tmp → vault swap. The tree-level swap would require a full
+  copy/hardlink of the existing vault before each render (so hash-
+  skip can find existing files), doubling disk I/O. File-level
+  atomic-rename gives the same per-file safety property at far less
+  cost. Tree-level swap is reserved for a future slice if the
+  partial-tree-on-failure case becomes a real problem in practice.
+
+What this scaffold STILL DOES NOT YET DO (Phase 2.2c)
+-----------------------------------------------------
+- **No sensitivity gating on interpretive artifacts.** The vault
+  emits every artifact regardless of source tier. Slice 13 only
+  tags `imported_sessions` and applies gist-and-drop / no-import
+  policies at ingest time; interpretive artifact tables (gists,
+  themes, etc.) have no sensitivity column today. Phase 2.2c will
+  either (a) JOIN to `sensitivity_rules` at render time via
+  source-row matching, or (b) wait for Slice 13 to roll a
+  sensitivity column out to interpretive tables.
 - **No pull_event linkage in rendered bodies.** Rendered files don't
   yet show "drilled into via" sections; that's a Phase 3 read-side
   feature.
@@ -57,6 +75,7 @@ import datetime as _dt
 import hashlib
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -151,6 +170,60 @@ _SOURCE_HASH_RE = re.compile(
     r"^source_hash:\s*\"?([0-9a-fA-F]+)\"?\s*$", re.MULTILINE)
 
 
+def _atomic_write(path: Path, content: str,
+                  encoding: str = "utf-8") -> None:
+    """Phase 2.2b (2026-05-27) — atomic per-file write.
+
+    Writes content to `<path>.tmp` in the same directory (so the rename
+    is atomic on POSIX), fsyncs the file descriptor to durably flush
+    the bytes, then `os.replace`s the tempfile onto the target. On any
+    exception mid-write the target is unchanged and the tempfile is
+    cleaned up (best-effort). If the process is killed between the
+    write and the rename, the tempfile remains and gets swept on the
+    next render start by `_clean_orphan_tmp_files`.
+
+    Same-directory tempfile is REQUIRED for atomic-rename guarantees —
+    cross-filesystem renames can fall back to copy+unlink, which isn't
+    atomic.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp_path, "w", encoding=encoding) as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp_path), str(path))
+    except Exception:
+        # Best-effort cleanup of the tempfile so it doesn't accumulate
+        # if the failure is recoverable. _clean_orphan_tmp_files would
+        # also catch it next render, but cleaning eagerly is cheap.
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def _clean_orphan_tmp_files(out_root: Path) -> int:
+    """Phase 2.2b (2026-05-27): sweep `<name>.md.tmp` leftovers from a
+    previously-interrupted atomic write. Returns the count cleaned.
+
+    Safe to call at the start of every render — atomic writes complete
+    quickly enough that an in-progress tempfile cannot exist when
+    render_vault begins (single-render-at-a-time discipline enforced
+    by the loop step). Anything matching this pattern is an orphan.
+    """
+    count = 0
+    for f in out_root.rglob("*.md.tmp"):
+        try:
+            f.unlink()
+            count += 1
+        except Exception as e:
+            log.warning("tmp-sweep: could not delete %s: %s", f, e)
+    return count
+
+
 def _split_existing_file(text: str) -> tuple[str, str, str]:
     """Parse an existing vault file into (above_marker, below_marker,
     source_hash).
@@ -237,7 +310,7 @@ def _render_one(out_path: Path, frontmatter: dict, title: str,
     )
 
     if not out_path.exists():
-        out_path.write_text(fresh_contents, encoding="utf-8")
+        _atomic_write(out_path, fresh_contents)
         return {"path": str(out_path.resolve()),
                 "bytes": len(fresh_contents),
                 "action": "written"}
@@ -265,7 +338,7 @@ def _render_one(out_path: Path, frontmatter: dict, title: str,
         sibling_name = (
             out_path.stem + f".loop-update-{ts}" + out_path.suffix)
         sibling_path = out_path.with_name(sibling_name)
-        sibling_path.write_text(fresh_contents, encoding="utf-8")
+        _atomic_write(sibling_path, fresh_contents)
         return {"path": str(out_path.resolve()),
                 "bytes": len(fresh_contents),
                 "action": "sibling_for_handedit",
@@ -281,7 +354,7 @@ def _render_one(out_path: Path, frontmatter: dict, title: str,
         + MARKER + "\n\n"
         + new_below + "\n"
     )
-    out_path.write_text(merged_contents, encoding="utf-8")
+    _atomic_write(out_path, merged_contents)
     return {"path": str(out_path.resolve()),
             "bytes": len(merged_contents),
             "action": "written"}
@@ -630,6 +703,13 @@ def render_vault(db, out_dir: str, *,
     counts: dict = {}
     errors: list = []
     render_at = _iso_local_now()
+    # Phase 2.2b: clean any orphaned tempfiles from a previous render
+    # that was interrupted mid-write. These would otherwise accumulate
+    # and clutter Tory's vault directory.
+    orphan_tmp_cleaned = _clean_orphan_tmp_files(out_root)
+    if orphan_tmp_cleaned:
+        log_fn("vault_generator: swept %d orphan .tmp files from a "
+               "previously-interrupted render", orphan_tmp_cleaned)
     # Manifest of every absolute file path the loop OWNS this run.
     # Note that the manifest is "owned this run", not "written this
     # run" — files whose source data is unchanged are skipped (action
@@ -807,10 +887,10 @@ def render_vault(db, out_dir: str, *,
             body_lines.append(f"- {tbl}#{rid}: {msg}")
         if len(errors) > 50:
             body_lines.append(f"- … +{len(errors) - 50} more")
-    last_render_path.write_text(
+    _atomic_write(
+        last_render_path,
         render_frontmatter(meta_fm) + "\n# Last render\n\n"
         + "\n".join(body_lines) + "\n",
-        encoding="utf-8",
     )
 
     # L99 must-fix #D (2026-05-27): emit a card-catalog README at the
@@ -868,7 +948,7 @@ def render_vault(db, out_dir: str, *,
         "`cortex_list`, `cortex_graph`, `cortex_recent`) that read\n"
         "this directory directly.\n"
     )
-    readme_path.write_text(readme_text, encoding="utf-8")
+    _atomic_write(readme_path, readme_text)
 
     log_fn(
         "vault_generator: done in %.2fs (counts=%s, errors=%d)",
@@ -884,6 +964,7 @@ def render_vault(db, out_dir: str, *,
         "orphans_deleted": sweep_result.get("orphans_deleted", 0),
         "orphan_files": sweep_result.get("orphan_files", [])[:20],
         "siblings_preserved": sweep_result.get("siblings_preserved", 0),
+        "orphan_tmp_cleaned": orphan_tmp_cleaned,
         "errors": [
             {"table": t, "id": i, "msg": m}
             for (t, i, m) in errors[:50]
