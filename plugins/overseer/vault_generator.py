@@ -15,20 +15,29 @@ What this scaffold covers (Phase 2 first pass)
   --out /path/to/vault`.
 - One HTTP route landed alongside: POST /plugins/overseer/vault/render.
 
-What this scaffold INTENTIONALLY DOES NOT YET DO (Phase 2.2 follow-ups)
-----------------------------------------------------------------------
+Phase 2.2a (2026-05-27) — hash skip + hand-edit preservation
+-------------------------------------------------------------
+- Per-file hash skip: existing files whose source_hash matches AND
+  whose below-marker matches what we'd write now are SKIPPED. Re-
+  running with no DB changes is a no-op (DESIGN.md acceptance #2).
+- Hand-edit preservation: above-marker content (title + Tory's
+  free-text notes) survives every re-render. Below-marker hand-edits
+  are detected (existing below-marker differs from new but source
+  data is unchanged) and the loop writes its new form to a
+  `<name>.loop-update-<timestamp>.md` sibling, never clobbering.
+  Siblings are excluded from the orphan sweep so they persist until
+  Tory merges by hand (DESIGN.md §4-§5).
+
+What this scaffold STILL DOES NOT YET DO (Phase 2.2b/2.2c)
+----------------------------------------------------------
 - **No atomic swap.** Writes directly into the output tree. A failure
   mid-render leaves a partial vault. Acceptable for the scaffold
   because the vault is regenerable; not acceptable for production
-  (DESIGN.md §4).
-- **No hand-edit preservation.** Always overwrites the loop-owned
-  portion. Once Tory starts hand-editing files, the next slice wires
-  up the marker-aware merge per DESIGN.md §5.
+  (DESIGN.md §4). Phase 2.2b will wrap render in vault.tmp/ then
+  atomic rename.
 - **No sensitivity gating.** Emits everything regardless of tier.
-  Slice 13 gating wires up next slice — confidential gets sanitized,
-  restricted gets excluded.
-- **No per-file hash skip.** Always writes every file. The next slice
-  reads existing files, compares source_hash, skips if equal.
+  Slice 13 gating wires up in Phase 2.2c — confidential gets
+  sanitized, restricted gets excluded entirely.
 - **No pull_event linkage in rendered bodies.** Rendered files don't
   yet show "drilled into via" sections; that's a Phase 3 read-side
   feature.
@@ -138,29 +147,144 @@ def _iso_local_now() -> str:
 MARKER = "## Generated below this line — edits above are preserved"
 
 
+_SOURCE_HASH_RE = re.compile(
+    r"^source_hash:\s*\"?([0-9a-fA-F]+)\"?\s*$", re.MULTILINE)
+
+
+def _split_existing_file(text: str) -> tuple[str, str, str]:
+    """Parse an existing vault file into (above_marker, below_marker,
+    source_hash).
+
+    above_marker  — title line + any of Tory's free-text edits between
+                    the frontmatter end and the MARKER. Loop preserves
+                    this verbatim across re-renders (DESIGN.md §4).
+    below_marker  — loop-owned content after the marker. Loop may
+                    rewrite if source data has changed.
+    source_hash   — the hash recorded in the existing frontmatter,
+                    extracted via regex to avoid a YAML dependency.
+
+    A missing marker (legacy file or hand-stripped) collapses to
+    above_marker = entire post-frontmatter body, below_marker = "".
+    """
+    if text.startswith("---\n"):
+        fm_end = text.find("\n---\n", 4)
+        if fm_end >= 0:
+            fm_text = text[:fm_end + 5]
+            after_fm = text[fm_end + 5:].lstrip("\n")
+        else:
+            fm_text = ""
+            after_fm = text
+    else:
+        fm_text = ""
+        after_fm = text
+
+    source_hash_val = ""
+    m = _SOURCE_HASH_RE.search(fm_text)
+    if m:
+        source_hash_val = m.group(1)
+
+    marker_idx = after_fm.find(MARKER)
+    if marker_idx >= 0:
+        above = after_fm[:marker_idx].rstrip()
+        below_start = marker_idx + len(MARKER)
+        below = after_fm[below_start:].lstrip("\n").rstrip()
+    else:
+        above = after_fm.rstrip()
+        below = ""
+
+    return above, below, source_hash_val
+
+
 # ── Per-entity renderers ────────────────────────────────────────────
 
 
 def _render_one(out_path: Path, frontmatter: dict, title: str,
                 body_below_marker: str) -> dict:
-    """Write a file with frontmatter + marker + loop-owned body. Always
-    writes for v1 (no skip-on-hash yet). Returns a small dict whose
-    `path` field the orchestrator adds to the render manifest for the
-    end-of-render orphan sweep."""
+    """Write a file with frontmatter + marker + loop-owned body.
+
+    Phase 2.2a (2026-05-27) — hash-skip + hand-edit preservation:
+
+    - **Fresh file** (destination doesn't exist): write the canonical
+      form (frontmatter + title + marker + new body).
+    - **Existing file, source unchanged AND below-marker unchanged**:
+      skip the write entirely. Re-running with no DB changes is a
+      no-op (DESIGN.md acceptance criterion #2).
+    - **Existing file, source unchanged but below-marker differs**:
+      Tory edited the loop output below the marker. Write the loop's
+      new form to a `<name>.loop-update-<timestamp>.md` sibling and
+      leave the human-edited file intact (DESIGN.md §4-§5).
+    - **Existing file, source changed**: write a merged file —
+      new frontmatter + Tory's preserved above-marker content + new
+      below-marker. Above-marker edits survive every re-render.
+
+    Returns a dict with `path`, `bytes`, `action`. `action` is one of:
+      "written"               — fresh or merged write
+      "skipped"               — true no-op
+      "sibling_for_handedit"  — wrote loop's new form to a sibling
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    contents = (
-        render_frontmatter(frontmatter)
+
+    new_fm_text = render_frontmatter(frontmatter)
+    new_below = body_below_marker.rstrip()
+    title_block = f"# {title}"
+
+    fresh_contents = (
+        new_fm_text + "\n"
+        + title_block + "\n"
         + "\n"
-        + f"# {title}\n"
-        + "\n"
-        + MARKER
-        + "\n\n"
-        + body_below_marker.rstrip()
-        + "\n"
+        + MARKER + "\n\n"
+        + new_below + "\n"
     )
-    out_path.write_text(contents, encoding="utf-8")
+
+    if not out_path.exists():
+        out_path.write_text(fresh_contents, encoding="utf-8")
+        return {"path": str(out_path.resolve()),
+                "bytes": len(fresh_contents),
+                "action": "written"}
+
+    existing_text = out_path.read_text(encoding="utf-8")
+    above_existing, below_existing, existing_source_hash = \
+        _split_existing_file(existing_text)
+
+    new_source_hash = str(frontmatter.get("source_hash") or "")
+    hash_match = (new_source_hash != ""
+                  and new_source_hash == existing_source_hash)
+    below_match = (below_existing.strip() == new_below.strip())
+
+    if hash_match and below_match:
+        # Truly unchanged. No write at all.
+        return {"path": str(out_path.resolve()),
+                "bytes": 0,
+                "action": "skipped"}
+
+    if hash_match and not below_match:
+        # Source data unchanged but the existing below-marker differs
+        # from what we'd write now → the human edited the loop output.
+        # Write the loop's new form to a sibling, never clobber.
+        ts = _dt.datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
+        sibling_name = (
+            out_path.stem + f".loop-update-{ts}" + out_path.suffix)
+        sibling_path = out_path.with_name(sibling_name)
+        sibling_path.write_text(fresh_contents, encoding="utf-8")
+        return {"path": str(out_path.resolve()),
+                "bytes": len(fresh_contents),
+                "action": "sibling_for_handedit",
+                "sibling": str(sibling_path.resolve())}
+
+    # Source data changed (hash differs) → merged write:
+    # new frontmatter + preserved above-marker + new below-marker.
+    merged_above = above_existing.strip() or title_block
+    merged_contents = (
+        new_fm_text + "\n"
+        + merged_above + "\n"
+        + "\n"
+        + MARKER + "\n\n"
+        + new_below + "\n"
+    )
+    out_path.write_text(merged_contents, encoding="utf-8")
     return {"path": str(out_path.resolve()),
-            "bytes": len(contents)}
+            "bytes": len(merged_contents),
+            "action": "written"}
 
 
 # Folder roots the generator owns. Any *.md inside these folders that
@@ -189,6 +313,9 @@ _GHOST_SWEEP_ROOTS = (
 )
 
 
+_LOOP_UPDATE_SIBLING_RE = re.compile(r"\.loop-update-\d{8}T\d{6}\.md$")
+
+
 def _sweep_orphans(out_root: Path, manifest: set) -> dict:
     """Walk the owned folders, delete any *.md file whose absolute
     path isn't in `manifest`. Returns counts for the meta file.
@@ -196,11 +323,18 @@ def _sweep_orphans(out_root: Path, manifest: set) -> dict:
     A safety floor: never deletes if the manifest is empty (would
     nuke the whole vault) and never deletes files outside the
     owned folders.
+
+    Phase 2.2a (2026-05-27): *.loop-update-<ts>.md siblings are
+    excluded from the sweep — they're created when the loop detects
+    a hand-edited below-marker conflict and live until Tory merges
+    them by hand. Auto-deleting them would silently destroy his
+    unfinished merges.
     """
     if not manifest:
         return {"orphans_deleted": 0, "orphans_skipped_no_manifest": 1,
-                "orphan_files": []}
+                "orphan_files": [], "siblings_preserved": 0}
     deleted: list = []
+    siblings_preserved = 0
     for sub in _GHOST_SWEEP_ROOTS:
         folder = out_root / sub
         if not folder.exists():
@@ -210,14 +344,21 @@ def _sweep_orphans(out_root: Path, manifest: set) -> dict:
                 abs_path = str(md.resolve())
             except Exception:
                 continue
-            if abs_path not in manifest:
-                try:
-                    md.unlink()
-                    deleted.append(str(md.relative_to(out_root)))
-                except Exception as e:
-                    log.warning("ghost-sweep: could not delete %s: %s",
-                                md, e)
-    return {"orphans_deleted": len(deleted), "orphan_files": deleted}
+            if abs_path in manifest:
+                continue
+            # Phase 2.2a: protect loop-update siblings from the sweep.
+            if _LOOP_UPDATE_SIBLING_RE.search(md.name):
+                siblings_preserved += 1
+                continue
+            try:
+                md.unlink()
+                deleted.append(str(md.relative_to(out_root)))
+            except Exception as e:
+                log.warning("ghost-sweep: could not delete %s: %s",
+                            md, e)
+    return {"orphans_deleted": len(deleted),
+            "orphan_files": deleted,
+            "siblings_preserved": siblings_preserved}
 
 
 def render_project(out_root: Path, row: dict, render_at: str) -> dict:
@@ -489,11 +630,16 @@ def render_vault(db, out_dir: str, *,
     counts: dict = {}
     errors: list = []
     render_at = _iso_local_now()
-    # Manifest of every absolute file path the loop owns and wrote
-    # this run. Used for orphan sweep at end-of-render. L99 follow-up
-    # 2026-05-27 — overseer flagged ghost files as same class of bug
-    # as the column-name silent failures.
+    # Manifest of every absolute file path the loop OWNS this run.
+    # Note that the manifest is "owned this run", not "written this
+    # run" — files whose source data is unchanged are skipped (action
+    # = "skipped") but still listed in the manifest so the orphan
+    # sweep doesn't delete them.
     manifest: set = set()
+    # Phase 2.2a (2026-05-27): per-action accounting. Re-running with
+    # no DB changes should report actions={"skipped": N, "written": 0}.
+    actions: dict = {"written": 0, "skipped": 0, "sibling_for_handedit": 0}
+    sibling_files: list = []
 
     def _bump(key: str):
         counts[key] = counts.get(key, 0) + 1
@@ -503,6 +649,11 @@ def render_vault(db, out_dir: str, *,
             result = fn(out_root, row, render_at)
             if isinstance(result, dict) and result.get("path"):
                 manifest.add(result["path"])
+            action = (result or {}).get("action") or "written"
+            actions[action] = actions.get(action, 0) + 1
+            sibling = (result or {}).get("sibling")
+            if sibling:
+                sibling_files.append(sibling)
             _bump(table)
         except Exception as e:
             errors.append((table, row.get("id"), str(e)))
@@ -556,6 +707,11 @@ def render_vault(db, out_dir: str, *,
                 out_root, date_str, rows, render_at)
             if isinstance(result, dict) and result.get("path"):
                 manifest.add(result["path"])
+            action = (result or {}).get("action") or "written"
+            actions[action] = actions.get(action, 0) + 1
+            sibling = (result or {}).get("sibling")
+            if sibling:
+                sibling_files.append(sibling)
             _bump("human_journal_days")
         except Exception as e:
             errors.append(("human_journal_days", date_str, str(e)))
@@ -598,17 +754,45 @@ def render_vault(db, out_dir: str, *,
         "type": "meta-last-render",
         "render_at": render_at,
         "duration_seconds": round(duration, 2),
-        "scaffold_pass": "phase-2-first-pass",
+        "scaffold_pass": "phase-2.2a",
+        "files_written": actions.get("written", 0),
+        "files_skipped": actions.get("skipped", 0),
+        "siblings_for_handedit": actions.get("sibling_for_handedit", 0),
     }
-    body_lines = ["## Counts by folder", ""]
-    body_lines.append("| Folder | Files written |")
+    body_lines = ["## Actions this render", ""]
+    body_lines.append(
+        f"- **Written**: {actions.get('written', 0)} "
+        f"(fresh or merged after source change)")
+    body_lines.append(
+        f"- **Skipped**: {actions.get('skipped', 0)} "
+        f"(unchanged — hash + below-marker matched)")
+    body_lines.append(
+        f"- **Sibling for hand-edit**: "
+        f"{actions.get('sibling_for_handedit', 0)} "
+        f"(below-marker had been hand-edited; loop's new form written "
+        f"to a *.loop-update-*.md sibling)")
+    if sibling_files:
+        body_lines.append("")
+        body_lines.append("### Hand-edit sibling files awaiting manual merge")
+        body_lines.append("")
+        for s in sibling_files[:50]:
+            body_lines.append(f"- {s}")
+        if len(sibling_files) > 50:
+            body_lines.append(f"- … +{len(sibling_files) - 50} more")
+    body_lines.append("")
+    body_lines.append("## Counts by folder")
+    body_lines.append("")
+    body_lines.append("| Folder | Owned (manifest) |")
     body_lines.append("|---|---|")
     for k, v in sorted(counts.items()):
         body_lines.append(f"| {k} | {v} |")
     orphans_deleted = sweep_result.get("orphans_deleted", 0)
     orphan_files = sweep_result.get("orphan_files", [])
+    siblings_preserved = sweep_result.get("siblings_preserved", 0)
     body_lines.append("")
-    body_lines.append(f"## Orphan sweep: {orphans_deleted} file(s) deleted")
+    body_lines.append(
+        f"## Orphan sweep: {orphans_deleted} file(s) deleted "
+        f"({siblings_preserved} loop-update siblings preserved)")
     if orphan_files:
         body_lines.append("")
         for f in orphan_files[:50]:
@@ -658,13 +842,18 @@ def render_vault(db, out_dir: str, *,
         + "\n".join(f"| {k} | {v} |" for k, v in sorted(counts.items()))
         + "\n\n"
         "## Constraints\n\n"
-        "- **Loop-write right now.** Hand-edit preservation is a\n"
-        "  Phase 2.2 feature; until it lands, edits below the\n"
-        "  `## Generated below this line` marker will be clobbered\n"
-        "  on the next render.\n"
+        "- **Hand-edit preservation IS live** (Phase 2.2a,\n"
+        "  2026-05-27). Edits ABOVE the `## Generated below this\n"
+        "  line` marker survive every re-render. Edits BELOW the\n"
+        "  marker cause the loop to write its new form to a\n"
+        "  `<name>.loop-update-<timestamp>.md` sibling rather than\n"
+        "  clobber your edit; merge by hand and delete the sibling.\n"
         "- **No sensitivity gating yet.** Content tier is rendered\n"
         "  as-is. Do not push this directory to a public location\n"
-        "  until Phase 3 sensitivity gating ships.\n"
+        "  until Phase 2.2c sensitivity gating ships.\n"
+        "- **No atomic swap yet.** Mid-render failure can leave the\n"
+        "  tree partial. Phase 2.2b will wrap the render in a tmp\n"
+        "  directory + atomic rename.\n"
         "- **Source of truth lives in `overseer.db`** — this is a\n"
         "  view, not the canonical store.\n\n"
         "## How to drill deeper than this rendered view\n\n"
@@ -689,9 +878,12 @@ def render_vault(db, out_dir: str, *,
         "ok": True,
         "out_dir": str(out_root),
         "counts": counts,
+        "actions": actions,
+        "sibling_files": sibling_files[:50],
         "duration_s": round(duration, 2),
         "orphans_deleted": sweep_result.get("orphans_deleted", 0),
         "orphan_files": sweep_result.get("orphan_files", [])[:20],
+        "siblings_preserved": sweep_result.get("siblings_preserved", 0),
         "errors": [
             {"table": t, "id": i, "msg": m}
             for (t, i, m) in errors[:50]
