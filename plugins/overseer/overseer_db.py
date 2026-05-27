@@ -957,6 +957,65 @@ CREATE INDEX IF NOT EXISTS idx_c_agents_status
     ON c_agents(status, last_run_at);
 CREATE INDEX IF NOT EXISTS idx_c_agents_parent
     ON c_agents(graduated_from_b_name);
+
+-- Phase 1 (2026-05-27, three-layer architecture seed): every time an
+-- external AI (or the Hub, or the vault renderer) drills past an
+-- abstraction into a deeper layer, log a pull_event. A pull is a
+-- refinement signal — if it happened, the abstraction at the higher
+-- layer didn't carry enough context for the consumer. The overseer
+-- reads these to decide which gist prompts need evolving and which
+-- abstractions are under-elaborated.
+CREATE TABLE IF NOT EXISTS pull_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- What was pulled (the artifact the consumer landed on)
+    artifact_table TEXT NOT NULL,        -- summaries_gist, summaries_theme, patterns, etc.
+    artifact_id INTEGER NOT NULL,
+    -- Surface that did the pull
+    surface TEXT NOT NULL,               -- mcp:cortex_search | mcp:cortex_overseer_detail | mcp:notes_search | hub:explorer | vault | overseer_chat
+    -- Optional context: which abstraction the puller came FROM (if known)
+    parent_artifact_table TEXT,
+    parent_artifact_id INTEGER,
+    -- Substring/semantic query that surfaced this artifact (if from search)
+    query_text TEXT,
+    -- Free-form caller context (Claude Desktop session id, agent name, etc.)
+    caller_id TEXT,
+    pulled_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_pull_events_artifact
+    ON pull_events(artifact_table, artifact_id);
+CREATE INDEX IF NOT EXISTS idx_pull_events_pulled_at
+    ON pull_events(pulled_at);
+CREATE INDEX IF NOT EXISTS idx_pull_events_surface
+    ON pull_events(surface, pulled_at);
+
+-- Phase 1 (2026-05-27, three-layer architecture seed): gist prompts
+-- as first-class evolving artifacts. The current prompt lives in
+-- prompts.py as a Python constant; this table records every version
+-- the overseer has used + its performance signals so the overseer can
+-- evolve the prompt when consumers keep drilling past gists generated
+-- with it.
+--
+-- Note: prompt_text is the SOURCE OF TRUTH for the active version.
+-- prompts.py reads from here at startup if a row exists, else falls
+-- back to the constant + writes the constant in as v1 on first boot.
+CREATE TABLE IF NOT EXISTS gist_prompts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_label TEXT NOT NULL UNIQUE,        -- 'v1', 'v2-add-decisions', etc.
+    prompt_text TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 0,      -- 1 for the currently-used prompt; only one row should be active
+    rationale TEXT,                            -- why this version was created
+    -- Performance signals (computed periodically by overseer, not live).
+    -- A high pulled_past_count / generated_count ratio = consumers
+    -- keep drilling past gists this prompt produced, i.e., the prompt
+    -- is missing something the consumers need.
+    gists_generated INTEGER NOT NULL DEFAULT 0,
+    gists_pulled_past INTEGER NOT NULL DEFAULT 0,
+    last_signals_computed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    deprecated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_gist_prompts_active ON gist_prompts(is_active);
 """
 
 
@@ -1689,6 +1748,44 @@ class OverseerDB(CortexDB):
             self._safe_commit()
             log.info("_migrate_14_7_3: category columns added; run "
                      "backfill_categories() to populate cwd-signal rows")
+        self._migrate_phase1_pull_events()
+
+    def _migrate_phase1_pull_events(self):
+        """Phase 1 (2026-05-27): pull_events + gist_prompts tables.
+
+        Fresh installs get both via CREATE TABLE IF NOT EXISTS in
+        OVERSEER_SCHEMA_SQL. Existing installs (.25) pick them up
+        additively on the next boot because schema bootstrap runs
+        OVERSEER_SCHEMA_SQL on every open(). This migration is a
+        safety check.
+
+        gist_prompts is intentionally left empty after the migration.
+        The current gist prompt lives in `prompts.session_gist_prompt`
+        as a Python FUNCTION (takes session-specific params), not a
+        flat string, so seeding from the constant doesn't fit. The
+        overseer will author v1 in gist_prompts the first time it
+        decides to evolve the prompt based on pull_events signals —
+        that's the right moment for the table to become populated.
+        """
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='pull_events'"
+        ).fetchone()
+        if not row:
+            log.warning(
+                "_migrate_phase1_pull_events: pull_events table missing "
+                "after schema bootstrap — corpus drill signals will not "
+                "be recorded until this resolves"
+            )
+        row2 = self._conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='gist_prompts'"
+        ).fetchone()
+        if not row2:
+            log.warning(
+                "_migrate_phase1_pull_events: gist_prompts table missing "
+                "after schema bootstrap"
+            )
 
     def _migrate_9_6_notification_actions(self):
         """Slice 9.6 CP1 (2026-05-19): notifications gain actions_json
@@ -4551,6 +4648,167 @@ class OverseerDB(CortexDB):
             (kind,),
         ).fetchone()
         return dict(row) if row else None
+
+    # ── Phase 1 (2026-05-27): pull_events ───────────────────────
+    #
+    # Every external drill into the corpus is a refinement signal. The
+    # overseer reads aggregate pull_event stats to decide which gist
+    # prompts and abstractions need evolving. Recording is best-effort;
+    # never let an instrumentation failure block the surface that did
+    # the actual pull.
+
+    def record_pull_event(self, *, artifact_table, artifact_id, surface,
+                          parent_artifact_table=None,
+                          parent_artifact_id=None,
+                          query_text=None, caller_id=None):
+        """Record one pull event. Returns the new row id or None on
+        failure. Designed to be cheap + crash-safe — exceptions are
+        swallowed and logged at WARNING so callers can fire-and-forget.
+        """
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO pull_events "
+                "(artifact_table, artifact_id, surface, "
+                "parent_artifact_table, parent_artifact_id, "
+                "query_text, caller_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(artifact_table or ""),
+                    int(artifact_id) if artifact_id is not None else 0,
+                    str(surface or ""),
+                    str(parent_artifact_table) if parent_artifact_table else None,
+                    int(parent_artifact_id) if parent_artifact_id else None,
+                    str(query_text) if query_text else None,
+                    str(caller_id) if caller_id else None,
+                ),
+            )
+            self._safe_commit()
+            return cur.lastrowid
+        except Exception as e:
+            log.warning("record_pull_event failed (%s/%s via %s): %s",
+                        artifact_table, artifact_id, surface, e)
+            return None
+
+    def recent_pull_events(self, *, limit=50, surface=None,
+                             artifact_table=None, days=None):
+        """List recent pull events. Optional filters narrow by surface
+        ('mcp:cortex_search'), artifact_table ('summaries_gist'), or
+        time window (days back from now)."""
+        sql = "SELECT * FROM pull_events WHERE 1=1"
+        params: list = []
+        if surface:
+            sql += " AND surface = ?"
+            params.append(surface)
+        if artifact_table:
+            sql += " AND artifact_table = ?"
+            params.append(artifact_table)
+        if days:
+            sql += " AND pulled_at >= datetime('now', ?)"
+            params.append(f"-{int(days)} days")
+        sql += " ORDER BY pulled_at DESC LIMIT ?"
+        params.append(int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def pull_event_stats(self, *, days=7):
+        """Aggregate stats for the overseer to surface in working
+        memory and reason about prompt-evolution priority.
+
+        Returns {
+          'total': int,
+          'by_surface': {surface: count, ...},
+          'by_artifact_table': {table: count, ...},
+          'top_pulled': [(artifact_table, artifact_id, count), ...],
+          'window_days': days,
+        }
+        """
+        window_clause = "WHERE pulled_at >= datetime('now', ?)"
+        window_param = f"-{int(days)} days"
+        total = self._conn.execute(
+            f"SELECT COUNT(*) FROM pull_events {window_clause}",
+            (window_param,),
+        ).fetchone()[0]
+        by_surface = {
+            r[0]: r[1] for r in self._conn.execute(
+                f"SELECT surface, COUNT(*) FROM pull_events "
+                f"{window_clause} GROUP BY surface",
+                (window_param,),
+            ).fetchall()
+        }
+        by_table = {
+            r[0]: r[1] for r in self._conn.execute(
+                f"SELECT artifact_table, COUNT(*) FROM pull_events "
+                f"{window_clause} GROUP BY artifact_table",
+                (window_param,),
+            ).fetchall()
+        }
+        top = [
+            (r[0], r[1], r[2]) for r in self._conn.execute(
+                f"SELECT artifact_table, artifact_id, COUNT(*) AS c "
+                f"FROM pull_events {window_clause} "
+                f"GROUP BY artifact_table, artifact_id "
+                f"ORDER BY c DESC LIMIT 20",
+                (window_param,),
+            ).fetchall()
+        ]
+        return {
+            "total": int(total),
+            "by_surface": by_surface,
+            "by_artifact_table": by_table,
+            "top_pulled": top,
+            "window_days": int(days),
+        }
+
+    # ── Phase 1 (2026-05-27): gist_prompts ──────────────────────
+    #
+    # Currently a placeholder. The current gist prompt is generated
+    # by prompts.session_gist_prompt(*kwargs*), so until the prompt is
+    # restructured to support DB-sourced templating, this table is
+    # write-rarely / read-rarely. Helpers below let the overseer author
+    # v1 when it decides to evolve the prompt and read the active row
+    # at that point.
+
+    def get_active_gist_prompt(self):
+        """Return the currently-active gist_prompts row or None."""
+        row = self._conn.execute(
+            "SELECT * FROM gist_prompts WHERE is_active = 1 "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_gist_prompts(self, *, limit=20):
+        rows = self._conn.execute(
+            "SELECT * FROM gist_prompts ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_gist_prompt(self, *, version_label, prompt_text,
+                        rationale=None, make_active=False):
+        """Insert a new gist_prompts version. If make_active=True,
+        deprecates the current active row first. Returns the new row id.
+        """
+        if not version_label or not prompt_text:
+            raise ValueError(
+                "version_label and prompt_text are required")
+        if make_active:
+            self._conn.execute(
+                "UPDATE gist_prompts SET is_active = 0, "
+                "deprecated_at = datetime('now') WHERE is_active = 1"
+            )
+        cur = self._conn.execute(
+            "INSERT INTO gist_prompts "
+            "(version_label, prompt_text, is_active, rationale) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                str(version_label),
+                str(prompt_text),
+                1 if make_active else 0,
+                str(rationale) if rationale else None,
+            ),
+        )
+        self._safe_commit()
+        return cur.lastrowid
 
     # ── Slice 5: human_journal_entries ──────────────────────────
 

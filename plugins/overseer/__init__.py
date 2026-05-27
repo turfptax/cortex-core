@@ -379,6 +379,16 @@ class OverseerPlugin(Plugin):
                   self._http_category_classify_batch),
             Route("POST", "/category/set",
                   self._http_category_set),
+            # ── Phase 1 (2026-05-27): corpus search + pull events ─
+            Route("GET",  "/search",
+                  self._http_search_corpus),
+            Route("GET",  "/pull-events",
+                  self._http_recent_pull_events),
+            Route("GET",  "/pull-events/stats",
+                  self._http_pull_event_stats),
+            # ── Phase 1 (2026-05-27): Claude Desktop import scaffold
+            Route("POST", "/imports/claude-desktop/dry-run",
+                  self._http_claude_desktop_dry_run),
         ]
 
     # ── Lifecycle ───────────────────────────────────────────────
@@ -965,6 +975,23 @@ class OverseerPlugin(Plugin):
 
     # ── Slice 3g checkpoint 2: drill-down detail ───────────────
 
+    # Map detail-token prefix → table name for pull_event recording.
+    # Mirrors detail._TABLE_TO_PREFIX inverted but lives here to avoid
+    # cross-module import churn.
+    _PREFIX_TO_TABLE = {
+        "q":    "open_questions",
+        "p":    "patterns",
+        "d":    "drift_observations",
+        "g":    "summaries_gist",
+        "e":    "summaries_episode",
+        "t":    "summaries_theme",
+        "r":    "automation_rollups",
+        "n":    "future_overseer_notes",
+        "j":    "overseer_journal",
+        "b":    "known_blindspots",
+        "dial": "dialectic_open",
+    }
+
     def _http_detail(self, payload):
         """GET /plugins/overseer/detail?token=<prefix>:<id>
 
@@ -972,19 +999,36 @@ class OverseerPlugin(Plugin):
         type-specific context + suggested next-step tokens. Two depths:
         the working_memory artifact gives you breadth, this gives you
         focused depth on one cell of it.
+
+        Phase 1 (2026-05-27): every successful drill records a pull_event
+        so the overseer can see which abstractions consumers keep
+        bouncing off of.
         """
         if self.overseer_db is None:
             return {"ok": False, "error": "overseer not initialized"}
         token = str(payload.get("token", "")).strip()
         if not token:
             return {"ok": False, "error": "token query param is required"}
+        caller_id = str(payload.get("caller_id") or "").strip() or None
         try:
-            return resolve_detail(self.overseer_db, token)
+            result = resolve_detail(self.overseer_db, token)
         except TokenError as e:
             return {"ok": False, "error": str(e)}
         except Exception as e:
             log.exception("detail resolution failed for %r", token)
             return {"ok": False, "error": "detail failed: " + str(e)}
+        # Record a pull_event for successful drills.
+        if isinstance(result, dict) and result.get("ok"):
+            prefix, _, rest = token.partition(":")
+            table = self._PREFIX_TO_TABLE.get(prefix)
+            if table and rest.isdigit():
+                self.overseer_db.record_pull_event(
+                    artifact_table=table,
+                    artifact_id=int(rest),
+                    surface="mcp:cortex_overseer_detail",
+                    caller_id=caller_id,
+                )
+        return result
 
     # ── Slice 3h: insight generation ───────────────────────────
 
@@ -2339,6 +2383,316 @@ class OverseerPlugin(Plugin):
         except Exception as e:
             log.exception("category_classify_batch failed")
             return {"ok": False, "error": str(e)}
+
+    # ── Phase 1 (2026-05-27): corpus search + pull events ──────────
+    #
+    # The discovery surface external AIs were missing. notes_search
+    # reads only the `notes` table (0 rows in practice). This walks
+    # the interpretive tables (gists, themes, episodes, patterns,
+    # drift, future_overseer_notes, overseer_journal, temporal_
+    # narratives, open_questions, known_blindspots, human_journal_
+    # entries) and returns hits with drill-down tokens so the caller
+    # can fetch full rows via /detail.
+    #
+    # Each hit is logged as a pull_event so the overseer can see
+    # what external AIs are looking for and which gist prompts need
+    # to evolve.
+
+    # Maps the search target to (table_name, body_columns, token_prefix,
+    # kind_label, where_extras). The body_columns is the list of TEXT
+    # columns we substring-match against (joined with OR).
+    _SEARCH_TARGETS = {
+        "gist":      ("summaries_gist",          ["body"],
+                      "g",     "gist"),
+        "theme":     ("summaries_theme",         ["body"],
+                      "t",     "theme"),
+        "episode":   ("summaries_episode",       ["body"],
+                      "e",     "episode"),
+        "pattern":   ("patterns",                ["name", "body"],
+                      "p",     "pattern"),
+        "drift":     ("drift_observations",      ["body", "direction"],
+                      "d",     "drift"),
+        "note":      ("future_overseer_notes",   ["body"],
+                      "n",     "future_note"),
+        "journal":   ("overseer_journal",        ["entry"],
+                      "j",     "journal_entry"),
+        "narrative": ("temporal_narratives",     ["body"],
+                      None,    "temporal_narrative"),
+        "question":  ("open_questions",          ["body"],
+                      "q",     "question"),
+        "blindspot": ("known_blindspots",        ["body", "rationale"],
+                      "b",     "blindspot"),
+        "human":     ("human_journal_entries",   ["text"],
+                      None,    "human_journal_entry"),
+    }
+
+    def _http_search_corpus(self, payload):
+        """GET /plugins/overseer/search
+
+        Substring search across the overseer's interpretive corpus.
+
+        Params:
+          q          (required)  — substring to match (case-insensitive)
+          kinds      (optional)  — comma-separated subset of:
+                                   gist,theme,episode,pattern,drift,note,
+                                   journal,narrative,question,blindspot,
+                                   human. Default: all.
+          limit_per_kind (default 5)
+          limit_total    (default 40)
+          days       (optional)  — restrict to artifacts created within
+                                   the last N days
+          caller_id  (optional)  — recorded with each pull_event so the
+                                   overseer can attribute drills
+          record_pulls (default true) — log each hit as a pull_event
+
+        Returns {ok, query, hits: [{token, kind, snippet, score,
+        artifact_table, artifact_id, created_at, extras}], total,
+        truncated}.
+
+        snippet is ~200 chars of body around the first match, with
+        ellipses on either side if the body is longer.
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        q = str((payload or {}).get("q") or "").strip()
+        if not q:
+            return {"ok": False, "error": "q (query string) is required"}
+        if len(q) < 2:
+            return {"ok": False,
+                    "error": "q must be at least 2 characters"}
+
+        kinds_raw = str((payload or {}).get("kinds") or "").strip()
+        if kinds_raw:
+            requested = [k.strip() for k in kinds_raw.split(",")
+                         if k.strip()]
+            kinds = [k for k in requested if k in self._SEARCH_TARGETS]
+            if not kinds:
+                return {"ok": False,
+                        "error": "no recognized kinds in 'kinds' param; "
+                        "valid: " + ",".join(sorted(self._SEARCH_TARGETS))}
+        else:
+            kinds = list(self._SEARCH_TARGETS.keys())
+
+        limit_per_kind = _as_int(payload, "limit_per_kind", 5,
+                                 max_value=50)
+        limit_total = _as_int(payload, "limit_total", 40, max_value=200)
+        days = _as_int(payload, "days", 0, max_value=3650)
+        caller_id = str((payload or {}).get("caller_id") or "").strip() \
+            or None
+        record_pulls = (payload or {}).get("record_pulls", True)
+        if isinstance(record_pulls, str):
+            record_pulls = record_pulls.lower() not in (
+                "0", "false", "no", "")
+
+        hits = []
+        like_param = f"%{q}%"
+        truncated = False
+
+        for kind_key in kinds:
+            table, body_cols, prefix, kind_label = \
+                self._SEARCH_TARGETS[kind_key]
+            # Build the LIKE-OR clause across body columns.
+            where_parts = [f"{c} LIKE ? COLLATE NOCASE"
+                           for c in body_cols]
+            params: list = [like_param] * len(body_cols)
+            extra_where = ""
+            if days:
+                # Most tables use created_at; a few use written_at or
+                # observed_at. Try created_at first; fall back if it
+                # doesn't exist.
+                try:
+                    table_cols = {r[1] for r in
+                                  self.overseer_db._conn.execute(
+                                      f"PRAGMA table_info({table})"
+                                  ).fetchall()}
+                except Exception:
+                    table_cols = set()
+                time_col = None
+                for cand in ("created_at", "written_at",
+                             "observed_at", "pulled_at"):
+                    if cand in table_cols:
+                        time_col = cand
+                        break
+                if time_col:
+                    extra_where = (f" AND {time_col} >= "
+                                   f"datetime('now', ?)")
+                    params.append(f"-{int(days)} days")
+            sql = (
+                f"SELECT * FROM {table} WHERE ("
+                + " OR ".join(where_parts) + ")"
+                + extra_where
+                + " ORDER BY id DESC LIMIT ?"
+            )
+            params.append(int(limit_per_kind))
+            try:
+                rows = self.overseer_db._conn.execute(
+                    sql, params).fetchall()
+            except Exception as e:
+                log.warning("search target %s failed: %s", table, e)
+                continue
+            for r in rows:
+                row = dict(r)
+                # Compute the snippet from the first body column that
+                # contains the query.
+                snippet = ""
+                ql = q.lower()
+                for c in body_cols:
+                    val = (row.get(c) or "")
+                    if not val:
+                        continue
+                    idx = val.lower().find(ql)
+                    if idx == -1:
+                        continue
+                    start = max(0, idx - 80)
+                    end = min(len(val), idx + len(q) + 120)
+                    snippet = ("…" if start > 0 else "") + \
+                        val[start:end] + \
+                        ("…" if end < len(val) else "")
+                    break
+                if not snippet:
+                    # No body field matched — fallback: first 200 chars
+                    # of body for caller context.
+                    for c in body_cols:
+                        v = row.get(c) or ""
+                        if v:
+                            snippet = v[:200] + ("…" if len(v) > 200
+                                                  else "")
+                            break
+                token = None
+                if prefix:
+                    token = "{}:{}".format(prefix, row.get("id"))
+                # Created-at / period-label / etc. for context.
+                created_at = (row.get("created_at")
+                              or row.get("written_at")
+                              or row.get("observed_at")
+                              or "")
+                extras = {}
+                for cand in ("period_label", "kind", "confidence",
+                             "name", "instance_id", "direction"):
+                    if row.get(cand):
+                        extras[cand] = row[cand]
+                hits.append({
+                    "token": token,
+                    "kind": kind_label,
+                    "artifact_table": table,
+                    "artifact_id": row.get("id"),
+                    "snippet": snippet,
+                    "created_at": created_at,
+                    "extras": extras,
+                })
+                if len(hits) >= limit_total:
+                    truncated = True
+                    break
+            if truncated:
+                break
+
+        # Record pull_events (best-effort, never raises). Only token-
+        # bearing hits get parented since pull_events.artifact_id is
+        # the drilled-into row.
+        if record_pulls and hits:
+            for h in hits:
+                self.overseer_db.record_pull_event(
+                    artifact_table=h["artifact_table"],
+                    artifact_id=h["artifact_id"],
+                    surface="mcp:cortex_search",
+                    query_text=q,
+                    caller_id=caller_id,
+                )
+
+        return {
+            "ok": True,
+            "query": q,
+            "kinds_searched": kinds,
+            "hits": hits,
+            "total": len(hits),
+            "truncated": truncated,
+        }
+
+    def _http_recent_pull_events(self, payload):
+        """GET /plugins/overseer/pull-events?limit=50&surface=...&
+        artifact_table=...&days=N"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        limit = _as_int(payload, "limit", 50, max_value=500)
+        surface = str((payload or {}).get("surface") or "").strip() \
+            or None
+        artifact_table = str(
+            (payload or {}).get("artifact_table") or "").strip() or None
+        days_raw = (payload or {}).get("days")
+        days = int(days_raw) if days_raw else None
+        try:
+            events = self.overseer_db.recent_pull_events(
+                limit=limit, surface=surface,
+                artifact_table=artifact_table, days=days,
+            )
+            return {"ok": True, "events": events,
+                    "count": len(events)}
+        except Exception as e:
+            log.exception("recent_pull_events failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_pull_event_stats(self, payload):
+        """GET /plugins/overseer/pull-events/stats?days=7"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        days = _as_int(payload, "days", 7, max_value=365)
+        try:
+            return {"ok": True, **self.overseer_db.pull_event_stats(
+                days=days)}
+        except Exception as e:
+            log.exception("pull_event_stats failed")
+            return {"ok": False, "error": str(e)}
+
+    # ── Phase 1 (2026-05-27): Claude Desktop import scaffold ───────
+    #
+    # Anthropic Data Export ZIP. Phase 1 ships a dry-run only —
+    # parses the ZIP, reports conversation/message counts + sample,
+    # writes nothing. Full ingest is a follow-up slice once the parse
+    # shape has been validated against a real export.
+
+    def _http_claude_desktop_dry_run(self, payload):
+        """POST /plugins/overseer/imports/claude-desktop/dry-run
+
+        Body: {zip_path: "/abs/path/to/export.zip", preview_n: 3}
+
+        Returns parse results without writing anything to the DB.
+        Use this to validate the parser against a real export before
+        we ship the actual ingest pass.
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        zip_path = str((payload or {}).get("zip_path") or "").strip()
+        if not zip_path:
+            return {"ok": False, "error": "zip_path is required"}
+        try:
+            from claude_desktop import parse_claude_desktop_export
+        except Exception as e:
+            log.exception("claude_desktop import failed")
+            return {"ok": False,
+                    "error": "module import failed: " + str(e)}
+        try:
+            result = parse_claude_desktop_export(zip_path)
+        except FileNotFoundError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            log.exception("claude_desktop parse failed")
+            return {"ok": False,
+                    "error": "parse failed: " + str(e)}
+        # Truncate conversations list for transport — full list is
+        # only useful when ingesting. Stats stay correct.
+        preview_n = _as_int(payload, "preview_n", 3, max_value=50)
+        truncated_convos = result.get("conversations", [])[:preview_n]
+        return {
+            "ok": result.get("ok", True),
+            "zip_path": result.get("zip_path"),
+            "zip_sha256": result.get("zip_sha256"),
+            "totals": result.get("totals"),
+            "errors": result.get("errors", []),
+            "preview_conversations": truncated_convos,
+            "conversations_returned": len(truncated_convos),
+            "conversations_parsed_total": result.get(
+                "totals", {}).get("conversations", 0),
+        }
 
     def _http_distill_corrections(self, payload):
         """POST /plugins/overseer/insight/distill-corrections
