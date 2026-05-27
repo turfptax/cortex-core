@@ -43,3 +43,24 @@ dossier/
 memory/core/*.md
 !memory/core/example.*.md
 !memory/core/README.md
+
+# Vault — design + templates + example files ship publicly; rendered
+# content (real personal data) stays out of the repo. Override by
+# removing the exclusions if you want git-tracked vault on your machine.
+vault/**/*
+!vault/README.md
+!vault/DESIGN.md
+!vault/**/_template.md
+!vault/**/_template-*.md
+!vault/**/*.example.md
+# Keep the empty folder structure
+!vault/
+!vault/abstractions/
+!vault/abstractions/*/
+!vault/gists/
+!vault/journal/
+!vault/journal/*/
+!vault/narratives/
+!vault/narratives/*/
+!vault/notes-for-future-overseer/
+!vault/_meta/
