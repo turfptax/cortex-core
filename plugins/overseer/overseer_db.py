@@ -958,6 +958,36 @@ CREATE INDEX IF NOT EXISTS idx_c_agents_status
 CREATE INDEX IF NOT EXISTS idx_c_agents_parent
     ON c_agents(graduated_from_b_name);
 
+-- Sub-agent tier registry (2026-05-27): which model tier each B/C
+-- agent runs at right now. Source of truth — overrides B_AGENTS dict
+-- model field at dispatch time. Default seeded from code; Tory pulls
+-- the upgrade trigger when an agent performs poorly.
+--
+-- Tier names map to canonical OpenRouter models via
+-- llm_router.SUB_AGENT_TIER_TO_MODEL (cheap → premium):
+--   flash  → google/gemini-2.0-flash-001  (~$0.001/call)
+--   sonnet → anthropic/claude-sonnet-4.6  (~$0.02/call)
+--   opus   → anthropic/claude-opus-4.7    (~$0.10/call)
+--
+-- agent_type:
+--   b  → stateless audit dispatched via dispatch_b_agent
+--   c  → scheduled-run agent (graduated B); agent_name matches
+--        c_agents.name
+CREATE TABLE IF NOT EXISTS sub_agent_tiers (
+    agent_type TEXT NOT NULL,
+    agent_name TEXT NOT NULL,
+    model_tier TEXT NOT NULL,
+    tier_set_at TEXT NOT NULL DEFAULT (datetime('now')),
+    tier_set_by TEXT NOT NULL DEFAULT 'default',
+    notes TEXT NOT NULL DEFAULT '',
+    last_model_used TEXT NOT NULL DEFAULT '',
+    last_invoked_at TEXT,
+    invocation_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent_type, agent_name)
+);
+CREATE INDEX IF NOT EXISTS idx_sub_agent_tiers_type
+    ON sub_agent_tiers(agent_type);
+
 -- Phase 1 (2026-05-27, three-layer architecture seed): every time an
 -- external AI (or the Hub, or the vault renderer) drills past an
 -- abstraction into a deeper layer, log a pull_event. A pull is a
@@ -1750,6 +1780,38 @@ class OverseerDB(CortexDB):
                      "backfill_categories() to populate cwd-signal rows")
         self._migrate_phase1_pull_events()
 
+    def _seed_sub_agent_tiers(self):
+        """Seed the sub_agent_tiers table with default rows for the
+        known B-agents on first boot. C-agents seed themselves at
+        graduation time. Idempotent — INSERT OR IGNORE.
+
+        Defaults locked 2026-05-27 with overseer's input:
+        - theme_check  → sonnet (confidence-calibration nuance)
+        - project_merge_check → flash (structural comparison, cheap is fine)
+        Everything else added later defaults to flash.
+        """
+        defaults = (
+            ("b", "theme_check",        "sonnet",
+             "Theme confidence calibration needs nuance reading; Flash "
+             "pattern-matches 'evidence exists → calibrated' and misses "
+             "the overconfident calls (per overseer L99 audit 2026-05-27)."),
+            ("b", "project_merge_check", "flash",
+             "Structural same/distinct/subproject comparison — Flash "
+             "handles this cleanly. Upgrade if Tory rates output poorly."),
+        )
+        for agent_type, agent_name, tier, notes in defaults:
+            try:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO sub_agent_tiers "
+                    "(agent_type, agent_name, model_tier, tier_set_by, "
+                    " notes) VALUES (?, ?, ?, 'default', ?)",
+                    (agent_type, agent_name, tier, notes),
+                )
+            except Exception as e:
+                log.warning("seed sub_agent_tier %s/%s failed: %s",
+                            agent_type, agent_name, e)
+        self._safe_commit()
+
     def _migrate_phase1_pull_events(self):
         """Phase 1 (2026-05-27): pull_events + gist_prompts tables.
 
@@ -1786,6 +1848,8 @@ class OverseerDB(CortexDB):
                 "_migrate_phase1_pull_events: gist_prompts table missing "
                 "after schema bootstrap"
             )
+        # Chain: sub-agent tier registry seed (2026-05-27).
+        self._seed_sub_agent_tiers()
 
     def _migrate_9_6_notification_actions(self):
         """Slice 9.6 CP1 (2026-05-19): notifications gain actions_json
@@ -4648,6 +4712,130 @@ class OverseerDB(CortexDB):
             (kind,),
         ).fetchone()
         return dict(row) if row else None
+
+    # ── Sub-agent tier registry (2026-05-27) ────────────────────
+    #
+    # Tory's directive: run B/C agents as cheap as possible, with a
+    # human-pull upgrade trigger when output is poor. Tier choices
+    # persist across restarts so a system reboot doesn't reset a
+    # manual upgrade.
+
+    _VALID_TIERS = ("flash", "sonnet", "opus")
+
+    def get_sub_agent_tier(self, agent_type, agent_name):
+        """Return the row for one sub-agent. None if no row exists
+        (which means the agent hasn't been seeded — caller should
+        seed-then-fetch via ensure_sub_agent_tier instead)."""
+        row = self._conn.execute(
+            "SELECT * FROM sub_agent_tiers "
+            "WHERE agent_type = ? AND agent_name = ?",
+            (str(agent_type), str(agent_name)),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def ensure_sub_agent_tier(self, agent_type, agent_name,
+                                default_tier="flash",
+                                default_notes=""):
+        """Get the tier row; insert with `default_tier` if missing.
+        Returns the row. Idempotent."""
+        existing = self.get_sub_agent_tier(agent_type, agent_name)
+        if existing:
+            return existing
+        if default_tier not in self._VALID_TIERS:
+            default_tier = "flash"
+        self._conn.execute(
+            "INSERT OR IGNORE INTO sub_agent_tiers "
+            "(agent_type, agent_name, model_tier, tier_set_by, notes) "
+            "VALUES (?, ?, ?, 'default', ?)",
+            (str(agent_type), str(agent_name), default_tier,
+             str(default_notes)),
+        )
+        self._safe_commit()
+        return self.get_sub_agent_tier(agent_type, agent_name)
+
+    def set_sub_agent_tier(self, agent_type, agent_name, tier, *,
+                            set_by="human", notes=""):
+        """Change a sub-agent's tier. Returns the updated row.
+        Raises ValueError on bad tier."""
+        if tier not in self._VALID_TIERS:
+            raise ValueError(
+                f"tier must be one of {self._VALID_TIERS}, got {tier!r}")
+        # Make sure the row exists first.
+        self.ensure_sub_agent_tier(agent_type, agent_name)
+        self._conn.execute(
+            "UPDATE sub_agent_tiers SET model_tier = ?, "
+            "  tier_set_at = datetime('now'), tier_set_by = ?, "
+            "  notes = ? "
+            "WHERE agent_type = ? AND agent_name = ?",
+            (tier, str(set_by), str(notes), str(agent_type),
+             str(agent_name)),
+        )
+        self._safe_commit()
+        return self.get_sub_agent_tier(agent_type, agent_name)
+
+    def record_sub_agent_invocation(self, agent_type, agent_name,
+                                      model_used):
+        """Update the tier row with the actual model used + last-run
+        timestamp + bump invocation_count. Called by dispatch paths
+        after every successful run. Fire-and-forget — never raises."""
+        try:
+            self.ensure_sub_agent_tier(agent_type, agent_name)
+            self._conn.execute(
+                "UPDATE sub_agent_tiers SET "
+                "  last_model_used = ?, "
+                "  last_invoked_at = datetime('now'), "
+                "  invocation_count = invocation_count + 1 "
+                "WHERE agent_type = ? AND agent_name = ?",
+                (str(model_used or ""), str(agent_type),
+                 str(agent_name)),
+            )
+            self._safe_commit()
+        except Exception as e:
+            log.warning("record_sub_agent_invocation %s/%s failed: %s",
+                        agent_type, agent_name, e)
+
+    def list_sub_agent_tiers(self):
+        """Every row. Used by /sub-agents listing."""
+        rows = self._conn.execute(
+            "SELECT * FROM sub_agent_tiers "
+            "ORDER BY agent_type ASC, agent_name ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def sub_agent_performance(self, agent_type, agent_name, *,
+                                last_n=10):
+        """Recent quality_rating signal for one sub-agent. Reads from
+        sibling_tasks where the B/C agent dispatched the task.
+
+        For B-agents: claimed_by = 'b-agent:<name>'.
+        For C-agents: claimed_by = 'c-agent:<name>'.
+
+        Returns:
+          {recent: [{id, rating, claimed_at, model}], n: int,
+           avg_rating: float|None, rated_count: int, unrated_count: int}
+        """
+        claimed_by = f"{agent_type}-agent:{agent_name}"
+        rows = self._conn.execute(
+            "SELECT id, quality_rating, claimed_at, "
+            "       actual_model_used, completed_at "
+            "FROM sibling_tasks "
+            "WHERE claimed_by = ? AND status = 'completed' "
+            "ORDER BY claimed_at DESC LIMIT ?",
+            (claimed_by, int(last_n)),
+        ).fetchall()
+        rated = [dict(r) for r in rows
+                 if r["quality_rating"] is not None]
+        unrated = [dict(r) for r in rows
+                   if r["quality_rating"] is None]
+        avg = (sum(r["quality_rating"] for r in rated) / len(rated)
+               if rated else None)
+        return {
+            "recent": [dict(r) for r in rows],
+            "n": len(rows),
+            "avg_rating": round(avg, 2) if avg is not None else None,
+            "rated_count": len(rated),
+            "unrated_count": len(unrated),
+        }
 
     # ── Phase 1 (2026-05-27): pull_events ───────────────────────
     #

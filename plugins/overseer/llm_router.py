@@ -47,6 +47,35 @@ SECRETS_DEFAULT_CANDIDATES = (
 )
 
 
+# Sub-agent model-tier resolution (2026-05-27).
+#
+# Tory's directive: B/C sub-agents run as inexpensively as possible
+# by default, and Tory pulls the upgrade trigger when output is poor.
+# The TIER is the human-facing knob; SUB_AGENT_TIER_TO_MODEL is the
+# implementation-side mapping. If models update, change one constant
+# here and every sub-agent gets the new model on its next dispatch.
+#
+# Cost shape (May 2026 OpenRouter pricing, approximate per-call):
+#   flash  ~$0.001 — Gemini 2.0 Flash, ~140× cheaper than Opus
+#   sonnet ~$0.02  — Claude Sonnet 4.6
+#   opus   ~$0.10  — Claude Opus 4.7
+SUB_AGENT_TIER_TO_MODEL = {
+    "flash":  "google/gemini-2.0-flash-001",
+    "sonnet": "anthropic/claude-sonnet-4.6",
+    "opus":   "anthropic/claude-opus-4.7",
+}
+
+
+def resolve_sub_agent_model(tier, default_model=None):
+    """Map a tier name to an OpenRouter model id. Unknown tier falls
+    back to `default_model` if provided, else 'flash' resolution."""
+    if tier in SUB_AGENT_TIER_TO_MODEL:
+        return SUB_AGENT_TIER_TO_MODEL[tier]
+    if default_model:
+        return default_model
+    return SUB_AGENT_TIER_TO_MODEL["flash"]
+
+
 def _resolve_candidate(p) -> Path:
     """Expand ~ and env vars; return Path (not necessarily existing)."""
     return Path(os.path.expanduser(os.path.expandvars(str(p))))

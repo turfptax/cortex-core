@@ -144,8 +144,9 @@ MARKER = "## Generated below this line — edits above are preserved"
 def _render_one(out_path: Path, frontmatter: dict, title: str,
                 body_below_marker: str) -> dict:
     """Write a file with frontmatter + marker + loop-owned body. Always
-    writes for v1 (no skip-on-hash yet). Returns a small dict with
-    bookkeeping fields."""
+    writes for v1 (no skip-on-hash yet). Returns a small dict whose
+    `path` field the orchestrator adds to the render manifest for the
+    end-of-render orphan sweep."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     contents = (
         render_frontmatter(frontmatter)
@@ -158,7 +159,65 @@ def _render_one(out_path: Path, frontmatter: dict, title: str,
         + "\n"
     )
     out_path.write_text(contents, encoding="utf-8")
-    return {"path": str(out_path), "bytes": len(contents)}
+    return {"path": str(out_path.resolve()),
+            "bytes": len(contents)}
+
+
+# Folder roots the generator owns. Any *.md inside these folders that
+# isn't in the per-run manifest is an orphan (its source row was
+# deleted or renamed since the previous render). The orchestrator
+# sweeps these folders at end-of-render and deletes orphans.
+#
+# IMPORTANT: README.md + _meta/last-render.md are loop-owned but
+# emitted *after* the per-table renders, so they're added to the
+# manifest separately.
+_GHOST_SWEEP_ROOTS = (
+    "abstractions/projects",
+    "abstractions/people",
+    "abstractions/themes",
+    "abstractions/patterns",
+    "abstractions/drift",
+    "abstractions/questions",
+    "gists",
+    "journal/daily",
+    "journal/overseer",
+    "narratives/daily",
+    "narratives/weekly",
+    "narratives/monthly",
+    "narratives/yearly",
+    "notes-for-future-overseer",
+)
+
+
+def _sweep_orphans(out_root: Path, manifest: set) -> dict:
+    """Walk the owned folders, delete any *.md file whose absolute
+    path isn't in `manifest`. Returns counts for the meta file.
+
+    A safety floor: never deletes if the manifest is empty (would
+    nuke the whole vault) and never deletes files outside the
+    owned folders.
+    """
+    if not manifest:
+        return {"orphans_deleted": 0, "orphans_skipped_no_manifest": 1,
+                "orphan_files": []}
+    deleted: list = []
+    for sub in _GHOST_SWEEP_ROOTS:
+        folder = out_root / sub
+        if not folder.exists():
+            continue
+        for md in folder.rglob("*.md"):
+            try:
+                abs_path = str(md.resolve())
+            except Exception:
+                continue
+            if abs_path not in manifest:
+                try:
+                    md.unlink()
+                    deleted.append(str(md.relative_to(out_root)))
+                except Exception as e:
+                    log.warning("ghost-sweep: could not delete %s: %s",
+                                md, e)
+    return {"orphans_deleted": len(deleted), "orphan_files": deleted}
 
 
 def render_project(out_root: Path, row: dict, render_at: str) -> dict:
@@ -430,13 +489,20 @@ def render_vault(db, out_dir: str, *,
     counts: dict = {}
     errors: list = []
     render_at = _iso_local_now()
+    # Manifest of every absolute file path the loop owns and wrote
+    # this run. Used for orphan sweep at end-of-render. L99 follow-up
+    # 2026-05-27 — overseer flagged ghost files as same class of bug
+    # as the column-name silent failures.
+    manifest: set = set()
 
     def _bump(key: str):
         counts[key] = counts.get(key, 0) + 1
 
     def _try(table: str, row: dict, fn):
         try:
-            fn(out_root, row, render_at)
+            result = fn(out_root, row, render_at)
+            if isinstance(result, dict) and result.get("path"):
+                manifest.add(result["path"])
             _bump(table)
         except Exception as e:
             errors.append((table, row.get("id"), str(e)))
@@ -486,7 +552,10 @@ def render_vault(db, out_dir: str, *,
         by_day.setdefault(date_key, []).append(row)
     for date_str, rows in by_day.items():
         try:
-            render_human_journal_day(out_root, date_str, rows, render_at)
+            result = render_human_journal_day(
+                out_root, date_str, rows, render_at)
+            if isinstance(result, dict) and result.get("path"):
+                manifest.add(result["path"])
             _bump("human_journal_days")
         except Exception as e:
             errors.append(("human_journal_days", date_str, str(e)))
@@ -514,6 +583,13 @@ def render_vault(db, out_dir: str, *,
             break
         offset += page
 
+    # Orphan sweep BEFORE writing meta/README so the sweep doesn't
+    # delete those (they're added to manifest after this point).
+    sweep_result = _sweep_orphans(out_root, manifest)
+    if sweep_result.get("orphans_deleted"):
+        log_fn("vault_generator: orphan sweep removed %d files",
+                sweep_result["orphans_deleted"])
+
     # Last-render meta file
     duration = time.time() - started
     last_render_path = out_root / "_meta" / "last-render.md"
@@ -529,6 +605,16 @@ def render_vault(db, out_dir: str, *,
     body_lines.append("|---|---|")
     for k, v in sorted(counts.items()):
         body_lines.append(f"| {k} | {v} |")
+    orphans_deleted = sweep_result.get("orphans_deleted", 0)
+    orphan_files = sweep_result.get("orphan_files", [])
+    body_lines.append("")
+    body_lines.append(f"## Orphan sweep: {orphans_deleted} file(s) deleted")
+    if orphan_files:
+        body_lines.append("")
+        for f in orphan_files[:50]:
+            body_lines.append(f"- {f}")
+        if len(orphan_files) > 50:
+            body_lines.append(f"- … +{len(orphan_files) - 50} more")
     if errors:
         body_lines.append("")
         body_lines.append("## Errors")
@@ -604,6 +690,8 @@ def render_vault(db, out_dir: str, *,
         "out_dir": str(out_root),
         "counts": counts,
         "duration_s": round(duration, 2),
+        "orphans_deleted": sweep_result.get("orphans_deleted", 0),
+        "orphan_files": sweep_result.get("orphan_files", [])[:20],
         "errors": [
             {"table": t, "id": i, "msg": m}
             for (t, i, m) in errors[:50]

@@ -392,6 +392,13 @@ class OverseerPlugin(Plugin):
             # ── Phase 2 (2026-05-27): vault generator (scaffold) ─
             Route("POST", "/vault/render",
                   self._http_vault_render),
+            # ── Sub-agent tiers (2026-05-27): cost discipline ────
+            Route("GET",  "/sub-agents",
+                  self._http_list_sub_agents),
+            Route("POST", "/sub-agents/set-tier",
+                  self._http_set_sub_agent_tier),
+            Route("GET",  "/sub-agents/performance",
+                  self._http_sub_agent_performance),
         ]
 
     # ── Lifecycle ───────────────────────────────────────────────
@@ -2714,6 +2721,125 @@ class OverseerPlugin(Plugin):
     # output directory. Scaffold pass = no atomic swap, no hand-edit
     # preservation, no sensitivity gating yet. See
     # plugins/overseer/vault_generator.py for the full scope.
+
+    # ── Sub-agent tier management (2026-05-27) ─────────────────────
+    #
+    # Tory's directive: B/C agents run as cheap as possible by default,
+    # human pulls the upgrade trigger when output is poor. Tier
+    # choices persist across restarts (sub_agent_tiers table).
+    # dispatch_b_agent reads from this registry every call and records
+    # actual_model_used + last_invoked_at on every successful run.
+
+    def _http_list_sub_agents(self, payload):
+        """GET /plugins/overseer/sub-agents
+
+        Returns the full sub-agent registry plus the code-side defaults
+        from B_AGENTS so the caller can see what's seeded vs what's
+        been customized.
+
+        Each row:
+          agent_type, agent_name, model_tier, tier_set_at, tier_set_by,
+          notes, last_model_used, last_invoked_at, invocation_count,
+          default_tier (from B_AGENTS, may differ from model_tier if
+          Tory has upgraded), available_tiers (the valid options)
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        try:
+            from llm_router import SUB_AGENT_TIER_TO_MODEL
+            import b_agents as _b_agents
+            rows = self.overseer_db.list_sub_agent_tiers()
+            # Annotate each row with the code-side default for compare.
+            for r in rows:
+                if r.get("agent_type") == "b":
+                    spec = _b_agents.B_AGENTS.get(r["agent_name"], {})
+                    r["default_tier"] = spec.get("default_tier", "flash")
+                    r["default_tier_rationale"] = spec.get(
+                        "default_tier_rationale", "")
+                else:
+                    # C-agents: pull from c_agents.model if present
+                    r["default_tier"] = "flash"
+                    r["default_tier_rationale"] = ""
+                r["current_model"] = SUB_AGENT_TIER_TO_MODEL.get(
+                    r.get("model_tier", "flash"),
+                    SUB_AGENT_TIER_TO_MODEL["flash"])
+            return {
+                "ok": True,
+                "sub_agents": rows,
+                "available_tiers": list(SUB_AGENT_TIER_TO_MODEL.keys()),
+                "tier_to_model": SUB_AGENT_TIER_TO_MODEL,
+            }
+        except Exception as e:
+            log.exception("list_sub_agents failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_set_sub_agent_tier(self, payload):
+        """POST /plugins/overseer/sub-agents/set-tier
+
+        Body: {agent_type: 'b'|'c', agent_name: str,
+               tier: 'flash'|'sonnet'|'opus', notes?: str}
+
+        Changes the tier for one sub-agent. Persists across restarts.
+        Next dispatch picks up the new tier.
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        p = payload or {}
+        agent_type = str(p.get("agent_type") or "").strip()
+        agent_name = str(p.get("agent_name") or "").strip()
+        tier = str(p.get("tier") or "").strip()
+        notes = str(p.get("notes") or "").strip()
+        if agent_type not in ("b", "c"):
+            return {"ok": False,
+                    "error": "agent_type must be 'b' or 'c'"}
+        if not agent_name:
+            return {"ok": False, "error": "agent_name is required"}
+        if not tier:
+            return {"ok": False,
+                    "error": "tier is required (flash|sonnet|opus)"}
+        try:
+            row = self.overseer_db.set_sub_agent_tier(
+                agent_type, agent_name, tier,
+                set_by="human", notes=notes,
+            )
+            return {"ok": True, "row": row}
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            log.exception("set_sub_agent_tier failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_sub_agent_performance(self, payload):
+        """GET /plugins/overseer/sub-agents/performance
+            ?agent_type=b&agent_name=theme_check&last_n=10
+
+        Quality-rating signal for one sub-agent. Reads the last N
+        sibling_tasks completed under claimed_by='b-agent:<name>' or
+        'c-agent:<name>' and returns rating stats + recent actual
+        models used.
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        p = payload or {}
+        agent_type = str(p.get("agent_type") or "").strip()
+        agent_name = str(p.get("agent_name") or "").strip()
+        last_n = _as_int(payload, "last_n", 10, max_value=100)
+        if agent_type not in ("b", "c"):
+            return {"ok": False,
+                    "error": "agent_type must be 'b' or 'c'"}
+        if not agent_name:
+            return {"ok": False, "error": "agent_name is required"}
+        try:
+            return {
+                "ok": True,
+                "agent_type": agent_type,
+                "agent_name": agent_name,
+                **self.overseer_db.sub_agent_performance(
+                    agent_type, agent_name, last_n=last_n),
+            }
+        except Exception as e:
+            log.exception("sub_agent_performance failed")
+            return {"ok": False, "error": str(e)}
 
     def _http_vault_render(self, payload):
         """POST /plugins/overseer/vault/render

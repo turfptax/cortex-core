@@ -75,8 +75,20 @@ B_TOOL_PREFIX = "dispatch_b_"
 def _register(name: str, *, description: str, parameters_schema: dict,
               system_prompt: str, snapshot_builder: Callable,
               model: str, marker: str, max_tokens: int = 800,
-              short_marker_name: str = ""):
-    """Register a B-agent. Called at module load (see bottom)."""
+              short_marker_name: str = "",
+              default_tier: str = "flash",
+              default_tier_rationale: str = ""):
+    """Register a B-agent. Called at module load (see bottom).
+
+    `default_tier` is the code-side cost-discipline default for this
+    agent — used by dispatch_b_agent to seed the sub_agent_tiers row
+    on first run. Tory can override via /sub-agents/set-tier; the DB
+    row is the source of truth from that point forward.
+
+    `model` is the fallback model used only when the tier registry is
+    unreachable (DB error, migration mid-flight). The registry +
+    SUB_AGENT_TIER_TO_MODEL is the normal path.
+    """
     B_AGENTS[name] = {
         "description": description,
         "parameters_schema": parameters_schema,
@@ -86,6 +98,8 @@ def _register(name: str, *, description: str, parameters_schema: dict,
         "marker": marker,
         "max_tokens": max_tokens,
         "short_marker_name": short_marker_name or name.replace("_", "-"),
+        "default_tier": default_tier,
+        "default_tier_rationale": default_tier_rationale,
     }
 
 
@@ -116,6 +130,17 @@ def dispatch_b_agent(name: str, args: dict, *, db, core_memory,
     Returns a dict the chat-tool layer will JSON-serialize as the
     tool result. Errors are surfaced as `{error: "..."}` so the
     overseer can react rather than crash.
+
+    Model selection (2026-05-27): reads the persisted tier from
+    sub_agent_tiers via OverseerDB. If no row exists, seeds with the
+    code-side default tier from the B-agent spec, then runs that. The
+    spec's `model` field is now a fallback used only when the tier
+    table is unreachable; the registry is the source of truth.
+
+    Per-invocation tracking: record_sub_agent_invocation captures the
+    actual model that ran + bumps invocation_count + updates
+    last_invoked_at on every successful dispatch. Tory can read the
+    current model for any B-agent without parsing logs.
     """
     if name not in B_AGENTS:
         return {"error": f"unknown B agent: {name}"}
@@ -141,6 +166,31 @@ def dispatch_b_agent(name: str, args: dict, *, db, core_memory,
     log.info("b_agent %s: snapshot built (%d chars)", name,
              len(snapshot_text))
 
+    # Resolve the model via the tier registry. Default tier per agent
+    # comes from the spec (DEFAULT_TIER); the registry can override.
+    default_tier = spec.get("default_tier", "flash")
+    model_to_use = spec.get("model", "")  # fallback if registry unreachable
+    tier_used = default_tier
+    try:
+        from llm_router import (
+            SUB_AGENT_TIER_TO_MODEL, resolve_sub_agent_model,
+        )
+        tier_row = db.ensure_sub_agent_tier(
+            "b", name,
+            default_tier=default_tier,
+            default_notes=spec.get("default_tier_rationale", ""),
+        )
+        tier_used = (tier_row or {}).get("model_tier") or default_tier
+        model_to_use = resolve_sub_agent_model(
+            tier_used, default_model=spec.get("model", ""))
+    except Exception as e:
+        log.warning(
+            "b_agent %s: tier resolution failed (%s); using spec model %s",
+            name, e, model_to_use,
+        )
+
+    log.info("b_agent %s: tier=%s model=%s", name, tier_used, model_to_use)
+
     # Frozen system prompt + structured snapshot. The B sees ONLY the
     # snapshot — no rolling chat history, no working memory, no other
     # B outputs. Statelessness by construction.
@@ -148,7 +198,7 @@ def dispatch_b_agent(name: str, args: dict, *, db, core_memory,
     result = llm.complete(
         prompt=snapshot_text,
         system=spec["system_prompt"],
-        model=spec["model"],
+        model=model_to_use,
         max_tokens=spec["max_tokens"],
         temperature=0.3,  # B is an audit — low temp; not creative work
         purpose=f"b_agent:{name}",
@@ -168,12 +218,14 @@ def dispatch_b_agent(name: str, args: dict, *, db, core_memory,
                     name, marker)
         output_text = f"{marker} (auto-wrapped) {output_text}"
 
+    actual_model = result.get("model", "") or model_to_use
+
     persist = db.b_agent_dispatch(
         b_agent_name=name,
         prompt=snapshot_text[:2000],  # short prompt summary
         snapshot=snapshot,
         output_text=output_text,
-        model_used=result.get("model", ""),
+        model_used=actual_model,
         cost_usd=float(result.get("cost_usd") or 0.0),
         latency_ms=latency_ms,
         daily_cap=b_daily_cap,
@@ -183,6 +235,14 @@ def dispatch_b_agent(name: str, args: dict, *, db, core_memory,
         # Cap exhaustion or marker validation failure — surface to caller.
         return {"error": persist.get("error", "persist failed")}
 
+    # Record per-invocation tracking so Tory can see at a glance which
+    # model ran an agent last + how many times it's run since the tier
+    # change. Fire-and-forget.
+    try:
+        db.record_sub_agent_invocation("b", name, actual_model)
+    except Exception as e:
+        log.warning("record_sub_agent_invocation %s failed: %s", name, e)
+
     return {
         "ok": True,
         "b_agent": name,
@@ -190,7 +250,8 @@ def dispatch_b_agent(name: str, args: dict, *, db, core_memory,
         "output": output_text,
         "transcript_id": persist["transcript_id"],
         "sibling_task_id": persist["sibling_task_id"],
-        "model_used": result.get("model", ""),
+        "model_used": actual_model,
+        "tier_used": tier_used,
         "cost_usd": float(result.get("cost_usd") or 0.0),
         "latency_ms": latency_ms,
         "used_today": persist.get("used_today"),
@@ -343,6 +404,16 @@ _register(
     marker="[B:theme-check]",
     max_tokens=600,
     short_marker_name="theme-check",
+    # Default sonnet per overseer's L99 audit 2026-05-27: theme
+    # confidence calibration is the one B-agent whose whole job is
+    # reading nuance in evidence-versus-claim. Flash pattern-matches
+    # 'evidence exists → calibrated' and misses overconfident calls.
+    default_tier="sonnet",
+    default_tier_rationale=(
+        "Confidence-calibration nuance — Flash misses overconfident "
+        "calls per overseer L99 audit 2026-05-27. Upgrade to opus if "
+        "ratings stay <3."
+    ),
 )
 
 
@@ -546,4 +617,11 @@ _register(
     marker="[B:project-merge-check]",
     max_tokens=600,
     short_marker_name="project-merge-check",
+    # Default flash: structural same/distinct/subproject comparison
+    # is well within Flash capability. Upgrade if Tory rates poorly.
+    default_tier="flash",
+    default_tier_rationale=(
+        "Structural same/distinct/subproject comparison — Flash "
+        "handles cleanly. Upgrade to sonnet if Tory rates output <3."
+    ),
 )
