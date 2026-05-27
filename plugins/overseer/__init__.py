@@ -389,6 +389,9 @@ class OverseerPlugin(Plugin):
             # ── Phase 1 (2026-05-27): Claude Desktop import scaffold
             Route("POST", "/imports/claude-desktop/dry-run",
                   self._http_claude_desktop_dry_run),
+            # ── Phase 2 (2026-05-27): vault generator (scaffold) ─
+            Route("POST", "/vault/render",
+                  self._http_vault_render),
         ]
 
     # ── Lifecycle ───────────────────────────────────────────────
@@ -2693,6 +2696,53 @@ class OverseerPlugin(Plugin):
             "conversations_parsed_total": result.get(
                 "totals", {}).get("conversations", 0),
         }
+
+    # ── Phase 2 (2026-05-27): vault generator scaffold ────────────
+    #
+    # Renders interpretive tables to markdown under a configured
+    # output directory. Scaffold pass = no atomic swap, no hand-edit
+    # preservation, no sensitivity gating yet. See
+    # plugins/overseer/vault_generator.py for the full scope.
+
+    def _http_vault_render(self, payload):
+        """POST /plugins/overseer/vault/render
+
+        Body: {
+          out_dir: "/abs/path/to/vault" (default: ~/cortex-vault),
+          gist_limit: int (0 = all, default 0)
+        }
+
+        Renders the full vault. Returns counts + duration + any
+        per-row errors. Synchronous — Phase 2.2 makes it async with
+        progress polling.
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        out_dir = str(
+            (payload or {}).get("out_dir")
+            or self.api.config.get("vault_output_dir")
+            or "~/cortex-vault"
+        )
+        gist_limit = _as_int(payload, "gist_limit", 0,
+                              max_value=10000)
+        try:
+            from vault_generator import render_vault
+        except Exception as e:
+            log.exception("vault_generator import failed")
+            return {"ok": False,
+                    "error": "vault_generator import failed: "
+                              + str(e)}
+        try:
+            result = render_vault(
+                self.overseer_db, out_dir,
+                gist_limit=gist_limit,
+                log_fn=log.info,
+            )
+            return result
+        except Exception as e:
+            log.exception("vault render failed")
+            return {"ok": False,
+                    "error": "vault render failed: " + str(e)}
 
     def _http_distill_corrections(self, payload):
         """POST /plugins/overseer/insight/distill-corrections
