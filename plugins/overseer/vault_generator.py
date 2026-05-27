@@ -186,7 +186,9 @@ def render_project(out_root: Path, row: dict, render_at: str) -> dict:
 
 
 def render_theme(out_root: Path, row: dict, render_at: str) -> dict:
-    title = row.get("title") or row.get("name") or f"theme-{row.get('id')}"
+    # summaries_theme schema: title (NOT NULL), body, confidence,
+    # first_seen_at, last_reinforced_at, created_at. L99 fix 2026-05-27.
+    title = row.get("title") or f"theme-{row.get('id')}"
     slug = slugify(title) or f"theme-{row.get('id')}"
     out = out_root / "abstractions" / "themes" / f"{slug}.md"
     fm = {
@@ -194,6 +196,8 @@ def render_theme(out_root: Path, row: dict, render_at: str) -> dict:
         "id": row.get("id"),
         "slug": slug,
         "confidence": row.get("confidence") or "med",
+        "first_seen_at": (row.get("first_seen_at") or "")[:10],
+        "last_reinforced_at": (row.get("last_reinforced_at") or "")[:10],
         "created_at": (row.get("created_at") or "")[:10],
         "source_hash": source_hash(row),
         "render_at": render_at,
@@ -203,9 +207,15 @@ def render_theme(out_root: Path, row: dict, render_at: str) -> dict:
 
 
 def render_question(out_root: Path, row: dict, render_at: str) -> dict:
+    # open_questions schema: question (NOT NULL — the actual text),
+    # body (longer body, default ""), confidence, lifecycle,
+    # first_observed_at, last_observed_at, evidence_count. L99 fix
+    # 2026-05-27: title was reading .body (often empty); should use
+    # .question as primary.
     qid = row.get("id")
-    body_text = row.get("body") or row.get("question") or ""
-    short = short_slug(body_text, max_len=40)
+    question_text = row.get("question") or row.get("body") or ""
+    body_text = row.get("body") or ""
+    short = short_slug(question_text, max_len=40)
     qslug = f"q{int(qid):03d}-{short}" if qid is not None else f"q-{short}"
     out = out_root / "abstractions" / "questions" / f"{qslug}.md"
     fm = {
@@ -213,15 +223,17 @@ def render_question(out_root: Path, row: dict, render_at: str) -> dict:
         "id": qid,
         "slug": qslug,
         "confidence": row.get("confidence") or "med",
-        "lifecycle": row.get("lifecycle") or row.get("status") or "active",
-        "first_filed": (row.get("created_at") or "")[:10],
-        "last_updated": (row.get("updated_at") or
-                         row.get("created_at") or "")[:10],
+        "lifecycle": row.get("lifecycle") or "active",
+        "is_active": bool(row.get("is_active", 1)),
+        "evidence_count": row.get("evidence_count") or 0,
+        "first_filed": (row.get("first_observed_at") or "")[:10],
+        "last_updated": (row.get("last_observed_at") or "")[:10],
         "source_hash": source_hash(row),
         "render_at": render_at,
     }
-    title = body_text[:120] + ("…" if len(body_text) > 120 else "")
-    body = "### Question\n" + body_text + "\n"
+    title = question_text[:120] + ("…" if len(question_text) > 120 else "")
+    body = ("### Question\n" + question_text + "\n"
+            + (("\n### Notes\n" + body_text + "\n") if body_text else ""))
     return _render_one(out, fm, title, body)
 
 
@@ -292,16 +304,20 @@ def render_overseer_journal(out_root: Path, row: dict,
     tick_id_zero_padded = f"{int(jid):05d}" if jid is not None else "00000"
     out = (out_root / "journal" / "overseer"
            / f"tick-{tick_id_zero_padded}.md")
+    # overseer_journal columns confirmed 2026-05-27 (L99): written_at +
+    # local_written_at carry the tick time (NOT created_at); body
+    # carries the entry text. Earlier .entry fallback would have
+    # produced empty bodies if .body wasn't there.
     fm = {
         "type": "journal-overseer",
         "tick_id": jid,
-        "tick_at": row.get("local_created_at")
-                   or row.get("created_at") or "",
-        "provenance": row.get("provenance") or row.get("model") or "",
+        "tick_at": row.get("local_written_at")
+                   or row.get("written_at") or "",
+        "provenance": row.get("model") or row.get("backend") or "",
         "source_hash": source_hash(row),
         "render_at": render_at,
     }
-    body_text = row.get("entry") or row.get("body") or ""
+    body_text = row.get("body") or row.get("entry") or ""
     title = body_text.split("\n", 1)[0][:80] or f"tick #{jid}"
     return _render_one(out, fm, title, body_text)
 
@@ -324,7 +340,9 @@ def render_temporal_narrative(out_root: Path, row: dict,
         "render_at": render_at,
     }
     title = label
-    body_text = row.get("body") or ""
+    # Column is `narrative` not `body` — L99 fix 2026-05-27. Earlier
+    # render emitted 215 empty narrative files because we read .body.
+    body_text = row.get("narrative") or row.get("body") or ""
     return _render_one(out, fm, title, body_text)
 
 
@@ -389,6 +407,11 @@ def render_vault(db, out_dir: str, *,
     Args:
       db: an OverseerDB instance.
       out_dir: filesystem path to render into. Created if missing.
+                Caller MUST pass an absolute path readable by the
+                human user — the caller knows whose home it lives
+                under; the service may run as root, so `~` expansion
+                here lands wherever the SERVICE thinks home is, not
+                where the human user expects.
       gist_limit: max gists to render (0 = all). v1 default = all.
       log_fn: optional callable for progress logging.
 
@@ -520,6 +543,58 @@ def render_vault(db, out_dir: str, *,
         encoding="utf-8",
     )
 
+    # L99 must-fix #D (2026-05-27): emit a card-catalog README at the
+    # vault root so external AIs landing here have a starting point.
+    # Plain markdown — works in any viewer.
+    readme_path = out_root / "README.md"
+    readme_text = (
+        "# Cortex Vault — rendered output\n\n"
+        f"*Rendered: {render_at}*\n\n"
+        "This directory is the human/AI-readable mirror of Cortex's\n"
+        "interpretive memory layer. Files are markdown + YAML\n"
+        "frontmatter, generated from `overseer.db` on the Pi.\n\n"
+        "## Where to start (for external AIs)\n\n"
+        "1. **`abstractions/projects/`** — what Tory is working on,\n"
+        "   ordered by recent activity.\n"
+        "2. **`abstractions/themes/`** — recurring patterns the\n"
+        "   overseer has identified across sessions.\n"
+        "3. **`abstractions/questions/`** — open questions Tory is\n"
+        "   working through, with evidence trails.\n"
+        "4. **`narratives/weekly/`** — most-recent-first temporal\n"
+        "   synthesis. Read the last 2-3 weeks to anchor in time.\n"
+        "5. **`journal/overseer/`** — overseer's tick-by-tick\n"
+        "   reflection (technical thinking layer).\n"
+        "6. **`journal/daily/`** — Tory's own daily journal entries.\n"
+        "7. **`_meta/last-render.md`** — staleness check (this file).\n\n"
+        "## Counts in this render\n\n"
+        "| Folder | Files |\n"
+        "|---|---|\n"
+        + "\n".join(f"| {k} | {v} |" for k, v in sorted(counts.items()))
+        + "\n\n"
+        "## Constraints\n\n"
+        "- **Loop-write right now.** Hand-edit preservation is a\n"
+        "  Phase 2.2 feature; until it lands, edits below the\n"
+        "  `## Generated below this line` marker will be clobbered\n"
+        "  on the next render.\n"
+        "- **No sensitivity gating yet.** Content tier is rendered\n"
+        "  as-is. Do not push this directory to a public location\n"
+        "  until Phase 3 sensitivity gating ships.\n"
+        "- **Source of truth lives in `overseer.db`** — this is a\n"
+        "  view, not the canonical store.\n\n"
+        "## How to drill deeper than this rendered view\n\n"
+        "- `cortex_search(query)` MCP tool — substring search\n"
+        "  across all interpretive tables, returns drill-down\n"
+        "  tokens.\n"
+        "- `cortex_overseer_detail(token)` MCP tool — resolve any\n"
+        "  drill token to its full row + linked artifacts.\n"
+        "- `overseer_chat(message)` MCP tool — ask the overseer\n"
+        "  directly; it renders working memory and answers.\n\n"
+        "Phase 3 ships vault-aware tools (`cortex_read`,\n"
+        "`cortex_list`, `cortex_graph`, `cortex_recent`) that read\n"
+        "this directory directly.\n"
+    )
+    readme_path.write_text(readme_text, encoding="utf-8")
+
     log_fn(
         "vault_generator: done in %.2fs (counts=%s, errors=%d)",
         duration, counts, len(errors),
@@ -549,7 +624,14 @@ def main(argv=None):
         help="Path to overseer.db",
     )
     parser.add_argument(
-        "--out", required=True, help="Output directory for vault tree",
+        "--out", required=True,
+        help=(
+            "Output directory for vault tree. The service runs as root "
+            "on the Pi — pass an absolute path under the human user's "
+            "home (e.g. /home/turfptax/cortex-vault) so the user can "
+            "read the output without sudo. ~ expansion resolves to the "
+            "running user's home, not the human user's home."
+        ),
     )
     parser.add_argument(
         "--gist-limit", type=int, default=0,

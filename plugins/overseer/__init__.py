@@ -993,6 +993,8 @@ class OverseerPlugin(Plugin):
         "j":    "overseer_journal",
         "b":    "known_blindspots",
         "dial": "dialectic_open",
+        "nar":  "temporal_narratives",        # added 2026-05-27
+        "hj":   "human_journal_entries",      # added 2026-05-27
     }
 
     def _http_detail(self, payload):
@@ -2404,12 +2406,21 @@ class OverseerPlugin(Plugin):
     # Maps the search target to (table_name, body_columns, token_prefix,
     # kind_label, where_extras). The body_columns is the list of TEXT
     # columns we substring-match against (joined with OR).
+    # Column names verified against actual schema 2026-05-27 (L99 fix):
+    #   temporal_narratives.narrative (NOT .body)
+    #   overseer_journal.body (NOT .entry)
+    #   open_questions.question + .body (both — primary text in .question)
+    #   summaries_theme adds .title for richer search
+    # Earlier draft of this map had .body for narratives + .entry for
+    # journal — both silently returned 0 hits because those columns
+    # don't exist. The probe missed it because the original
+    # checkpoint only searched gists.
     _SEARCH_TARGETS = {
         "gist":      ("summaries_gist",          ["body"],
                       "g",     "gist"),
-        "theme":     ("summaries_theme",         ["body"],
+        "theme":     ("summaries_theme",         ["title", "body"],
                       "t",     "theme"),
-        "episode":   ("summaries_episode",       ["body"],
+        "episode":   ("summaries_episode",       ["title", "body"],
                       "e",     "episode"),
         "pattern":   ("patterns",                ["name", "body"],
                       "p",     "pattern"),
@@ -2417,16 +2428,16 @@ class OverseerPlugin(Plugin):
                       "d",     "drift"),
         "note":      ("future_overseer_notes",   ["body"],
                       "n",     "future_note"),
-        "journal":   ("overseer_journal",        ["entry"],
+        "journal":   ("overseer_journal",        ["body"],
                       "j",     "journal_entry"),
-        "narrative": ("temporal_narratives",     ["body"],
-                      None,    "temporal_narrative"),
-        "question":  ("open_questions",          ["body"],
+        "narrative": ("temporal_narratives",     ["narrative"],
+                      "nar",   "temporal_narrative"),
+        "question":  ("open_questions",          ["question", "body"],
                       "q",     "question"),
         "blindspot": ("known_blindspots",        ["body", "rationale"],
                       "b",     "blindspot"),
         "human":     ("human_journal_entries",   ["text"],
-                      None,    "human_journal_entry"),
+                      "hj",    "human_journal_entry"),
     }
 
     def _http_search_corpus(self, payload):
@@ -2708,9 +2719,15 @@ class OverseerPlugin(Plugin):
         """POST /plugins/overseer/vault/render
 
         Body: {
-          out_dir: "/abs/path/to/vault" (default: ~/cortex-vault),
+          out_dir: "/abs/path/to/vault" (default below),
           gist_limit: int (0 = all, default 0)
         }
+
+        Default out_dir resolves to the human user's home, not the
+        service uid's home — the service runs as root on .25 so a
+        bare ~/cortex-vault would land in /root/cortex-vault where
+        the human user can't read it without sudo. L99 must-fix #3
+        (2026-05-27).
 
         Renders the full vault. Returns counts + duration + any
         per-row errors. Synchronous — Phase 2.2 makes it async with
@@ -2718,10 +2735,15 @@ class OverseerPlugin(Plugin):
         """
         if self.overseer_db is None:
             return {"ok": False, "error": "overseer not initialized"}
+        # Path precedence:
+        #   1. payload.out_dir (explicit caller choice)
+        #   2. plugin config vault_output_dir (per-Pi override)
+        #   3. /home/turfptax/cortex-vault (hardcoded human-readable
+        #      default on the .25 deploy)
         out_dir = str(
             (payload or {}).get("out_dir")
             or self.api.config.get("vault_output_dir")
-            or "~/cortex-vault"
+            or "/home/turfptax/cortex-vault"
         )
         gist_limit = _as_int(payload, "gist_limit", 0,
                               max_value=10000)

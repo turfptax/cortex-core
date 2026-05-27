@@ -28,6 +28,8 @@ otherwise):
   j     overseer_journal
   b     known_blindspots
   dial  dialectic_open
+  nar   temporal_narratives          (added 2026-05-27, L99 must-fix #1)
+  hj    human_journal_entries        (added 2026-05-27, L99 must-fix #1)
 """
 
 import json
@@ -52,6 +54,8 @@ _PREFIX_TO_TYPE = {
     "j":    "journal_entry",
     "b":    "blindspot",
     "dial": "dialectic",
+    "nar":  "temporal_narrative",      # added 2026-05-27
+    "hj":   "human_journal_entry",     # added 2026-05-27
 }
 
 _TABLE_TO_PREFIX = {
@@ -66,6 +70,8 @@ _TABLE_TO_PREFIX = {
     "overseer_journal":       "j",
     "known_blindspots":       "b",
     "dialectic_open":         "dial",
+    "temporal_narratives":    "nar",   # added 2026-05-27
+    "human_journal_entries":  "hj",    # added 2026-05-27
 }
 
 
@@ -368,6 +374,60 @@ def _resolve_dialectic(db, did):
     }
 
 
+def _resolve_temporal_narrative(db, nid):
+    """Added 2026-05-27 (L99 must-fix #1). Resolve a temporal narrative
+    by row id — daily/weekly/monthly/yearly artifact.
+
+    Drilling provides the full narrative body. next_tokens stay empty
+    because temporal narratives don't carry artifact-level back-links
+    in the schema today; the sibling narratives (same kind, adjacent
+    periods) could be added later if external AIs ask for them.
+    """
+    rows = db._conn.execute(
+        "SELECT * FROM temporal_narratives WHERE id = ?",
+        (int(nid),),
+    ).fetchone()
+    if not rows:
+        return None
+    row = dict(rows)
+    return {
+        "primary": row,
+        "tags": [],
+        "context": {
+            "kind": row.get("kind"),
+            "period_label": row.get("period_label"),
+            "period_start": row.get("period_start"),
+            "period_end": row.get("period_end"),
+        },
+        "next_tokens": [],
+    }
+
+
+def _resolve_human_journal_entry(db, hid):
+    """Added 2026-05-27 (L99 must-fix #1). Resolve a human journal
+    entry by row id — Tory's own writing.
+
+    Sensitivity: human journal is Tory's first-person voice. Treat
+    as internal by default; callers should respect Slice 13 rules
+    if a future render-time gate is added.
+    """
+    rows = db._conn.execute(
+        "SELECT * FROM human_journal_entries WHERE id = ?",
+        (int(hid),),
+    ).fetchone()
+    if not rows:
+        return None
+    row = dict(rows)
+    return {
+        "primary": row,
+        "tags": [],
+        "context": {
+            "entry_type": row.get("entry_type"),
+        },
+        "next_tokens": [],
+    }
+
+
 _RESOLVERS = {
     "q":    _resolve_question,
     "p":    _resolve_pattern,
@@ -380,4 +440,6 @@ _RESOLVERS = {
     "j":    _resolve_journal_entry,
     "b":    _resolve_blindspot,
     "dial": _resolve_dialectic,
+    "nar":  _resolve_temporal_narrative,    # added 2026-05-27
+    "hj":   _resolve_human_journal_entry,   # added 2026-05-27
 }
