@@ -4533,7 +4533,11 @@ class OverseerDB(CortexDB):
         if kind:
             sql += " WHERE kind = ?"
             params.append(kind)
-        sql += " ORDER BY created_at DESC LIMIT ?"
+        # Slice 14.7.4 (2026-05-26): order by period_start DESC so
+        # the list reads chronologically (newest period first). Prior
+        # order by created_at DESC sorted by regenerate-time which
+        # scrambled history every time we did a bulk re-run.
+        sql += " ORDER BY period_start DESC LIMIT ?"
         params.append(int(limit))
         rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
