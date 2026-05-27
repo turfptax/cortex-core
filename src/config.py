@@ -103,11 +103,14 @@ HTTP_USERNAME = "cortex"
 HTTP_PASSWORD = "cortex"
 UPLOADS_DIR = os.path.join(HOME, "uploads")
 
-# Pet plugin config moved to plugins/pet/pet_config.py during slice 2c1a.
+# Pet plugin source was extracted to the cortex-pet sister repo
+# (Slice 11, 2026-05-09). The plugin is still loaded at runtime on
+# production .25 from that sibling repo.
 # Constants previously here (PET_*, HEARTBEAT_*, DREAM_*, COMA_*, SPRITE_*,
 # COLOR_PET_*, COLOR_VITAL_*, COLOR_CURSOR/MENU_BG/HIGHLIGHT/SPEECH_BG/
 # XP_BAR/XP_BAR_BG, BATTERY_ENERGY_WEIGHT, INFERENCE_ENERGY_WEIGHT,
-# BATTERY_DREAM_MIN_PCT) now live with the plugin.
+# BATTERY_DREAM_MIN_PCT) live in cortex-pet's pet_config.py.
+# See https://github.com/turfptax/cortex-pet
 
 # Gamepad (8BitDo Micro via evdev)
 # Slice 12.1.2 (2026-05-09): GAMEPAD_ENABLED is now env-overridable.
@@ -134,7 +137,7 @@ BATTERY_POLL_INTERVAL_S = 30       # seconds between I2C reads
 BATTERY_I2C_BUS = None             # None = auto-detect
 
 # Real battery thresholds — hardware behavior, not pet behavior.
-# Pet's blend weights live in plugins/pet/pet_config.py.
+# Pet's blend weights live in the cortex-pet sister repo's pet_config.py.
 BATTERY_FORCE_SLEEP_PCT = 15       # force sleep below this battery %
 BATTERY_CRITICAL_PCT = 5           # graceful shutdown below this
 

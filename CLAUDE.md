@@ -108,7 +108,8 @@ cortex-core/
 │   │   └── data/
 │   │       ├── overseer.db           # Source of truth
 │   │       └── imports/              # Raw .jsonl files
-│   └── pet/                          # (excised — see github.com/turfptax/cortex-pet)
+│   # Pet plugin lives in the cortex-pet sister repo and is loaded
+│   # at runtime on .25 from there. See github.com/turfptax/cortex-pet
 ├── scripts/
 │   ├── backfill_session_stats.py
 │   └── migrate_timestamps_to_local.py
@@ -183,7 +184,7 @@ Plugin updates: replace `src/` with `plugins/overseer/`.
 
 - [cortex-desktop](https://github.com/turfptax/cortex-desktop) — Windows Hub UI + MCP server + training pipeline
 - [cortex-link](https://github.com/turfptax/cortex-link) — ESP32-S3 BLE bridge
-- [cortex-pet](https://github.com/turfptax/cortex-pet) — extracted pet plugin (not active on production)
+- [cortex-pet](https://github.com/turfptax/cortex-pet) — extracted pet plugin; loaded on production .25 at runtime from this sibling repo
 - [cortex-pet-training](https://github.com/turfptax/cortex-pet-training) — training scripts (consolidating into cortex_train)
 
 ## When in doubt

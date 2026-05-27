@@ -97,11 +97,11 @@ def main():
             print("Battery monitor failed to initialize: {}".format(e))
 
     # ── Plugins ──────────────────────────────────────────────────
-    # The pet plugin's on_load() does the one-time migration of pet rows
-    # from cortex.db into pet.db, then constructs PetEngine and starts
-    # Heartbeat. Slice 2c2c1: cortex_protocol no longer needs pet/heartbeat
-    # references — the plugin serves the full pet surface via its own
-    # /plugins/pet/* HTTP routes.
+    # Pet plugin was extracted to the cortex-pet sister repo in Slice 11
+    # (2026-05-09); cortex_protocol no longer carries pet/heartbeat
+    # references. PluginRegistry below loads installed plugins from
+    # PYTHON_PATH — pet (from the sibling repo) and overseer both end
+    # up registered on .25.
     plugin_registry = None
     if PLUGINS_ENABLED:
         try:

@@ -1,7 +1,9 @@
 """OverseerLoop — background consolidation thread.
 
-Heartbeat-pattern (proven from pet plugin's Heartbeat). Runs inside the
-overseer plugin process; started in on_load, stopped in on_unload.
+Heartbeat-pattern (originally proven in the pet plugin's Heartbeat, which
+was later extracted to the cortex-pet sister repo in Slice 11). Runs
+inside the overseer plugin process; started in on_load, stopped in
+on_unload.
 
 Per-tick work, in priority order (locked design 2026-05-02):
   1. Auto-summarize sessions that ended-but-not-yet-processed

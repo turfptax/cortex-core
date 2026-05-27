@@ -692,8 +692,8 @@ def main():
     test_wifi_protocol()
     test_http_server()
     test_shell_exec()
-    # Pet tests moved to plugins/pet/tests/test_pet.py in slice 2c2a.
-    # Run them with: python plugins/pet/tests/test_pet.py
+    # Pet tests live in the cortex-pet sister repo (Slice 11 extraction).
+    # Not exercised here.
 
     print("\n" + "=" * 40)
     print(f"Results: {PASSED} passed, {FAILED} failed")

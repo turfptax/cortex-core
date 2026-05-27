@@ -82,9 +82,10 @@ class CortexProtocol:
     """Processes Cortex CMD: protocol messages and returns responses."""
 
     def __init__(self, db, plugin_registry=None):
-        # Slice 2c2c1: pet + heartbeat refs removed. The pet plugin owns
-        # both and serves them via /plugins/pet/* HTTP routes mounted by
-        # http_server.py (see plugins/pet/__init__.py http_routes()).
+        # Slice 2c2c1: pet + heartbeat refs removed from core. Pet was
+        # later extracted entirely to the cortex-pet sister repo
+        # (Slice 11, 2026-05-09); plugin is still loaded at runtime on
+        # .25 from the sibling repo and serves /plugins/pet/* HTTP routes.
         # Slice 3d-A: plugin_registry is optional; if present, plugins
         # that implement contribute_to_context() get to extend the
         # /api/cmd get_context response (overseer injects working_memory).
@@ -168,8 +169,10 @@ class CortexProtocol:
             "wifi_scan": self._cmd_wifi_scan,
             "wifi_config": self._cmd_wifi_config,
             "wifi_status": self._cmd_wifi_status,
-            # Pet/heartbeat/dream commands moved to /plugins/pet/* HTTP
-            # routes in slice 2c2c1 (see plugins/pet/__init__.py).
+            # Pet/heartbeat/dream commands moved out of core in Slice 2c2c1
+            # and the pet plugin itself was extracted to the cortex-pet
+            # sister repo in Slice 11. Plugin is loaded on .25 and serves
+            # /plugins/pet/* HTTP routes from the sibling repo.
             # Training examples & ledger
             "training_upload": self._cmd_training_upload,
             "training_examples": self._cmd_training_examples,
@@ -411,9 +414,10 @@ class CortexProtocol:
                          "projects", "computers", "people", "files",
                          "organizations", "time_entries",
                          "training_examples", "training_ledger"):
-            # NOTE slice 2c2d: pet_state/pet_interactions live in pet.db
-            # (plugin), not cortex.db (core). Use /plugins/pet/history
-            # or /plugins/pet/status instead of CMD:query for pet data.
+            # NOTE: pet_state/pet_interactions live in the cortex-pet
+            # sister repo's pet.db (Slice 2c2d schema move; Slice 11 plugin
+            # extraction). Use /plugins/pet/history or /plugins/pet/status
+            # instead of CMD:query for pet data.
             return "ERR:query:invalid or missing table"
         filters = data.get("filters", {})
         limit = min(data.get("limit", 20), 100)

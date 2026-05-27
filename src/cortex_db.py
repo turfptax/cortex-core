@@ -4,8 +4,11 @@ Manages the Cortex knowledge database (cortex.db). Core tables:
 sessions, notes, activities, searches, projects, organizations,
 time_entries, computers, people, files, training_examples, training_ledger.
 
-Pet/heartbeat schema and helpers moved to plugins/pet/pet_db.py in
-slice 2c2d. The pet plugin uses PetDB(pet.db); core uses CortexDB(cortex.db).
+Pet/heartbeat schema and helpers live in the cortex-pet sister repo's
+pet_db.py (Slice 2c2d schema move; Slice 11 full plugin extraction).
+The pet plugin uses PetDB(pet.db); core uses CortexDB(cortex.db).
+Plugin is loaded at runtime on production .25 from the sibling repo.
+See https://github.com/turfptax/cortex-pet
 
 Uses WAL mode for safe concurrent reads during writes.
 All timestamps are ISO 8601 UTC via SQLite datetime('now').
