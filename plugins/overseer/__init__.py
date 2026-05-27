@@ -34,6 +34,7 @@ from llm_router import LLMRouter
 from core_memory_ro import CoreMemoryRO
 from ingest_session_0 import ingest_seed
 from loop import OverseerLoop
+import corpus  # search_corpus + SEARCH_TARGETS (extracted 2026-05-27)
 from claude_jsonl import (
     CLAUDE_CODE_SOURCE,
     canonicalize_project_name,
@@ -2422,35 +2423,19 @@ class OverseerPlugin(Plugin):
     # journal — both silently returned 0 hits because those columns
     # don't exist. The probe missed it because the original
     # checkpoint only searched gists.
-    _SEARCH_TARGETS = {
-        "gist":      ("summaries_gist",          ["body"],
-                      "g",     "gist"),
-        "theme":     ("summaries_theme",         ["title", "body"],
-                      "t",     "theme"),
-        "episode":   ("summaries_episode",       ["title", "body"],
-                      "e",     "episode"),
-        "pattern":   ("patterns",                ["name", "body"],
-                      "p",     "pattern"),
-        "drift":     ("drift_observations",      ["body", "direction"],
-                      "d",     "drift"),
-        "note":      ("future_overseer_notes",   ["body"],
-                      "n",     "future_note"),
-        "journal":   ("overseer_journal",        ["body"],
-                      "j",     "journal_entry"),
-        "narrative": ("temporal_narratives",     ["narrative"],
-                      "nar",   "temporal_narrative"),
-        "question":  ("open_questions",          ["question", "body"],
-                      "q",     "question"),
-        "blindspot": ("known_blindspots",        ["body", "rationale"],
-                      "b",     "blindspot"),
-        "human":     ("human_journal_entries",   ["text"],
-                      "hj",    "human_journal_entry"),
-    }
+    # Source of truth for kind→table mapping lives in corpus.SEARCH_TARGETS
+    # (extracted 2026-05-27 so chat_tools.dispatch_tool can call the same
+    # search logic from overseer's chat surface). Kept here as a reference
+    # only — do NOT duplicate the mapping; update corpus.py instead.
+    _SEARCH_TARGETS = corpus.SEARCH_TARGETS
 
     def _http_search_corpus(self, payload):
         """GET /plugins/overseer/search
 
         Substring search across the overseer's interpretive corpus.
+        Thin HTTP wrapper — the actual search logic lives in
+        `corpus.search_corpus()` (extracted 2026-05-27 so the same
+        body can be called from chat_tools.dispatch_tool too).
 
         Params:
           q          (required)  — substring to match (case-insensitive)
@@ -2466,218 +2451,38 @@ class OverseerPlugin(Plugin):
                                    overseer can attribute drills
           record_pulls (default true) — log each hit as a pull_event
 
-        Returns {ok, query, hits: [{token, kind, snippet, score,
-        artifact_table, artifact_id, created_at, extras}], total,
-        truncated}.
-
-        snippet is ~200 chars of body around the first match, with
-        ellipses on either side if the body is longer.
+        Returns {ok, query, kinds_searched, hits, abstractions, gists,
+        raw_refs, total, truncated}. Hits carry token, kind,
+        artifact_table, artifact_id, snippet (~200 chars around the
+        first match), created_at, and extras.
         """
         if self.overseer_db is None:
             return {"ok": False, "error": "overseer not initialized"}
         q = str((payload or {}).get("q") or "").strip()
         if not q:
             return {"ok": False, "error": "q (query string) is required"}
-        if len(q) < 2:
-            return {"ok": False,
-                    "error": "q must be at least 2 characters"}
 
-        kinds_raw = str((payload or {}).get("kinds") or "").strip()
-        if kinds_raw:
-            requested = [k.strip() for k in kinds_raw.split(",")
-                         if k.strip()]
-            kinds = [k for k in requested if k in self._SEARCH_TARGETS]
-            if not kinds:
-                return {"ok": False,
-                        "error": "no recognized kinds in 'kinds' param; "
-                        "valid: " + ",".join(sorted(self._SEARCH_TARGETS))}
-        else:
-            kinds = list(self._SEARCH_TARGETS.keys())
-
-        limit_per_kind = _as_int(payload, "limit_per_kind", 5,
-                                 max_value=50)
-        limit_total = _as_int(payload, "limit_total", 40, max_value=200)
-        days = _as_int(payload, "days", 0, max_value=3650)
-        caller_id = str((payload or {}).get("caller_id") or "").strip() \
-            or None
         record_pulls = (payload or {}).get("record_pulls", True)
         if isinstance(record_pulls, str):
             record_pulls = record_pulls.lower() not in (
                 "0", "false", "no", "")
 
-        hits = []
-        like_param = f"%{q}%"
-        truncated = False
+        caller_id = str((payload or {}).get("caller_id") or "").strip() \
+            or None
 
-        for kind_key in kinds:
-            table, body_cols, prefix, kind_label = \
-                self._SEARCH_TARGETS[kind_key]
-            # Build the LIKE-OR clause across body columns.
-            where_parts = [f"{c} LIKE ? COLLATE NOCASE"
-                           for c in body_cols]
-            params: list = [like_param] * len(body_cols)
-            extra_where = ""
-            if days:
-                # Most tables use created_at; a few use written_at or
-                # observed_at. Try created_at first; fall back if it
-                # doesn't exist.
-                try:
-                    table_cols = {r[1] for r in
-                                  self.overseer_db._conn.execute(
-                                      f"PRAGMA table_info({table})"
-                                  ).fetchall()}
-                except Exception:
-                    table_cols = set()
-                time_col = None
-                for cand in ("created_at", "written_at",
-                             "observed_at", "pulled_at"):
-                    if cand in table_cols:
-                        time_col = cand
-                        break
-                if time_col:
-                    extra_where = (f" AND {time_col} >= "
-                                   f"datetime('now', ?)")
-                    params.append(f"-{int(days)} days")
-            sql = (
-                f"SELECT * FROM {table} WHERE ("
-                + " OR ".join(where_parts) + ")"
-                + extra_where
-                + " ORDER BY id DESC LIMIT ?"
-            )
-            params.append(int(limit_per_kind))
-            try:
-                rows = self.overseer_db._conn.execute(
-                    sql, params).fetchall()
-            except Exception as e:
-                log.warning("search target %s failed: %s", table, e)
-                continue
-            for r in rows:
-                row = dict(r)
-                # Compute the snippet from the first body column that
-                # contains the query.
-                snippet = ""
-                ql = q.lower()
-                for c in body_cols:
-                    val = (row.get(c) or "")
-                    if not val:
-                        continue
-                    idx = val.lower().find(ql)
-                    if idx == -1:
-                        continue
-                    start = max(0, idx - 80)
-                    end = min(len(val), idx + len(q) + 120)
-                    snippet = ("…" if start > 0 else "") + \
-                        val[start:end] + \
-                        ("…" if end < len(val) else "")
-                    break
-                if not snippet:
-                    # No body field matched — fallback: first 200 chars
-                    # of body for caller context.
-                    for c in body_cols:
-                        v = row.get(c) or ""
-                        if v:
-                            snippet = v[:200] + ("…" if len(v) > 200
-                                                  else "")
-                            break
-                token = None
-                if prefix:
-                    token = "{}:{}".format(prefix, row.get("id"))
-                # Created-at / period-label / etc. for context.
-                created_at = (row.get("created_at")
-                              or row.get("written_at")
-                              or row.get("observed_at")
-                              or "")
-                extras = {}
-                for cand in ("period_label", "kind", "confidence",
-                             "name", "instance_id", "direction"):
-                    if row.get(cand):
-                        extras[cand] = row[cand]
-                hits.append({
-                    "token": token,
-                    "kind": kind_label,
-                    "artifact_table": table,
-                    "artifact_id": row.get("id"),
-                    "snippet": snippet,
-                    "created_at": created_at,
-                    "extras": extras,
-                })
-                if len(hits) >= limit_total:
-                    truncated = True
-                    break
-            if truncated:
-                break
-
-        # Record pull_events (best-effort, never raises). Only token-
-        # bearing hits get parented since pull_events.artifact_id is
-        # the drilled-into row.
-        if record_pulls and hits:
-            for h in hits:
-                self.overseer_db.record_pull_event(
-                    artifact_table=h["artifact_table"],
-                    artifact_id=h["artifact_id"],
-                    surface="mcp:cortex_search",
-                    query_text=q,
-                    caller_id=caller_id,
-                )
-
-        # ── Layered returns (Slice 14.8, 2026-05-27) ───────────────
-        # Per three_layer_architecture_design_seed.md, the response is
-        # grouped into abstractions (Layer 1) / gists (Layer 2) / raw_refs
-        # (Layer 3). The flat `hits` array is kept for backward compat
-        # so existing callers don't break; new consumers should prefer
-        # the layered buckets to walk top-down.
-        ABSTRACTION_KINDS = {
-            "theme", "episode", "pattern", "drift", "future_note",
-            "journal_entry", "temporal_narrative", "question",
-            "blindspot", "human_journal_entry",
-        }
-        abstractions = []
-        gists_out = []
-        raw_refs = []
-        seen_raw_ids = set()
-        for h in hits:
-            kind = h.get("kind", "")
-            if kind == "gist":
-                # Extract raw_id from period_label when it points back
-                # at an imported_session (format: "<source>:<id>" such
-                # as "grok-com:abc123" or "claude-jsonl:def456").
-                period_label = (h.get("extras") or {}).get(
-                    "period_label") or ""
-                raw_id = period_label if ":" in period_label else None
-                gist_out = dict(h)
-                if raw_id:
-                    gist_out["raw_id"] = raw_id
-                    if raw_id not in seen_raw_ids:
-                        raw_refs.append({
-                            "raw_id": raw_id,
-                            "linked_gist_token": h.get("token"),
-                            "note": ("Layer 3 raw source. Drill via "
-                                     "imported_sessions; Slice 13 "
-                                     "sensitivity rules apply at "
-                                     "fetch time."),
-                        })
-                        seen_raw_ids.add(raw_id)
-                gists_out.append(gist_out)
-            elif kind in ABSTRACTION_KINDS:
-                abstractions.append(h)
-            else:
-                # Unknown kind — degrade to abstractions so nothing
-                # disappears from the layered view.
-                abstractions.append(h)
-
-        return {
-            "ok": True,
-            "query": q,
-            "kinds_searched": kinds,
-            # Flat list kept for backward compat.
-            "hits": hits,
-            # Layered per three_layer_architecture_design_seed.md.
-            "abstractions": abstractions,
-            "gists": gists_out,
-            "raw_refs": raw_refs,
-            "total": len(hits),
-            "truncated": truncated,
-        }
+        return corpus.search_corpus(
+            self.overseer_db,
+            q,
+            kinds=str((payload or {}).get("kinds") or ""),
+            limit_per_kind=_as_int(payload, "limit_per_kind", 5,
+                                    max_value=50),
+            limit_total=_as_int(payload, "limit_total", 40,
+                                 max_value=200),
+            days=_as_int(payload, "days", 0, max_value=3650),
+            surface="mcp:cortex_search",
+            caller_id=caller_id,
+            record_pulls=record_pulls,
+        )
 
     def _http_recent_pull_events(self, payload):
         """GET /plugins/overseer/pull-events?limit=50&surface=...&

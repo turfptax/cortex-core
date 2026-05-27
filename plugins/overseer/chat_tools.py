@@ -1,24 +1,45 @@
-"""Overseer chat tools — Slice 10.
+"""Overseer chat tools — Slice 10 origin, evolved through 2026-05-27.
 
-Read-only tool surface the overseer can call during a chat turn to
-fetch live data the static context block doesn't already include.
+Tool surface the overseer can call during a chat turn (or journal
+step) to fetch live data and take audited write actions. Mirrors the
+F1 MCP surface external AIs use, plus overseer-specific writes that
+have no external equivalent.
 
-Why these and not more?
-- Tier 1: read-only inspection (notes, sessions, journals, projects,
-  body/call/activity surfaces). Can't damage anything; bounded
-  cost per call (small DB queries, no LLM).
-- No write tools yet. The overseer should not mark blindspots
-  acknowledged, mutate dialectic state, or change classifications
-  without going through the existing (auditable) review queues.
+Surfaces by category (~35 tools total):
+- **Read (per-table)**: get_recent_human_journal, get_recent_overseer_journal,
+  search_notes, get_notes_by_tag, get_recent_sessions, get_session_detail,
+  list_active_projects, get_project_detail, get_open_questions,
+  get_known_blindspots, get_pending_interpretations, get_temporal_narrative,
+  search_people, get_recent_patterns, get_recent_drift.
+- **Read (F1 unified, 2026-05-27)**: cortex_search (cross-kind, layered
+  returns) + cortex_resolve_token (drill any working_memory token).
+  These mirror the MCP surface so overseer can run its own
+  audit-before-claim rule without asking Tory to verify externally.
+- **Writes (Slice 9.6 CP2)**: update_project_status, create_project,
+  create_question, update_question_lifecycle. Auditable mutations —
+  not the same as bypassing review queues, but real state change.
+- **Notification system**: emit_notification (with optional
+  actions_json), get_pending_notification_responses,
+  mark_notification_responses_processed.
+- **Sibling/B-agent dispatch**: dispatch_sibling (Cat A, Claude Code),
+  rate_sibling_result, dispatch_b_<name> (Cat B specialists),
+  accept_c_promotion (B→C graduation).
+- **Evidence + sensitivity**: file_evidence, propose_project_merge,
+  redact_imported_session, scan_for_sensitive_content,
+  redact_human_journal.
+- **Chat management**: compress_chat, redact_chat_attachment,
+  delete_chat_message.
 
 Each tool follows OpenAI's function-calling schema (which OpenRouter
-normalizes to Anthropic's native tool_use format for Opus). The
+normalizes to Anthropic's tool_use format for Opus and to the
+appropriate native format for any provider the resolver picks). The
 dispatcher takes (name, args) -> str and returns a JSON-serialized
 result the model can read on the next turn.
 
-Cost shape: each tool call adds one LLM round-trip. The chat handler
-caps tool iterations per chat turn (see MAX_TOOL_ITER) so a confused
-model can't loop indefinitely and burn budget.
+Cost shape: each tool call adds one LLM round-trip. MAX_TOOL_ITER
+bounds the loop so a confused model can't burn budget indefinitely.
+Per-tool result is truncated to MAX_TOOL_RESULT_CHARS so a fat
+result doesn't blow the prompt budget.
 """
 from __future__ import annotations
 
@@ -1065,6 +1086,138 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
+    # ── Phase 1 / Audit follow-up (2026-05-27): F1 reader surface ──
+    # External AIs already have cortex_search + cortex_overseer_detail
+    # via the MCP wrapper. The 24h activity bundle audit showed
+    # overseer's own chat tool palette was missing them — 13 of 15
+    # runs used ZERO tools because the "audit-before-claim" rule had
+    # no clean fetching primitive. These two tools close that gap so
+    # overseer can run its own F1 surface from chat.
+    {
+        "type": "function",
+        "function": {
+            "name": "cortex_search",
+            "description": (
+                "Unified substring search across the interpretive "
+                "corpus — the same F1 surface external AIs have via "
+                "MCP. Returns layered hits per "
+                "three_layer_architecture_design_seed.md: "
+                "`abstractions` (Layer 1: themes, patterns, drift, "
+                "future_notes, journal entries, narratives, episodes, "
+                "questions, blindspots, human journal), `gists` "
+                "(Layer 2: per-session summaries, each with `raw_id` "
+                "when its source is an imported_session), and "
+                "`raw_refs` (Layer 3 pointers, deduplicated). Each "
+                "hit carries a drill `token` (e.g. `g:3141`, `t:6`, "
+                "`gp:1`) that resolves via cortex_resolve_token.\n\n"
+                "Use when: a topic could span multiple kinds and you "
+                "want one call instead of guessing which "
+                "per-table get_recent_X to invoke; the persona's "
+                "audit-before-claim rule demands a fetch and you "
+                "don't know the exact row ID yet; a recommendation "
+                "depends on what the corpus currently knows.\n\n"
+                "Pull events are logged with surface='chat:cortex_"
+                "search' so your own queries feed back into the "
+                "refinement-loop signal (drill-past ratios per "
+                "gist_prompts row).\n\n"
+                "DON'T use for: notes-only search — use search_notes "
+                "(different table, kept for compat). Drilling a "
+                "specific token you already know — use cortex_"
+                "resolve_token. Routine context already in your "
+                "context block — don't burn a tool call to restate "
+                "what's already there."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "q": {
+                        "type": "string",
+                        "description": (
+                            "Substring to match (case-insensitive). "
+                            "Minimum 2 characters."
+                        ),
+                    },
+                    "kinds": {
+                        "type": "string",
+                        "description": (
+                            "Optional comma-separated subset of: "
+                            "gist, theme, episode, pattern, drift, "
+                            "note, journal, narrative, question, "
+                            "blindspot, human. Empty = all 11."
+                        ),
+                    },
+                    "limit_per_kind": {
+                        "type": "integer",
+                        "description": (
+                            "Max hits per kind (default 5, max 50)."
+                        ),
+                    },
+                    "limit_total": {
+                        "type": "integer",
+                        "description": (
+                            "Hard cap across all kinds (default 40)."
+                        ),
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": (
+                            "Restrict to artifacts within last N "
+                            "days (0 = no limit)."
+                        ),
+                    },
+                },
+                "required": ["q"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cortex_resolve_token",
+            "description": (
+                "Resolve a working-memory drill token to its full "
+                "row + linked artifacts. This is the row-fetch "
+                "primitive the audit-before-claim rule needs.\n\n"
+                "Valid prefixes (token format `<prefix>:<id>`):\n"
+                "  `q`     open_questions\n"
+                "  `p`     patterns\n"
+                "  `d`     drift_observations\n"
+                "  `g`     summaries_gist\n"
+                "  `e`     summaries_episode\n"
+                "  `t`     summaries_theme\n"
+                "  `r`     automation_rollups\n"
+                "  `n`     future_overseer_notes\n"
+                "  `j`     overseer_journal\n"
+                "  `b`     known_blindspots\n"
+                "  `dial`  dialectic_open\n"
+                "  `nar`   temporal_narratives\n"
+                "  `hj`    human_journal_entries\n"
+                "  `gp`    gist_prompts (Phase 1d)\n\n"
+                "Returns the full row + tags + type-specific context "
+                "+ `next_tokens` (links to drill into next, so you "
+                "can walk the graph without parsing free text).\n\n"
+                "Use this when the persona's fetch-before-claim "
+                "trigger phrases fire (\"theme X is still [conf]\", "
+                "\"the verdict on\", \"I recommend [drop|keep|"
+                "remove]\", etc.) — pull the actual row before "
+                "writing the assertion. Don't use for general "
+                "search; use cortex_search for that."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "token": {
+                        "type": "string",
+                        "description": (
+                            "Token to resolve, e.g. 'g:3141', 't:6', "
+                            "'gp:1', 'q:6'. Required."
+                        ),
+                    },
+                },
+                "required": ["token"],
+            },
+        },
+    },
 ]
 
 # ── Slice 10 (2026-05-20): Category B agent tools ────────────────
@@ -1147,6 +1300,78 @@ def _dispatch(name: str, args: dict, *, db, core_memory,
             b_name, args, db=db, core_memory=core_memory,
             llm=llm, b_daily_cap=50,
         )
+
+    # ── F1 reader-surface tools (2026-05-27 audit follow-up) ───────
+    # Unified search + token-drill so overseer can run its own
+    # audit-before-claim rule from chat. Mirrors the MCP surface
+    # external AIs already have.
+    if name == "cortex_search":
+        q = str((args.get("q") or "")).strip()
+        if not q or len(q) < 2:
+            return {"error": "q is required, minimum 2 characters"}
+        try:
+            import corpus
+        except Exception as e:
+            return {"error": f"corpus module unavailable: {e}"[:200]}
+        return corpus.search_corpus(
+            db,
+            q,
+            kinds=str(args.get("kinds") or ""),
+            limit_per_kind=max(1, min(50, int(args.get(
+                "limit_per_kind", 5)))),
+            limit_total=max(1, min(200, int(args.get(
+                "limit_total", 40)))),
+            days=max(0, min(3650, int(args.get("days", 0)))),
+            surface="chat:cortex_search",
+            caller_id="overseer-chat",
+            record_pulls=True,
+        )
+
+    if name == "cortex_resolve_token":
+        token = str((args.get("token") or "")).strip()
+        if not token:
+            return {"error": "token is required (e.g. 'g:3141')"}
+        try:
+            import detail
+        except Exception as e:
+            return {"error": f"detail module unavailable: {e}"[:200]}
+        try:
+            result = detail.resolve_detail(db, token)
+        except detail.TokenError as te:
+            return {"ok": False, "token": token, "error": str(te)}
+        # Log a pull_event so overseer's own drills feed back into
+        # refinement-loop signals (same as MCP cortex_overseer_detail).
+        try:
+            prefix = token.split(":", 1)[0] if ":" in token else ""
+            table = {
+                "q": "open_questions",
+                "p": "patterns",
+                "d": "drift_observations",
+                "g": "summaries_gist",
+                "e": "summaries_episode",
+                "t": "summaries_theme",
+                "r": "automation_rollups",
+                "n": "future_overseer_notes",
+                "j": "overseer_journal",
+                "b": "known_blindspots",
+                "dial": "dialectic_open",
+                "nar": "temporal_narratives",
+                "hj": "human_journal_entries",
+                "gp": "gist_prompts",
+            }.get(prefix)
+            row_id = (result.get("primary") or {}).get("id")
+            if table and row_id:
+                db.record_pull_event(
+                    artifact_table=table,
+                    artifact_id=int(row_id),
+                    surface="chat:cortex_resolve_token",
+                    query_text=token,
+                    caller_id="overseer-chat",
+                )
+        except Exception as _e:
+            log.warning("pull_event log on cortex_resolve_token failed: %s",
+                        _e)
+        return result
 
     if name == "get_recent_human_journal":
         limit = max(1, min(50, int(args.get("limit", 10))))
