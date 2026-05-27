@@ -47,8 +47,10 @@ CREATE TABLE IF NOT EXISTS summaries_gist (
     body TEXT NOT NULL,                    -- the one line
     confidence TEXT DEFAULT 'med',         -- high | med | low
     raw_pointer_id INTEGER,                -- → raw_pointers.id (nullable)
+    prompt_version_id INTEGER,             -- → gist_prompts.id (Phase 1d, 2026-05-27)
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (raw_pointer_id) REFERENCES raw_pointers(id)
+    FOREIGN KEY (raw_pointer_id) REFERENCES raw_pointers(id),
+    FOREIGN KEY (prompt_version_id) REFERENCES gist_prompts(id)
 );
 CREATE INDEX IF NOT EXISTS idx_gist_created ON summaries_gist(created_at);
 CREATE INDEX IF NOT EXISTS idx_gist_period ON summaries_gist(period_label);
@@ -1887,6 +1889,78 @@ class OverseerDB(CortexDB):
         self._seed_sub_agent_tiers()
         # Then validate every tier still resolves to a real model.
         self._validate_sub_agent_tiers()
+        # Phase 1d (2026-05-27): wire gist→prompt linkage live.
+        self._migrate_phase1d_gist_prompt_link()
+
+    def _migrate_phase1d_gist_prompt_link(self):
+        """Phase 1d (2026-05-27): summaries_gist.prompt_version_id +
+        seed gist_prompts v1 with the current canonical session prompt.
+
+        Closes Phase 1 of the three-layer architecture seed by making
+        the gist→prompt linkage live. Future regenerations (Phase 5
+        refinement loop) author v2+ as gist_prompts rows; the linkage
+        tracks which gists were produced by which prompt version, so
+        consumers' drill-past signals (pull_events) can attribute back
+        to a specific prompt version and drive a revision proposal.
+
+        Idempotent — safe to re-run.
+        """
+        # 1. ALTER summaries_gist for existing installs.
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(summaries_gist)"
+        ).fetchall()}
+        if "prompt_version_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE summaries_gist ADD COLUMN "
+                "prompt_version_id INTEGER"
+            )
+            self._safe_commit()
+
+        # 2. Seed v1 of gist_prompts with the canonical session prompt
+        #    template if the table is still empty. Captured by hand
+        #    from prompts.session_gist_prompt as of 2026-05-27. Future
+        #    revisions get authored by overseer; this row anchors the
+        #    baseline for refinement-loop comparators.
+        row = self._conn.execute(
+            "SELECT id FROM gist_prompts WHERE version_label = ?",
+            ("v1",)
+        ).fetchone()
+        if not row:
+            seed_text = (
+                "You are summarizing a single Cortex session into ONE "
+                "LINE that captures THE CHANGE.\n\n"
+                "What did this session change about the user's standing "
+                "situation? What's now true that wasn't true before, "
+                "or what's now untrue that was? Drop everything the "
+                "user already knew, already had, or already believed "
+                "before this session. If nothing changed, say that "
+                "plainly — 'no net change' is a valid one-line gist."
+                "\n\n"
+                "Don't describe what the assistant did. Describe what "
+                "shifted for the human.\n\n"
+                "Session: {sid}\nStarted: {started}\nEnded: {ended}\n"
+                "Platform: {platform}\n\n"
+                "Notes from this session ({n_total} total{n_shown}):"
+                "\n{body}\n\n"
+                "Write only the one-sentence gist focused on the "
+                "change. No preamble. No quotes. If nothing changed, "
+                "write 'No net change in user's standing situation.'"
+            )
+            self.add_gist_prompt(
+                version_label="v1",
+                prompt_text=seed_text,
+                rationale=(
+                    "Seed snapshot of session_gist_prompt as of "
+                    "2026-05-27 (Phase 1d). Captures the canonical "
+                    "CHANGE-focused template the loop has used since "
+                    "the F1 reader surface shipped. Future revisions "
+                    "(v2+) will be authored by overseer based on "
+                    "pull_events drill-past signals per the "
+                    "three_layer_architecture_design_seed.md "
+                    "refinement loop."
+                ),
+                make_active=True,
+            )
 
     def _migrate_9_6_notification_actions(self):
         """Slice 9.6 CP1 (2026-05-19): notifications gain actions_json
@@ -1977,15 +2051,36 @@ class OverseerDB(CortexDB):
 
     def add_gist(self, body, *, period_label="", period_start=None,
                  period_end=None, confidence="med", raw_pointer_id=None,
-                 tags=None):
+                 prompt_version_id=None, tags=None):
+        # Phase 1d (2026-05-27): if no explicit prompt_version_id was
+        # passed, auto-link to the currently-active gist_prompts row
+        # so refinement-loop signals (pull_events drill-past) can
+        # attribute back to a specific prompt version. Callers that
+        # don't fit the standard session-gist path can pass
+        # prompt_version_id=0 or a specific id to override.
+        if prompt_version_id is None:
+            active = self.get_active_gist_prompt()
+            if active:
+                prompt_version_id = active["id"]
         cur = self._conn.execute(
-            "INSERT INTO summaries_gist (period_label, period_start, period_end, "
-            "body, confidence, raw_pointer_id) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO summaries_gist (period_label, period_start, "
+            "period_end, body, confidence, raw_pointer_id, "
+            "prompt_version_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (period_label, period_start, period_end, body,
-             _norm_confidence(confidence), raw_pointer_id),
+             _norm_confidence(confidence), raw_pointer_id,
+             prompt_version_id),
         )
         self._safe_commit()
         gid = cur.lastrowid
+        # Phase 1d: bump the prompt's gists_generated counter so the
+        # refinement loop has a denominator for drill-past ratios.
+        if prompt_version_id:
+            self._conn.execute(
+                "UPDATE gist_prompts SET gists_generated = "
+                "gists_generated + 1 WHERE id = ?",
+                (int(prompt_version_id),),
+            )
+            self._safe_commit()
         self.tag_many("summaries_gist", gid, tags)
         return gid
 

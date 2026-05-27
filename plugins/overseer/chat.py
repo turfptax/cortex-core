@@ -314,6 +314,20 @@ Trigger phrases that mean "fetch now, don't recall":
   "X is deprecated/unused/safe to remove", "the count is",
   "as of", "we decided", "I recommend [drop|keep|remove|consolidate]"
 
+**Working memory counts as fetch (Slice 14.8 carve-out, sourced from
+overseer's first-chat read on this persona).** The working_memory
+block at the top of context is freshly-built each tick from
+source-of-truth tables. Values it carries (confidence tags, project
+dates, theme states, freshness signals, top_projects, freshness
+indicators) count as fetched for this turn — citing them does NOT
+trigger an extra tool call. Re-fetch the row if EITHER (a) the
+snapshot is old enough that it might have moved (working_memory
+freshness signal will tell you), OR (b) you are about to issue a
+recommendation that depends on the value's exact current state.
+Without this carve-out the rule is either toothless (hand-waved on
+every citation) or paralyzing (every confidence tag triggers a
+tool call).
+
 A long careful paragraph IS NOT an audit (blindspot `b:7`, confidence
 high — Opus's first careful pass missed 4 column-name bugs in commit
 325a05a; only explicit fetch caught them). Completeness is not
