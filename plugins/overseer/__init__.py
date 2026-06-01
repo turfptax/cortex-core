@@ -1511,22 +1511,74 @@ class OverseerPlugin(Plugin):
 
     def _http_add_human_journal(self, payload):
         """POST /plugins/overseer/human-journal
-        Body: {"text": "...", "entry_type": "free" (default)}"""
+        Body: {
+          "text":             required — entry body,
+          "entry_type":       optional — 'free' (default), 'voice',
+                              'daily', 'weekly'. 'voice' added
+                              2026-06-01 for Google Recorder + Pi
+                              wearable transcripts that arrive after
+                              the moment of recording.
+          "local_created_at": optional — ISO-with-offset override for
+                              backdated entries (e.g. a transcript
+                              recorded at 09:17 imported later in the
+                              day). If absent, defaults to now-local.
+                              Must be a parseable ISO string; the
+                              backend stores it verbatim into the
+                              local_created_at column AND mirrors it
+                              into created_at so range queries work.
+        }
+        """
         if self.overseer_db is None:
             return {"ok": False, "error": "overseer not initialized"}
         text = (payload.get("text") or "").strip()
         if not text:
             return {"ok": False, "error": "text required"}
         entry_type = (payload.get("entry_type") or "free").strip()
-        if entry_type not in ("free", "daily", "weekly"):
+        # Expanded 2026-06-01: 'voice' now accepted to cover both Pi
+        # wearable voice runtime and Google Recorder imports.
+        if entry_type not in ("free", "voice", "daily", "weekly"):
             entry_type = "free"
+        # Optional caller override for backdated entries. Defaults to
+        # "now" via temporal_clock to preserve the prior behavior.
+        local_created_at = str(
+            payload.get("local_created_at") or ""
+        ).strip()
+        if not local_created_at:
+            local_created_at = temporal_clock.format_local_iso()
         try:
             new_id = self.overseer_db.add_human_journal_entry(
                 text=text,
                 entry_type=entry_type,
-                local_created_at=temporal_clock.format_local_iso(),
+                local_created_at=local_created_at,
             )
-            return {"ok": True, "id": new_id}
+            # If caller passed a backdated local_created_at, mirror it
+            # into created_at too so range queries (used by temporal
+            # gatherers + vault renderer) place this entry in the
+            # right window. Without this, backdated voice entries
+            # show up in TODAY's bucket regardless of when they were
+            # actually recorded.
+            if payload.get("local_created_at"):
+                try:
+                    # Convert ISO-with-offset to UTC for created_at.
+                    import datetime as _dt
+                    dt = _dt.datetime.fromisoformat(
+                        local_created_at.replace("Z", "+00:00"))
+                    utc_iso = dt.astimezone(_dt.timezone.utc).strftime(
+                        "%Y-%m-%d %H:%M:%S")
+                    self.overseer_db._conn.execute(
+                        "UPDATE human_journal_entries SET created_at "
+                        "= ? WHERE id = ?",
+                        (utc_iso, new_id),
+                    )
+                    self.overseer_db._safe_commit()
+                except Exception as e:
+                    log.warning(
+                        "could not normalize created_at for backdated "
+                        "human-journal #%s: %s", new_id, e,
+                    )
+            return {"ok": True, "id": new_id,
+                    "entry_type": entry_type,
+                    "local_created_at": local_created_at}
         except Exception as e:
             log.exception("add_human_journal failed")
             return {"ok": False, "error": str(e)}
