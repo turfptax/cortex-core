@@ -1,0 +1,52 @@
+[plugin]
+name = "weather"
+version = "0.1.0"
+description = "Weather + sky conditions logger with multi-location support and aurora/UFO-watching signals"
+author = "turfptax"
+entrypoint = "weather"
+enabled = true
+
+[capabilities]
+db = true                       # owns plugins/weather/data/weather.db
+display_screens = false         # no Pi display surface — Hub renders
+mcp_tools = false               # not yet — Phase 2 may add cortex_weather
+http_routes = true              # /plugins/weather/* for Hub queries
+background_tasks = true         # hourly poll loop
+core_memory_read = false        # weather is self-contained
+core_memory_write = false       # never writes to cortex.db
+llm = false                     # no LLM needed for Phase 1
+
+[config]
+# Hourly poll cadence for current conditions + sky data.
+# Honors "won't bombard" — Open-Meteo says 10,000 calls/day free;
+# hourly per location is 24/day per location. Plenty of headroom.
+poll_interval_s = 3600
+
+# Initial tick delay so we don't hammer endpoints at boot.
+first_poll_delay_s = 60
+
+# Per-source request timeout.
+http_timeout_s = 20
+
+# How many days of history to retain in weather_observations + sky_observations.
+# Older rows pruned on plugin load. 90d = ~2160 obs per location at hourly.
+history_retention_days = 90
+
+# Source enable flags. Disable any source globally without touching the loop.
+source_open_meteo_enabled = true   # current + forecast (global)
+source_noaa_swpc_enabled = true    # Kp + aurora forecast (global geomag)
+source_nws_enabled = false         # Phase 2 — US severe weather alerts
+
+# Seed location on first boot. Lincoln, Nebraska (Tory's home).
+# Extra locations added via POST /plugins/weather/locations.
+[config.seed_location]
+slug = "lincoln-ne"
+name = "Lincoln, NE"
+lat = 40.8136
+lon = -96.7026
+timezone = "America/Chicago"
+is_primary = true
+
+[dependencies]
+core_min = "0.1.0"
+plugins = []
