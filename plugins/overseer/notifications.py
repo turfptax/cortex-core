@@ -235,6 +235,61 @@ def rule_llm_health(*, db, core_memory, config) -> list[dict]:
     }]
 
 
+def rule_weather_alert(*, db, core_memory, config) -> list[dict]:
+    """Active SEVERE/EXTREME NWS weather alerts → Bell (Weather CP2).
+
+    Reads the sibling weather plugin's weather_alerts table read-only and
+    surfaces severe+extreme, non-dismissed, non-expired alerts. Design
+    (looper authority): severity gate = severe|extreme; dedup + auto-
+    resolve via rule_key=source_alert_id (when an alert expires or is
+    dismissed it stops being returned and evaluate_rules archives the
+    Bell entry). NWS 'extreme' → 'important', 'severe' → 'warn'.
+    """
+    import os
+    import sqlite3 as _sql
+    import datetime as _dt
+    wpath = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "weather", "data", "weather.db")
+    if not os.path.exists(wpath):
+        return []
+    try:
+        wc = _sql.connect("file:%s?mode=ro" % wpath, uri=True)
+        wc.row_factory = _sql.Row
+        rows = wc.execute(
+            "SELECT a.id, a.source_alert_id, a.severity, a.event, "
+            "       a.headline, a.expires_at, l.name AS loc "
+            "FROM weather_alerts a "
+            "JOIN locations l ON l.id = a.location_id "
+            "WHERE a.dismissed_at IS NULL "
+            "  AND a.severity IN ('severe', 'extreme')"
+        ).fetchall()
+        wc.close()
+    except Exception:
+        return []
+    now = _dt.datetime.now(_dt.timezone.utc)
+    out = []
+    for r in rows:
+        exp = r["expires_at"]
+        if exp:
+            try:
+                if _dt.datetime.fromisoformat(exp) < now:
+                    continue  # expired
+            except Exception:
+                pass
+        out.append({
+            "rule_name": "weather_alert",
+            "rule_key": str(r["source_alert_id"]),
+            "severity": "important" if r["severity"] == "extreme" else "warn",
+            "title": "{}: {}".format(r["loc"], r["event"]),
+            "body": (r["headline"] or r["event"] or "")[:600],
+            "related_table": "weather_alerts",
+            "related_id": str(r["id"]),
+            "action_url": "",
+        })
+    return out
+
+
 # ── Registry ────────────────────────────────────────────────────
 
 RULES = [
@@ -242,6 +297,7 @@ RULES = [
     rule_automation_anomaly,
     rule_import_backlog,
     rule_llm_health,
+    rule_weather_alert,
 ]
 
 
