@@ -1045,6 +1045,13 @@ CREATE TABLE IF NOT EXISTS pull_events (
     query_text TEXT,
     -- Free-form caller context (Claude Desktop session id, agent name, etc.)
     caller_id TEXT,
+    -- Looper iteration #2 added (2026-06-06): caller_class derived
+    -- from caller_id at INSERT time. THE F1 adoption-signal metric.
+    -- Empty string for unclassified rows (legacy or unknown).
+    -- Values: organic-external | automation:looper | automation:bootstrap
+    --       | automation:verification | user-probe | hub | internal
+    --       | external-tagged
+    caller_class TEXT NOT NULL DEFAULT '',
     pulled_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -1054,6 +1061,10 @@ CREATE INDEX IF NOT EXISTS idx_pull_events_pulled_at
     ON pull_events(pulled_at);
 CREATE INDEX IF NOT EXISTS idx_pull_events_surface
     ON pull_events(surface, pulled_at);
+-- idx_pull_events_caller_class is created in
+-- _migrate_pull_events_caller_class AFTER the column exists. Putting
+-- it in the schema bootstrap fails on existing installs because
+-- CREATE TABLE IF NOT EXISTS doesn't add columns to existing tables.
 
 -- Phase 1 (2026-05-27, three-layer architecture seed): gist prompts
 -- as first-class evolving artifacts. The current prompt lives in
@@ -1883,6 +1894,50 @@ class OverseerDB(CortexDB):
                             agent_type, agent_name, e)
         self._safe_commit()
 
+    def _migrate_pull_events_caller_class(self):
+        """Looper iter #2 ship (2026-06-06): add caller_class column +
+        backfill existing rows via classify_caller.
+
+        Fresh installs get the column from OVERSEER_SCHEMA_SQL. Existing
+        installs (.25) need the additive ALTER + a backfill so the F1
+        adoption metric works on historical data.
+        """
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(pull_events)"
+        ).fetchall()}
+        if "caller_class" not in cols:
+            self._conn.execute(
+                "ALTER TABLE pull_events ADD COLUMN "
+                "caller_class TEXT NOT NULL DEFAULT ''"
+            )
+            self._safe_commit()
+            log.info(
+                "_migrate_pull_events_caller_class: column added")
+        # Index lives here (not in schema bootstrap) so the column
+        # is guaranteed to exist before the index attempts to
+        # reference it.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pull_events_caller_class "
+            "ON pull_events(caller_class, pulled_at)"
+        )
+        self._safe_commit()
+        # Backfill any rows with empty caller_class.
+        rows = self._conn.execute(
+            "SELECT id, caller_id FROM pull_events "
+            "WHERE caller_class = ''"
+        ).fetchall()
+        if rows:
+            for row in rows:
+                self._conn.execute(
+                    "UPDATE pull_events SET caller_class = ? "
+                    "WHERE id = ?",
+                    (self.classify_caller(row["caller_id"]), row["id"]),
+                )
+            self._safe_commit()
+            log.info(
+                "_migrate_pull_events_caller_class: backfilled %d rows",
+                len(rows))
+
     def _migrate_phase1_pull_events(self):
         """Phase 1 (2026-05-27): pull_events + gist_prompts tables.
 
@@ -1923,6 +1978,8 @@ class OverseerDB(CortexDB):
         self._seed_sub_agent_tiers()
         # Then validate every tier still resolves to a real model.
         self._validate_sub_agent_tiers()
+        # Chain: pull_events caller_class (2026-06-06, looper iter #2).
+        self._migrate_pull_events_caller_class()
         # Phase 1d (2026-05-27): wire gist→prompt linkage live.
         self._migrate_phase1d_gist_prompt_link()
 
@@ -5132,6 +5189,65 @@ class OverseerDB(CortexDB):
     # never let an instrumentation failure block the surface that did
     # the actual pull.
 
+    # caller_class derivation (2026-06-06, looper iter #2 proposal).
+    # THE F1 adoption metric is "are organic external AIs actually
+    # reading the corpus?" — and that signal was unreadable while
+    # looper/bootstrap/verification probes pollute the same surface.
+    # caller_class is computed at INSERT time from caller_id; the
+    # surface is documented in memory/looper_command.md so future
+    # sessions tag correctly.
+    @staticmethod
+    def classify_caller(caller_id):
+        """Derive caller_class from caller_id. NEVER raises."""
+        try:
+            cid = (caller_id or "").strip().lower()
+        except Exception:
+            return ""
+        if not cid:
+            # No caller_id passed → an external session called the MCP
+            # tool without identifying itself. Best proxy we have for
+            # "organic external AI". The convention is: ALL automation
+            # MUST pass a tagged caller_id; everything else is organic.
+            return "organic-external"
+        # Looper iterations
+        if cid.startswith("looper-") or cid.startswith("looper:") \
+           or cid.startswith("looper "):
+            return "automation:looper"
+        # Bootstrap-era probes from the slice 14.7+ ship sequence
+        if (cid.startswith("phase1-") or cid.startswith("phase2-")
+                or cid.startswith("phase3-") or cid.startswith("setup-")
+                or cid.startswith("bootstrap-") or "checkpoint" in cid):
+            return "automation:bootstrap"
+        # Gateway parity tests + cross-system probes
+        if "gateway-" in cid or "parity-probe" in cid:
+            return "automation:bootstrap"
+        # Tory's manual probes from his own Claude sessions
+        if cid.startswith("tory-") or cid.startswith("user-"):
+            return "user-probe"
+        # Claude Code sessions running scripted F1 verification
+        if cid.startswith("claude-code-") and (
+                "verify" in cid or "audit" in cid or "regress" in cid
+                or "acceptance" in cid or "e2e" in cid
+                or "test" in cid):
+            return "automation:verification"
+        # Other claude-code sessions tagged organically
+        if cid.startswith("claude-code-"):
+            return "external-tagged"
+        # Internal cortex surfaces
+        if (cid in ("overseer-chat", "overseer", "internal",
+                     "health-check")
+                or cid.startswith("overseer:")
+                or cid.startswith("internal:")):
+            return "internal"
+        # Hub UI surfaces
+        if cid.startswith("hub:") or "hub-" in cid \
+           or cid == "hub":
+            return "hub"
+        # Anything else has a caller_id we don't recognize — external
+        # but identifiable, distinct from the bare-no-id "organic"
+        # signal.
+        return "external-tagged"
+
     def record_pull_event(self, *, artifact_table, artifact_id, surface,
                           parent_artifact_table=None,
                           parent_artifact_id=None,
@@ -5139,14 +5255,18 @@ class OverseerDB(CortexDB):
         """Record one pull event. Returns the new row id or None on
         failure. Designed to be cheap + crash-safe — exceptions are
         swallowed and logged at WARNING so callers can fire-and-forget.
+
+        caller_class is computed at INSERT time from caller_id via
+        classify_caller (2026-06-06, looper iter #2 ship).
         """
+        caller_class = self.classify_caller(caller_id)
         try:
             cur = self._conn.execute(
                 "INSERT INTO pull_events "
                 "(artifact_table, artifact_id, surface, "
                 "parent_artifact_table, parent_artifact_id, "
-                "query_text, caller_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "query_text, caller_id, caller_class) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     str(artifact_table or ""),
                     int(artifact_id) if artifact_id is not None else 0,
@@ -5155,6 +5275,7 @@ class OverseerDB(CortexDB):
                     int(parent_artifact_id) if parent_artifact_id else None,
                     str(query_text) if query_text else None,
                     str(caller_id) if caller_id else None,
+                    caller_class,
                 ),
             )
             self._safe_commit()
@@ -5193,7 +5314,12 @@ class OverseerDB(CortexDB):
           'total': int,
           'by_surface': {surface: count, ...},
           'by_artifact_table': {table: count, ...},
+          'by_caller_class': {class: count, ...},
+          'organic_external_count': int,    # THE F1 adoption metric
+          'automation_count': int,          # everything tagged as auto
+          'signal_ratio': float,            # organic / total (0..1)
           'top_pulled': [(artifact_table, artifact_id, count), ...],
+          'top_pulled_organic': [(artifact_table, artifact_id, count), ...],
           'window_days': days,
         }
         """
@@ -5217,6 +5343,18 @@ class OverseerDB(CortexDB):
                 (window_param,),
             ).fetchall()
         }
+        by_caller_class = {
+            r[0]: r[1] for r in self._conn.execute(
+                f"SELECT caller_class, COUNT(*) FROM pull_events "
+                f"{window_clause} GROUP BY caller_class",
+                (window_param,),
+            ).fetchall()
+        }
+        organic = int(by_caller_class.get("organic-external", 0))
+        automation = sum(
+            v for k, v in by_caller_class.items()
+            if k.startswith("automation:")
+        )
         top = [
             (r[0], r[1], r[2]) for r in self._conn.execute(
                 f"SELECT artifact_table, artifact_id, COUNT(*) AS c "
@@ -5226,11 +5364,29 @@ class OverseerDB(CortexDB):
                 (window_param,),
             ).fetchall()
         ]
+        # Top pulled BY ORGANIC EXTERNAL only — answers "what are
+        # real users actually drilling into?" cleanly.
+        top_organic = [
+            (r[0], r[1], r[2]) for r in self._conn.execute(
+                f"SELECT artifact_table, artifact_id, COUNT(*) AS c "
+                f"FROM pull_events {window_clause} "
+                f"  AND caller_class = 'organic-external' "
+                f"GROUP BY artifact_table, artifact_id "
+                f"ORDER BY c DESC LIMIT 20",
+                (window_param,),
+            ).fetchall()
+        ]
+        signal_ratio = round(organic / total, 3) if total else 0.0
         return {
             "total": int(total),
             "by_surface": by_surface,
             "by_artifact_table": by_table,
+            "by_caller_class": by_caller_class,
+            "organic_external_count": organic,
+            "automation_count": int(automation),
+            "signal_ratio": signal_ratio,
             "top_pulled": top,
+            "top_pulled_organic": top_organic,
             "window_days": int(days),
         }
 

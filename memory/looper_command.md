@@ -160,6 +160,42 @@ Pick ONE primary focus per iteration, plus light touches on others.
 
 ---
 
+## Caller-ID convention (don't pollute the F1 signal)
+
+Every `cortex_search` / `cortex_overseer_detail` call you make logs a
+`pull_event`. The overseer's F1 adoption metric is "how often do
+ORGANIC external AIs read the corpus" — and that metric is unreadable
+if automation traffic pollutes it.
+
+**Always pass `caller_id` on your MCP calls. The pattern picks the
+class:**
+
+| caller_id pattern | classified as | use when |
+|---|---|---|
+| `looper-iter<N>-<focus>` | `automation:looper` | you're a /loop iteration |
+| `looper:<task>` | `automation:looper` | spot work inside an iteration |
+| `phase<N>-*`, `setup-*`, `bootstrap-*`, `*checkpoint*` | `automation:bootstrap` | one-time ship verification |
+| `claude-code-*verify*` / `*audit*` / `*test*` / `*acceptance*` | `automation:verification` | scripted regression / smoke tests |
+| `tory-*`, `user-*` | `user-probe` | Tory's own MCP queries |
+| `overseer:*`, `internal:*`, `health-check` | `internal` | cortex-internal callers |
+| `hub:*`, `hub-*` | `hub` | Hub UI calls |
+| (anything else with a caller_id) | `external-tagged` | external but tagged |
+| **(no caller_id at all)** | **`organic-external`** ← **F1 metric** | DO NOT FAKE THIS |
+
+**Never call cortex_search with an empty caller_id.** That bucket is
+reserved for genuinely organic external traffic (Claude Desktop
+sessions, Claude in Chrome, future apps). If you tag yourself
+correctly, the overseer can see "the corpus has X organic readers
+this week" as a clean number.
+
+Read the signal via:
+```bash
+curl -s -u cortex:cortex \
+  'http://10.0.0.25:8420/plugins/overseer/pull-events/stats?days=7' | jq
+# returns organic_external_count, automation_count, signal_ratio,
+# by_caller_class, top_pulled_organic
+```
+
 ## Cost discipline
 
 You have Tory's Max quota, but he wants ROI per token. Calibration:
