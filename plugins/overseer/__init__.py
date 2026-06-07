@@ -324,6 +324,8 @@ class OverseerPlugin(Plugin):
                   self._http_add_person),
             Route("POST", "/people/update",
                   self._http_update_person),
+            Route("POST", "/people/merge",
+                  self._http_people_merge),
             Route("POST", "/people/delete",
                   self._http_delete_person),
             Route("POST", "/people/link-project",
@@ -1714,6 +1716,38 @@ class OverseerPlugin(Plugin):
             return {"ok": False, "error": "not found"}
         _parse_people_json(updated)
         return {"ok": True, "person": updated}
+
+    def _http_people_merge(self, payload):
+        """POST /plugins/overseer/people/merge
+
+        Body: {"from_id": int, "into_id": int, "dry_run": bool (default
+               true), "agent": str (optional)}
+
+        Folds the duplicate `from_id` row into the canonical `into_id`
+        row: re-points project_people + phone_contacts references, unions
+        the JSON list fields, appends the loser's notes to the survivor,
+        and archives the loser via merged_into_id (NEVER deletes it).
+
+        dry_run defaults to TRUE — callers must pass dry_run=false to
+        actually mutate. The dry-run return is the exact plan that an
+        execute run will carry out.
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        from_id = payload.get("from_id")
+        into_id = payload.get("into_id")
+        if from_id is None or into_id is None:
+            return {"ok": False, "error": "from_id + into_id required"}
+        dry_run = payload.get("dry_run", True)
+        if isinstance(dry_run, str):
+            dry_run = dry_run.strip().lower() not in ("0", "false", "no")
+        try:
+            return self.overseer_db.merge_people(
+                int(from_id), int(into_id), dry_run=bool(dry_run),
+                agent=(payload.get("agent") or "looper"))
+        except Exception as e:
+            log.exception("people_merge failed")
+            return {"ok": False, "error": str(e)}
 
     def _http_delete_person(self, payload):
         if self.overseer_db is None:

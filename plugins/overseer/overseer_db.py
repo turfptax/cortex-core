@@ -1590,6 +1590,19 @@ class OverseerDB(CortexDB):
         OVERSEER_SCHEMA_SQL has CREATE TABLE IF NOT EXISTS, kept as
         chain anchor for future additive Slice 6 column changes
         (e.g. avatar_url, pronouns, etc. if we ever add them)."""
+        # Looper iter #4 (2026-06-07): people-merge support. merged_into_id
+        # archives a duplicate row by pointing it at its survivor instead
+        # of DELETEing it (audit trail + the looper's no-DELETE policy).
+        # NULL = a live, canonical row. Additive + idempotent for the
+        # existing .25 install.
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(overseer_people)").fetchall()}
+        if "merged_into_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE overseer_people ADD COLUMN "
+                "merged_into_id INTEGER")
+            self._safe_commit()
+            log.info("_migrate_6_people: added merged_into_id column")
         self._migrate_8_chat_files()
 
     def _migrate_8_chat_files(self):
@@ -5514,13 +5527,15 @@ class OverseerDB(CortexDB):
             order_by = "last_interacted_at"
         try:
             rows = self._conn.execute(
-                "SELECT * FROM overseer_people ORDER BY {} DESC NULLS LAST "
+                "SELECT * FROM overseer_people WHERE merged_into_id IS NULL "
+                "ORDER BY {} DESC NULLS LAST "
                 "LIMIT ? OFFSET ?".format(order_by),
                 (int(limit), int(offset)),
             ).fetchall()
         except sqlite3.OperationalError:
             rows = self._conn.execute(
-                "SELECT * FROM overseer_people ORDER BY {} DESC "
+                "SELECT * FROM overseer_people WHERE merged_into_id IS NULL "
+                "ORDER BY {} DESC "
                 "LIMIT ? OFFSET ?".format(order_by),
                 (int(limit), int(offset)),
             ).fetchall()
@@ -5648,6 +5663,134 @@ class OverseerDB(CortexDB):
             "DELETE FROM overseer_people WHERE id = ?", (int(person_id),))
         self._safe_commit()
         return cur.rowcount
+
+    def merge_people(self, from_id, into_id, *, dry_run=False,
+                      agent="looper"):
+        """Merge person `from_id` (the duplicate/loser) INTO `into_id`
+        (the canonical survivor).
+
+        Re-points references (project_people, phone_contacts) from the
+        loser to the survivor, unions the JSON list fields
+        (handles/links/expertise/tags), appends the loser's notes to the
+        survivor with a merge marker, and ARCHIVES the loser by setting
+        merged_into_id + is_provisional=1. The loser row is NEVER
+        deleted — audit trail + the looper's no-DELETE policy.
+
+        Returns a plan dict. When dry_run=True, computes the plan and
+        makes NO writes (the required dry-run before any real merge).
+        """
+        from_id = int(from_id)
+        into_id = int(into_id)
+        if from_id == into_id:
+            return {"ok": False, "error": "from_id and into_id are equal"}
+        loser = self.get_person(from_id)
+        survivor = self.get_person(into_id)
+        if not loser:
+            return {"ok": False, "error": "from_id %d not found" % from_id}
+        if not survivor:
+            return {"ok": False, "error": "into_id %d not found" % into_id}
+        if loser.get("merged_into_id"):
+            return {"ok": False,
+                    "error": "from_id %d already merged into %s"
+                    % (from_id, loser["merged_into_id"])}
+        if survivor.get("merged_into_id"):
+            return {"ok": False,
+                    "error": "into_id %d is itself merged into %s"
+                    % (into_id, survivor["merged_into_id"])}
+
+        def _loads(s):
+            try:
+                return json.loads(s) if s else []
+            except Exception:
+                return []
+
+        def _union(a, b):
+            out = list(a)
+            for x in b:
+                if x not in out:
+                    out.append(x)
+            return out
+
+        pp = self._conn.execute(
+            "SELECT id, project FROM project_people WHERE person_id = ?",
+            (from_id,)).fetchall()
+        pc = self._conn.execute(
+            "SELECT id FROM phone_contacts WHERE person_id = ?",
+            (from_id,)).fetchall()
+
+        handles = _union(_loads(survivor.get("online_handles_json")),
+                         _loads(loser.get("online_handles_json")))
+        social = _union(_loads(survivor.get("social_links_json")),
+                        _loads(loser.get("social_links_json")))
+        expert = _union(_loads(survivor.get("areas_of_expertise_json")),
+                        _loads(loser.get("areas_of_expertise_json")))
+        tags = _union(_loads(survivor.get("tags_json")),
+                      _loads(loser.get("tags_json")))
+
+        plan = {
+            "ok": True,
+            "dry_run": bool(dry_run),
+            "from": {"id": from_id, "name": loser["name"]},
+            "into": {"id": into_id, "name": survivor["name"]},
+            "project_people_to_move": len(pp),
+            "phone_contacts_to_move": len(pc),
+            "tags_after": tags,
+            "handles_after": handles,
+            "expertise_after": expert,
+        }
+        if dry_run:
+            return plan
+
+        stamp = self._conn.execute("SELECT datetime('now')").fetchone()[0]
+        # Re-point phone_contacts (keyed by phone_number — no person
+        # UNIQUE conflict possible).
+        self._conn.execute(
+            "UPDATE phone_contacts SET person_id = ?, "
+            "updated_at = datetime('now') WHERE person_id = ?",
+            (into_id, from_id))
+        # Re-point project_people, respecting UNIQUE(project, person_id):
+        # if the survivor is already linked to that project, leave the
+        # loser's link in place (loser is archived) rather than DELETE it.
+        for row in pp:
+            dup = self._conn.execute(
+                "SELECT 1 FROM project_people WHERE project = ? "
+                "AND person_id = ?", (row["project"], into_id)).fetchone()
+            if dup:
+                continue
+            self._conn.execute(
+                "UPDATE project_people SET person_id = ? WHERE id = ?",
+                (into_id, row["id"]))
+        # Union JSON list fields + append the loser's notes onto survivor.
+        merge_line = ("[{} merge:{}] Merged from id {} ('{}')."
+                      .format(stamp, agent, from_id, loser["name"]))
+        loser_notes = (loser.get("notes") or "").strip()
+        if loser_notes:
+            merge_line += "\nNotes from merged row:\n" + loser_notes
+        surv_notes = survivor.get("notes") or ""
+        sep = "\n\n" if surv_notes else ""
+        self._conn.execute(
+            "UPDATE overseer_people SET online_handles_json = ?, "
+            "social_links_json = ?, areas_of_expertise_json = ?, "
+            "tags_json = ?, notes = ?, updated_at = datetime('now') "
+            "WHERE id = ?",
+            (json.dumps(handles), json.dumps(social), json.dumps(expert),
+             json.dumps(tags), surv_notes + sep + merge_line, into_id))
+        # Archive the loser (no DELETE).
+        tomb = loser.get("notes") or ""
+        tsep = "\n\n" if tomb else ""
+        tomb_line = ("[{} merge:{}] Merged INTO id {} ('{}') and archived "
+                     "(not deleted)."
+                     .format(stamp, agent, into_id, survivor["name"]))
+        self._conn.execute(
+            "UPDATE overseer_people SET merged_into_id = ?, "
+            "is_provisional = 1, notes = ?, updated_at = datetime('now') "
+            "WHERE id = ?",
+            (into_id, tomb + tsep + tomb_line, from_id))
+        self._safe_commit()
+
+        plan["executed"] = True
+        plan["survivor"] = self.get_person(into_id)
+        return plan
 
     # project_people junction
 
