@@ -341,7 +341,16 @@ c_agents_run_enabled = true
 # allow/deny list across the PAT-accessible repo set (~80 repos).
 loop_git_ingest_enabled = true
 loop_git_ingest_repos = [
+    # Cortex family (turfptax, public) — Tory's current primary work.
+    "turfptax/cortex-core",
+    "turfptax/cortex-desktop",
+    "turfptax/cortex-link",
+    "turfptax/cortex-pet",
+    # Open Muscle (public OSS hardware venture).
     "Open-Muscle/OpenMuscle-Software",
+    "Open-Muscle/OpenMuscle-AR",
+    "Open-Muscle/OpenMuscle-FlexGrid",
+    "Open-Muscle/FlexGridV3-Firmware",
 ]
 loop_git_ingest_interval_hours = 6
 loop_git_ingest_lookback_days = 7
