@@ -64,21 +64,21 @@ secrets_paths = [
 # in a single day. Quality is rechecked against the next 20 gists;
 # if any regress meaningfully, fall back to "anthropic/claude-sonnet-4.6"
 # (~$0.005/gist) before going back to Opus.
-"summarize-session" = "google/gemini-2.0-flash-001"
+"summarize-session" = "google/gemini-2.5-flash"
 "summarize-recent"  = "anthropic/claude-opus-4.7"
 "working-memory"    = "anthropic/claude-opus-4.7"
 # Slice 14.5 (2026-05-22): moved Sonnet → Gemini 2.0 Flash. Auto-
 # tagging is a small structured task — model choice doesn't move
 # tagging quality much, but it does move cost ~30x.
-"auto-tag-notes"    = "google/gemini-2.0-flash-001"
+"auto-tag-notes"    = "google/gemini-2.5-flash"
 # Slice 14.7.3 (2026-05-26): work/cortex/personal one-word classifier
 # for web-AI sessions (chatgpt/grok-com without cwd). 8-token output,
 # routine pattern match — Flash is exactly the right tier.
-"category-classify" = "google/gemini-2.0-flash-001"
+"category-classify" = "google/gemini-2.5-flash"
 # Slice 14.7 (2026-05-22): router-tier chat. Flash sits in front of
 # Opus-overseer, handles routine turns with thin context, escalates
 # when the question needs the full agent. ~30x cheaper than Opus.
-"router-chat"       = "google/gemini-2.0-flash-001"
+"router-chat"       = "google/gemini-2.5-flash"
 "overseer-chat"     = "anthropic/claude-opus-4.7"
 # Slice 3f: dialectic checker. Paired-generation runs Opus + this in
 # parallel on every interpretive artifact; the diff is captured in
@@ -101,14 +101,14 @@ secrets_paths = [
 # Slice 14.5 (2026-05-22): moved Sonnet → Gemini 2.0 Flash. ~30x
 # cheaper, plenty of capability for structured short tasks, large
 # input window. Routine routing doesn't need Sonnet.
-"evidence-routing"  = "google/gemini-2.0-flash-001"
+"evidence-routing"  = "google/gemini-2.5-flash"
 # Slice 3h: insight scan. Reads recent gist arcs per project and
 # proposes new theme/pattern/drift candidates to the pending queue.
 # Slice 14.5: Sonnet → Gemini Flash for the same reason.
-"insight-scan"      = "google/gemini-2.0-flash-001"
+"insight-scan"      = "google/gemini-2.5-flash"
 # Slice 3i CP2: distill corrections → blindspot proposals.
 # Cheap clustering of small text rows — Flash territory.
-"distill-corrections" = "google/gemini-2.0-flash-001"
+"distill-corrections" = "google/gemini-2.5-flash"
 
 [hooks]
 subscribe = [

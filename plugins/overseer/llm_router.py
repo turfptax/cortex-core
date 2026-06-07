@@ -56,11 +56,13 @@ SECRETS_DEFAULT_CANDIDATES = (
 # here and every sub-agent gets the new model on its next dispatch.
 #
 # Cost shape (May 2026 OpenRouter pricing, approximate per-call):
-#   flash  ~$0.001 — Gemini 2.0 Flash, ~140× cheaper than Opus
+#   flash  ~$0.003 — Gemini 2.5 Flash (2.0-flash-001 was 404'd off
+#                    OpenRouter 2026-06-07; 2.5-flash is the successor,
+#                    a few× the old cost but still ~40× cheaper than Opus)
 #   sonnet ~$0.02  — Claude Sonnet 4.6
 #   opus   ~$0.10  — Claude Opus 4.7
 SUB_AGENT_TIER_TO_MODEL = {
-    "flash":  "google/gemini-2.0-flash-001",
+    "flash":  "google/gemini-2.5-flash",
     "sonnet": "anthropic/claude-sonnet-4.6",
     "opus":   "anthropic/claude-opus-4.7",
 }

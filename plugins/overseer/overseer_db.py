@@ -1020,7 +1020,7 @@ CREATE INDEX IF NOT EXISTS idx_looper_log_iter
 --
 -- Tier names map to canonical OpenRouter models via
 -- llm_router.SUB_AGENT_TIER_TO_MODEL (cheap → premium):
---   flash  → google/gemini-2.0-flash-001  (~$0.001/call)
+--   flash  → google/gemini-2.5-flash      (~$0.003/call)
 --   sonnet → anthropic/claude-sonnet-4.6  (~$0.02/call)
 --   opus   → anthropic/claude-opus-4.7    (~$0.10/call)
 --
