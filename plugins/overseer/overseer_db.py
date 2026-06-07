@@ -5503,14 +5503,26 @@ class OverseerDB(CortexDB):
     def get_person_by_name(self, name):
         """Case-insensitive name lookup — used by add to prevent
         duplicate creation when an agent encounters the same person
-        across sessions."""
+        across sessions.
+
+        If the matched row has been merged into another (archived via
+        merged_into_id by merge_people), resolve to the live survivor so
+        callers — add_person idempotency in particular — land on the
+        canonical row rather than the archived shell."""
         if not name:
             return None
         row = self._conn.execute(
             "SELECT * FROM overseer_people WHERE LOWER(name) = LOWER(?)",
             (name.strip(),),
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        person = dict(row)
+        if person.get("merged_into_id"):
+            survivor = self.get_person(person["merged_into_id"])
+            if survivor:
+                return survivor
+        return person
 
     def get_person(self, person_id):
         row = self._conn.execute(
@@ -5548,14 +5560,14 @@ class OverseerDB(CortexDB):
             return self.list_people(limit=limit)
         like = "%{}%".format(query.strip())
         rows = self._conn.execute(
-            "SELECT * FROM overseer_people WHERE "
+            "SELECT * FROM overseer_people WHERE merged_into_id IS NULL AND ("
             "  LOWER(name) LIKE LOWER(?) "
             "  OR LOWER(display_name) LIKE LOWER(?) "
             "  OR LOWER(online_handles_json) LIKE LOWER(?) "
             "  OR LOWER(areas_of_expertise_json) LIKE LOWER(?) "
             "  OR LOWER(tags_json) LIKE LOWER(?) "
             "  OR LOWER(notes) LIKE LOWER(?) "
-            "ORDER BY last_interacted_at DESC, updated_at DESC "
+            ") ORDER BY last_interacted_at DESC, updated_at DESC "
             "LIMIT ?",
             (like, like, like, like, like, like, int(limit)),
         ).fetchall()
