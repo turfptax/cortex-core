@@ -5912,22 +5912,27 @@ class OverseerDB(CortexDB):
         """
         cur = self._conn
 
+        # merged_into_id IS NULL across these counts so archived (merged)
+        # rows don't inflate the people-surface stats post-merge.
         total = cur.execute(
-            "SELECT COUNT(*) AS n FROM overseer_people"
+            "SELECT COUNT(*) AS n FROM overseer_people "
+            "WHERE merged_into_id IS NULL"
         ).fetchone()["n"]
 
         added_24h = cur.execute(
             "SELECT COUNT(*) AS n FROM overseer_people "
-            "WHERE created_at >= datetime('now', '-1 day')"
+            "WHERE merged_into_id IS NULL "
+            "  AND created_at >= datetime('now', '-1 day')"
         ).fetchone()["n"]
         added_7d = cur.execute(
             "SELECT COUNT(*) AS n FROM overseer_people "
-            "WHERE created_at >= datetime('now', '-7 days')"
+            "WHERE merged_into_id IS NULL "
+            "  AND created_at >= datetime('now', '-7 days')"
         ).fetchone()["n"]
 
         orphans = cur.execute(
             "SELECT COUNT(*) AS n FROM overseer_people p "
-            "WHERE NOT EXISTS ("
+            "WHERE p.merged_into_id IS NULL AND NOT EXISTS ("
             "  SELECT 1 FROM project_people pp "
             "  WHERE pp.person_id = p.id"
             ")"
@@ -5953,6 +5958,7 @@ class OverseerDB(CortexDB):
         expertise_counter: dict = {}
         for r in cur.execute(
             "SELECT areas_of_expertise_json FROM overseer_people "
+            "WHERE merged_into_id IS NULL "
             "ORDER BY updated_at DESC LIMIT 500"
         ).fetchall():
             try:
@@ -5971,7 +5977,8 @@ class OverseerDB(CortexDB):
         recent_rows = cur.execute(
             "SELECT id, name, created_at, created_by_agent, "
             "       created_by_session_id "
-            "FROM overseer_people ORDER BY created_at DESC LIMIT 10"
+            "FROM overseer_people WHERE merged_into_id IS NULL "
+            "ORDER BY created_at DESC LIMIT 10"
         ).fetchall()
         recent_additions = [dict(r) for r in recent_rows]
 
