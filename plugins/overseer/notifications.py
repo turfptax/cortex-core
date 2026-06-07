@@ -223,7 +223,7 @@ def rule_llm_health(*, db, core_memory, config) -> list[dict]:
                  "journal, temporal narratives) is degraded.").format(
                      diag=diag, err=last_err),
         "related_table": "",
-        "related_id": None,
+        "related_id": "",
         "action_url": "https://openrouter.ai/settings/credits",
     }]
 
