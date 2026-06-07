@@ -101,6 +101,14 @@ CREATE TABLE IF NOT EXISTS corpus_decisions (
     gist_id INTEGER,
     confidence TEXT,
     source TEXT,
+    -- enrichment (looper datamining pass 4): comma-joined tracked-people
+    -- names mentioned in the decision's source gist (NULL when none — most
+    -- logged decisions are project/tech-centric, not interpersonal); and
+    -- pipe-joined t:<id> theme tokens linking the decision UP into the
+    -- abstraction graph (theme -> its decisions), drill-able via
+    -- cortex_overseer_detail. Both populated by the looper, additive.
+    people TEXT,
+    themes TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (decision_text)
 );
@@ -2104,6 +2112,30 @@ class OverseerDB(CortexDB):
                 ),
                 make_active=True,
             )
+        self._migrate_corpus_decisions_links()
+
+    def _migrate_corpus_decisions_links(self):
+        """Looper datamining pass 4 (2026-06-07): additive people + themes
+        enrichment columns on corpus_decisions. Fresh installs get them via
+        the CREATE TABLE in OVERSEER_SCHEMA_SQL; existing installs (.25) pick
+        them up here. Idempotent. The table itself may not exist yet on a
+        brand-new install at the moment this runs, but the schema bootstrap
+        creates it first, so the PRAGMA is safe."""
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='corpus_decisions'"
+        ).fetchone()
+        if not row:
+            return
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(corpus_decisions)"
+        ).fetchall()}
+        for col in ("people", "themes"):
+            if col not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE corpus_decisions ADD COLUMN {col} TEXT"
+                )
+        self._safe_commit()
 
     def _migrate_9_6_notification_actions(self):
         """Slice 9.6 CP1 (2026-05-19): notifications gain actions_json
