@@ -960,6 +960,40 @@ CREATE INDEX IF NOT EXISTS idx_c_agents_status
 CREATE INDEX IF NOT EXISTS idx_c_agents_parent
     ON c_agents(graduated_from_b_name);
 
+-- Looper log (2026-06-05): Tory runs a separate Claude Code session
+-- on /loop interval using HIS Anthropic Max quota (not overseer's
+-- $3/day cap) to do datamining + cleanup + Phase 2.x work. Each
+-- iteration is a fresh session with NO memory of prior iterations —
+-- the looper reads the most recent rows here at boot to know what's
+-- already been done + what to pick up next.
+--
+-- Distinguished from overseer_journal: that's overseer's own first-
+-- person reflection on the corpus. This is a contractor's work log
+-- — what got done, what's queued, what files changed, what to
+-- escalate.
+CREATE TABLE IF NOT EXISTS looper_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    iteration_number INTEGER NOT NULL,        -- monotonic across all loop runs
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    ended_at TEXT,                            -- NULL if iteration crashed / still running
+    local_started_at TEXT NOT NULL DEFAULT '',
+    local_ended_at TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL DEFAULT 'general',     -- 'datamining' | 'phase2' | 'cleanup' | 'discovery' | etc
+    session_id TEXT NOT NULL DEFAULT '',      -- Claude Code session id when known
+    model TEXT NOT NULL DEFAULT '',           -- e.g. 'claude-opus-4.7'
+    summary TEXT NOT NULL DEFAULT '',         -- 1-paragraph TLDR for next iter
+    work_done_json TEXT NOT NULL DEFAULT '[]',  -- [{category, item, status}]
+    followups_json TEXT NOT NULL DEFAULT '[]',  -- list of strings for next iter
+    files_changed_json TEXT NOT NULL DEFAULT '[]', -- repo paths touched
+    llm_calls_estimate INTEGER NOT NULL DEFAULT 0,
+    cost_usd_estimate REAL NOT NULL DEFAULT 0.0,
+    escalations_json TEXT NOT NULL DEFAULT '[]'  -- items requiring Tory's call
+);
+CREATE INDEX IF NOT EXISTS idx_looper_log_started
+    ON looper_log(started_at);
+CREATE INDEX IF NOT EXISTS idx_looper_log_iter
+    ON looper_log(iteration_number);
+
 -- Sub-agent tier registry (2026-05-27): which model tier each B/C
 -- agent runs at right now. Source of truth — overrides B_AGENTS dict
 -- model field at dispatch time. Default seeded from code; Tory pulls
@@ -4844,6 +4878,91 @@ class OverseerDB(CortexDB):
             (kind,),
         ).fetchone()
         return dict(row) if row else None
+
+    # ── Looper log (2026-06-05) ─────────────────────────────────
+    #
+    # Tory's separate Claude Code /loop session writes here so each
+    # fresh iteration knows what its predecessor did + what to pick
+    # up. Cheap journaling — no indexes that would slow it down.
+
+    def next_looper_iteration_number(self):
+        """Read max(iteration_number) + 1. Returns 1 if table is empty."""
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(iteration_number), 0) + 1 "
+            "FROM looper_log"
+        ).fetchone()
+        return int(row[0]) if row else 1
+
+    def start_looper_iteration(self, *, mode="general", session_id="",
+                                  model="", local_started_at=""):
+        """Insert a new looper_log row at the start of an iteration.
+        Returns (id, iteration_number)."""
+        iter_n = self.next_looper_iteration_number()
+        cur = self._conn.execute(
+            "INSERT INTO looper_log "
+            "(iteration_number, mode, session_id, model, "
+            " local_started_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (iter_n, str(mode), str(session_id), str(model),
+             str(local_started_at)),
+        )
+        self._safe_commit()
+        return {"id": cur.lastrowid, "iteration_number": iter_n}
+
+    def finish_looper_iteration(self, *, id, summary="",
+                                   work_done=None, followups=None,
+                                   files_changed=None,
+                                   llm_calls_estimate=0,
+                                   cost_usd_estimate=0.0,
+                                   escalations=None,
+                                   local_ended_at=""):
+        """Mark the iteration done + write its outputs."""
+        self._conn.execute(
+            "UPDATE looper_log SET "
+            "  ended_at = datetime('now'), "
+            "  local_ended_at = ?, "
+            "  summary = ?, "
+            "  work_done_json = ?, "
+            "  followups_json = ?, "
+            "  files_changed_json = ?, "
+            "  llm_calls_estimate = ?, "
+            "  cost_usd_estimate = ?, "
+            "  escalations_json = ? "
+            "WHERE id = ?",
+            (
+                str(local_ended_at),
+                str(summary)[:5000],
+                json.dumps(work_done or []),
+                json.dumps(followups or []),
+                json.dumps(files_changed or []),
+                int(llm_calls_estimate or 0),
+                float(cost_usd_estimate or 0.0),
+                json.dumps(escalations or []),
+                int(id),
+            ),
+        )
+        self._safe_commit()
+        return {"ok": True, "id": int(id)}
+
+    def recent_looper_entries(self, *, limit=10):
+        rows = self._conn.execute(
+            "SELECT * FROM looper_log "
+            "ORDER BY iteration_number DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            # Parse the JSON cols for the caller's convenience.
+            for k in ("work_done_json", "followups_json",
+                       "files_changed_json", "escalations_json"):
+                try:
+                    d[k.replace("_json", "")] = json.loads(
+                        d.get(k) or "[]")
+                except Exception:
+                    d[k.replace("_json", "")] = []
+            out.append(d)
+        return out
 
     # ── Sub-agent tier registry (2026-05-27) ────────────────────
     #

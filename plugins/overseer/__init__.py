@@ -400,6 +400,13 @@ class OverseerPlugin(Plugin):
                   self._http_set_sub_agent_tier),
             Route("GET",  "/sub-agents/performance",
                   self._http_sub_agent_performance),
+            # ── Looper log (2026-06-05): /loop AI activity ───────
+            Route("POST", "/looper/start",
+                  self._http_looper_start),
+            Route("POST", "/looper/finish",
+                  self._http_looper_finish),
+            Route("GET",  "/looper/recent",
+                  self._http_looper_recent),
         ]
 
     # ── Lifecycle ───────────────────────────────────────────────
@@ -2746,6 +2753,95 @@ class OverseerPlugin(Plugin):
             }
         except Exception as e:
             log.exception("sub_agent_performance failed")
+            return {"ok": False, "error": str(e)}
+
+    # ── Looper log routes (2026-06-05) ─────────────────────────────
+    #
+    # Used by the /loop Claude Code session to journal each iteration
+    # so the next iteration can read what was done. NOT for overseer's
+    # own reflection — that's overseer_journal.
+
+    def _http_looper_start(self, payload):
+        """POST /plugins/overseer/looper/start
+
+        Body: {mode?: str, session_id?: str, model?: str,
+               local_started_at?: str}
+
+        Returns the new looper_log row id + iteration_number. Call
+        this at the START of every /loop iteration; finish it via
+        /looper/finish at the end.
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        p = payload or {}
+        try:
+            result = self.overseer_db.start_looper_iteration(
+                mode=str(p.get("mode") or "general"),
+                session_id=str(p.get("session_id") or ""),
+                model=str(p.get("model") or ""),
+                local_started_at=str(p.get("local_started_at") or ""),
+            )
+            return {"ok": True, **result}
+        except Exception as e:
+            log.exception("looper_start failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_looper_finish(self, payload):
+        """POST /plugins/overseer/looper/finish
+
+        Body: {
+          id: required — the looper_log row id from /looper/start
+          summary: str — 1-paragraph TLDR for next iteration
+          work_done: list of {category, item, status}
+          followups: list of strings — what next iter should consider
+          files_changed: list of repo paths touched
+          llm_calls_estimate: int — rough total LLM calls this iter
+          cost_usd_estimate: float — rough total $ spent
+          escalations: list of strings — items requiring Tory's call
+          local_ended_at: ISO local with offset
+        }
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        p = payload or {}
+        loop_id = p.get("id")
+        if loop_id is None:
+            return {"ok": False, "error": "id is required"}
+        try:
+            return self.overseer_db.finish_looper_iteration(
+                id=int(loop_id),
+                summary=str(p.get("summary") or ""),
+                work_done=p.get("work_done") or [],
+                followups=p.get("followups") or [],
+                files_changed=p.get("files_changed") or [],
+                llm_calls_estimate=int(
+                    p.get("llm_calls_estimate") or 0),
+                cost_usd_estimate=float(
+                    p.get("cost_usd_estimate") or 0.0),
+                escalations=p.get("escalations") or [],
+                local_ended_at=str(p.get("local_ended_at") or ""),
+            )
+        except Exception as e:
+            log.exception("looper_finish failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_looper_recent(self, payload):
+        """GET /plugins/overseer/looper/recent?limit=10
+
+        Returns recent looper_log entries (most recent first). The
+        /loop iteration calls this at boot to read what prior
+        iterations did + what they queued for follow-up.
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        limit = _as_int(payload, "limit", 10, max_value=100)
+        try:
+            entries = self.overseer_db.recent_looper_entries(
+                limit=limit)
+            return {"ok": True, "entries": entries,
+                    "count": len(entries)}
+        except Exception as e:
+            log.exception("looper_recent failed")
             return {"ok": False, "error": str(e)}
 
     def _http_vault_render(self, payload):
