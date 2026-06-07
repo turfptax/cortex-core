@@ -185,8 +185,15 @@ def rule_llm_health(*, db, core_memory, config) -> list[dict]:
     n = (row["n"] if row else 0) or 0
     ok_n = (row["ok_n"] if row else 0) or 0
     min_attempts = int(config.get("notify_llm_health_min_attempts", 4))
-    if n < min_attempts or ok_n > 0:
-        return []  # insufficient signal, or at least one success → healthy
+    # Use FAILURE RATE, not zero-successes: when credit is low, the
+    # occasional tiny call sneaks under the affordable-token cap and
+    # succeeds, which would otherwise flap the alert off/on every tick.
+    # Alert while the LLM is mostly failing; clear only when it's mostly
+    # working again.
+    fail_rate = (n - ok_n) / n if n else 0.0
+    min_fail_rate = float(config.get("notify_llm_health_min_fail_rate", 0.7))
+    if n < min_attempts or fail_rate < min_fail_rate:
+        return []  # insufficient signal, or LLM mostly working → healthy
     # Pick the most ACTIONABLE error across the window (credit > model >
     # timeout) — not just the latest, which is often a fallback timeout
     # masking the real OpenRouter cause.
