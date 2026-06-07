@@ -276,11 +276,25 @@ def _resolve_theme(db, tid):
     row = db.get_theme(tid)
     if not row:
         return None
+    # Member gists become drill-down tokens so an external AI pulling a
+    # theme top-down can reach its evidence (looper cycle 2 — theme_gists).
+    next_tokens = []
+    member_count = 0
+    try:
+        member_count = db.count_gists_for_theme(tid)
+        for g in db.gists_for_theme(tid, limit=25):
+            next_tokens.append(_next(
+                "g:%d" % g["gist_id"],
+                _truncate(g.get("body") or "member gist", 60),
+                kind="member",
+            ))
+    except Exception:
+        pass  # theme_gists absent on older installs — degrade gracefully
     return {
         "primary": row,
         "tags": db.get_tags_for("summaries_theme", tid),
-        "context": {},
-        "next_tokens": [],
+        "context": {"member_gist_count": member_count},
+        "next_tokens": next_tokens,
     }
 
 

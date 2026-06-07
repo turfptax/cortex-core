@@ -68,6 +68,25 @@ CREATE TABLE IF NOT EXISTS summaries_theme (
 );
 CREATE INDEX IF NOT EXISTS idx_theme_title ON summaries_theme(title);
 
+-- theme<->gist membership (looper cycle 2, 2026-06-07): the many-to-many
+-- drill path that makes topical themes navigable. summaries_theme only
+-- carried raw_pointer_id (a single seed gist); this lets a theme link to
+-- ALL its member gists so an external AI can pull a theme top-down then
+-- drill to its evidence. Closes the iter-7 finding (88% of gists were
+-- reachable only via substring search, not via the abstraction graph).
+-- linked_by = provenance (e.g. 'looper:kw-route:v1'); relevance = how.
+CREATE TABLE IF NOT EXISTS theme_gists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    theme_id INTEGER NOT NULL,
+    gist_id INTEGER NOT NULL,
+    relevance TEXT NOT NULL DEFAULT '',
+    linked_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (theme_id, gist_id)
+);
+CREATE INDEX IF NOT EXISTS idx_theme_gists_theme ON theme_gists(theme_id);
+CREATE INDEX IF NOT EXISTS idx_theme_gists_gist ON theme_gists(gist_id);
+
 CREATE TABLE IF NOT EXISTS summaries_episode (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,                   -- "The shipping work"
@@ -2340,6 +2359,27 @@ class OverseerDB(CortexDB):
             "SELECT * FROM summaries_theme WHERE id = ?", (int(theme_id),),
         ).fetchone()
         return dict(row) if row else None
+
+    def gists_for_theme(self, theme_id, *, limit=25):
+        """Member gists of a theme (newest first) with bodies for the
+        detail drill-down. Backs the theme->gist next_tokens path that
+        makes topical themes navigable (looper cycle 2)."""
+        rows = self._conn.execute(
+            "SELECT tg.gist_id, g.body, g.created_at "
+            "FROM theme_gists tg "
+            "JOIN summaries_gist g ON g.id = tg.gist_id "
+            "WHERE tg.theme_id = ? "
+            "ORDER BY g.created_at DESC LIMIT ?",
+            (int(theme_id), int(limit)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_gists_for_theme(self, theme_id):
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM theme_gists WHERE theme_id = ?",
+            (int(theme_id),),
+        ).fetchone()
+        return int(row["n"]) if row else 0
 
     # ── summaries_episode ───────────────────────────────────────
 
