@@ -87,6 +87,26 @@ CREATE TABLE IF NOT EXISTS theme_gists (
 CREATE INDEX IF NOT EXISTS idx_theme_gists_theme ON theme_gists(theme_id);
 CREATE INDEX IF NOT EXISTS idx_theme_gists_gist ON theme_gists(gist_id);
 
+-- corpus_decisions: F1 relational decision dataset, mined deterministically
+-- from gist bodies (decision-signal sentences anchored to projects + dated).
+-- LLM-independent; populated by the looper datamining passes. project may be
+-- NULL (unanchored standalone decision). gist_id drills to the source gist.
+-- confidence: 'high' = project-anchored, 'medium' = strong standalone phrase.
+-- UNIQUE(decision_text) makes re-mining idempotent (INSERT OR IGNORE).
+CREATE TABLE IF NOT EXISTS corpus_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT,
+    decision_text TEXT NOT NULL,
+    decided_on TEXT,
+    gist_id INTEGER,
+    confidence TEXT,
+    source TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (decision_text)
+);
+CREATE INDEX IF NOT EXISTS idx_corpus_decisions_project ON corpus_decisions(project);
+CREATE INDEX IF NOT EXISTS idx_corpus_decisions_date ON corpus_decisions(decided_on);
+
 CREATE TABLE IF NOT EXISTS summaries_episode (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,                   -- "The shipping work"
