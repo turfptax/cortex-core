@@ -3997,7 +3997,12 @@ class OverseerDB(CortexDB):
             "ON CONFLICT(rule_name, rule_key) DO UPDATE SET "
             "severity=excluded.severity, title=excluded.title, "
             "body=excluded.body, related_table=excluded.related_table, "
-            "related_id=excluded.related_id, action_url=excluded.action_url",
+            "related_id=excluded.related_id, action_url=excluded.action_url, "
+            # A re-firing rule un-resolves its own notification: clear the
+            # auto-resolver's archived_at so a recurring alert (LLM still
+            # down, weather alert re-detected) reappears without a manual
+            # un-archive. dismissed_at is left alone — that's a user action.
+            "archived_at=NULL",
             (severity, title, body, related_table, related_id, action_url,
              rule_name, rule_key),
         )
