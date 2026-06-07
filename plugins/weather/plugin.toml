@@ -35,7 +35,7 @@ history_retention_days = 90
 # Source enable flags. Disable any source globally without touching the loop.
 source_open_meteo_enabled = true   # current + forecast (global)
 source_noaa_swpc_enabled = true    # Kp + aurora forecast (global geomag)
-source_nws_enabled = false         # Phase 2 — US severe weather alerts
+source_nws_enabled = true          # US severe weather alerts (NWS api.weather.gov)
 
 # Seed location on first boot. Lincoln, Nebraska (Tory's home).
 # Extra locations added via POST /plugins/weather/locations.

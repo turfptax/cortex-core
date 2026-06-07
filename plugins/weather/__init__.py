@@ -41,7 +41,7 @@ from plugin_api import Plugin, Route  # noqa: E402
 # Local imports
 sys.path.insert(0, str(_HERE))
 from weather_db import WeatherDB  # noqa: E402
-from sources import open_meteo, noaa_swpc, sunrise_sunset  # noqa: E402
+from sources import open_meteo, noaa_swpc, sunrise_sunset, nws_alerts  # noqa: E402
 import astronomy  # noqa: E402
 
 
@@ -140,6 +140,7 @@ class WeatherPlugin(Plugin):
             Route("GET",  "/sky",                  self._http_sky),
             Route("GET",  "/forecast",             self._http_forecast),
             Route("GET",  "/history",              self._http_history),
+            Route("GET",  "/alerts",               self._http_alerts),
             Route("POST", "/poll-now",             self._http_poll_now),
         ]
 
@@ -300,6 +301,23 @@ class WeatherPlugin(Plugin):
                 return {"ok": False, "error": str(e)}
         return {"ok": True, "result": result}
 
+    def _http_alerts(self, payload):
+        """GET /plugins/weather/alerts[?location=<slug>]
+
+        Active (non-dismissed, non-expired) NWS alerts, newest first.
+        Optional ?location=<slug> filters to one location."""
+        if not self.weather_db:
+            return {"ok": False, "error": "weather db not ready"}
+        slug = str((payload or {}).get("location") or "").strip()
+        loc_id = None
+        if slug:
+            loc = self.weather_db.get_location_by_slug(slug)
+            if not loc:
+                return {"ok": False, "error": f"no location: {slug}"}
+            loc_id = loc["id"]
+        alerts = self.weather_db.active_alerts(location_id=loc_id)
+        return {"ok": True, "alerts": alerts, "count": len(alerts)}
+
     # ── Polling ──────────────────────────────────────────────────
 
     def _poll_loop(self):
@@ -388,6 +406,39 @@ class WeatherPlugin(Plugin):
                 log.warning("open-meteo poll for %s failed: %s",
                             loc["slug"], e)
                 result["weather"] = {"ok": False, "error": str(e)}
+
+        # NWS active alerts (US points only; non-US returns []).
+        if bool(cfg.get("source_nws_enabled", True)):
+            try:
+                alerts = nws_alerts.fetch_active(
+                    float(loc["lat"]), float(loc["lon"]), timeout=timeout)
+                new_n = 0
+                new_severe = []
+                for a in alerts:
+                    if self.weather_db.upsert_alert(
+                        location_id=loc["id"], source="nws",
+                        source_alert_id=a["source_alert_id"],
+                        severity=a["severity"], event=a["event"],
+                        headline=a["headline"],
+                        description=a["description"],
+                        effective_at=a["effective_at"],
+                        expires_at=a["expires_at"],
+                        raw_json=json.dumps(a["raw"]),
+                    ):
+                        new_n += 1
+                        if a["severity"] in ("severe", "extreme"):
+                            new_severe.append(a["event"])
+                result["alerts"] = {"ok": True, "active": len(alerts),
+                                    "new": new_n, "new_severe": new_severe}
+                # CP2 hook: emit overseer notification on new_severe.
+                # For now log it so it's visible without cross-plugin coupling.
+                if new_severe:
+                    log.warning("NWS new severe alert(s) for %s: %s",
+                                loc["slug"], ", ".join(new_severe))
+            except Exception as e:
+                log.warning("nws alerts poll for %s failed: %s",
+                            loc["slug"], e)
+                result["alerts"] = {"ok": False, "error": str(e)}
 
         # Sky observation: astronomy + Kp + cloud cover snapshot
         try:

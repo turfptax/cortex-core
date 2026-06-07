@@ -280,6 +280,58 @@ class WeatherDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # ── weather_alerts (NWS) ────────────────────────────────────
+
+    def upsert_alert(self, *, location_id, source, source_alert_id,
+                      severity, event, headline, description="",
+                      effective_at=None, expires_at=None, raw_json="{}"):
+        """Insert a new alert; dedup on UNIQUE(source, source_alert_id).
+        Returns True if a NEW row was inserted, False if already stored
+        (lets the poll cycle detect newly-arrived alerts)."""
+        with self._write_lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO weather_alerts (location_id, source, "
+                    " source_alert_id, severity, event, headline, "
+                    " description, effective_at, expires_at, raw_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (int(location_id), source, str(source_alert_id),
+                     severity, event, headline, description,
+                     effective_at, expires_at, raw_json),
+                )
+                self._conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def active_alerts(self, location_id=None):
+        """Non-dismissed alerts that haven't expired, newest first.
+
+        Expiry is evaluated in Python: NWS timestamps carry a tz offset
+        (e.g. ...T07:30:00-05:00) which SQLite's datetime() can't compare
+        reliably against a UTC 'now'."""
+        sql = "SELECT * FROM weather_alerts WHERE dismissed_at IS NULL"
+        params = []
+        if location_id is not None:
+            sql += " AND location_id = ?"
+            params.append(int(location_id))
+        sql += " ORDER BY received_at DESC LIMIT 500"
+        rows = [dict(r) for r in
+                self._conn.execute(sql, params).fetchall()]
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc)
+        out = []
+        for r in rows:
+            exp = r.get("expires_at")
+            if exp:
+                try:
+                    if _dt.datetime.fromisoformat(exp) < now:
+                        continue  # expired
+                except Exception:
+                    pass  # unparseable -> keep, let consumer decide
+            out.append(r)
+        return out[:200]
+
     # ── sky_observations ────────────────────────────────────────
 
     def add_sky_observation(self, *, location_id, observed_at,
