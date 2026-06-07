@@ -530,14 +530,30 @@ class CortexDB:
     }
 
     def upsert_row(self, table, data):
-        """Generic INSERT OR REPLACE for a whitelisted table.
-        `data` is a dict of column→value pairs."""
+        """Partial-aware upsert for a whitelisted table.
+
+        `data` is a dict of column→value pairs.
+
+        Semantics (2026-06-06, looper iter #2 followup fix):
+        - No PK on auto-PK table → INSERT a new row.
+        - PK present + row exists → UPDATE ONLY the supplied columns,
+          preserve every other column (content, timestamps, audit
+          fields).
+        - PK present + no row → INSERT with the supplied columns.
+
+        Previous implementation used `INSERT OR REPLACE` for every PK-
+        present case. SQLite's REPLACE semantics DELETE the matching
+        row and INSERT a new one — columns not in the partial dict
+        default to NULL. That silently nuked note content when callers
+        like `note_update(note_id=N, tags="...")` passed partial dicts
+        for triage. The looper flagged it; this is the fix.
+        """
         if table not in self.WRITABLE_TABLES:
             raise ValueError(f"Table '{table}' is not writable")
         info = self.WRITABLE_TABLES[table]
         pk = info["pk"]
 
-        # For auto-PK tables without a PK value, use INSERT (not REPLACE)
+        # No PK supplied on an auto-PK table → straight INSERT.
         if info["auto_pk"] and pk not in data:
             cols = [k for k in data.keys() if k.replace("_", "").isalnum()]
             vals = [data[k] for k in cols]
@@ -550,13 +566,39 @@ class CortexDB:
             self._conn.commit()
             return cur.lastrowid
 
-        # For keyed tables or updates with explicit PK → INSERT OR REPLACE
+        # PK supplied — check if the row exists. UPDATE if yes (partial-
+        # safe), INSERT if no.
+        pk_value = data[pk]
+        existing = self._conn.execute(
+            f"SELECT 1 FROM {table} WHERE {pk} = ? LIMIT 1",
+            (pk_value,),
+        ).fetchone()
+
+        if existing:
+            update_cols = [
+                k for k in data.keys()
+                if k != pk and k.replace("_", "").isalnum()
+            ]
+            if not update_cols:
+                # Caller passed only the PK — no-op, return the PK.
+                return pk_value
+            set_clause = ", ".join(f"{c} = ?" for c in update_cols)
+            update_vals = [data[k] for k in update_cols]
+            update_vals.append(pk_value)
+            self._conn.execute(
+                f"UPDATE {table} SET {set_clause} WHERE {pk} = ?",
+                update_vals,
+            )
+            self._conn.commit()
+            return pk_value
+
+        # Row doesn't exist — INSERT with whatever the caller supplied.
         cols = [k for k in data.keys() if k.replace("_", "").isalnum()]
         vals = [data[k] for k in cols]
         placeholders = ",".join("?" * len(cols))
         col_str = ",".join(cols)
         cur = self._conn.execute(
-            f"INSERT OR REPLACE INTO {table} ({col_str}) VALUES ({placeholders})",
+            f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})",
             vals,
         )
         self._conn.commit()
