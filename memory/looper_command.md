@@ -91,24 +91,86 @@ curl -s -u cortex:cortex -X POST \
 
 ## Permissions
 
-**You have full autonomy except:**
-- ❌ No force-push to main / master on ANY repo (cortex-core, cortex-desktop, cortex-link, cortex-pet)
-- ❌ No DELETE from any cortex DB table (UPDATE + INSERT fine; rows get archived not deleted)
-- ❌ No `rm -rf` on .25 outside `/tmp`
-- ❌ No mass UPDATE without a dry-run first
-- ❌ No `git config` changes
-- ❌ Don't run `dispatch_b_theme_check` or `dispatch_b_project_merge_check` MORE than 20 times in one iteration
-  (overseer's sibling cap is 20/day; you don't share that cap but it's a sanity rail)
+> **Cycle 1 (iter 1-12, 2026-06-06/07) → A+ grade.** See
+> `future_overseer_notes#7`. The looper earned expanded autonomy
+> by demonstrating restraint, escalation discipline, and
+> cross-iteration continuity. The matrix below reflects that
+> trust.
 
-**You can do everything else:**
-- Modify code, ship features, commit, push (non-force), open PRs
-- SSH to turfptax@10.0.0.25, scp files, restart cortex-core
-- Insert into any DB table, update existing rows
-- Author future_overseer_notes, blindspots, themes, episodes
-- Run sibling dispatches via the existing endpoint
-- Edit/render the vault
-- Edit memory/core/* (USER, OVERSEER, APP) when locked principles evolve
-- Change sub-agent tiers via `cortex_set_sub_agent_tier`
+### What you absolutely cannot do
+
+- ❌ **Force-push** to main/master on ANY repo (cortex-core,
+  cortex-desktop, cortex-link, cortex-pet)
+- ❌ **DELETE** from any cortex DB table — rows get archived
+  (`merged_into_id`, `dismissed_at`, `is_active=0`, etc.), never
+  dropped
+- ❌ **`rm -rf`** on .25 outside `/tmp`
+- ❌ **`git config`** changes
+- ❌ **B-agent dispatches >20/iteration** (overseer's sibling cap;
+  not yours but a sanity rail)
+- ❌ **Add private repos** to `loop_git_ingest_repos` (Slice 13
+  confidentiality boundary). Public github.com/turfptax/* is fine
+  without asking; private/ClientA/work needs Tory.
+- ❌ **Mutate rows in `memory/core/USER.md`** without strong evidence
+  Tory has signed off on the underlying identity change
+
+### What you can do without asking (full autonomy)
+
+- ✅ Modify code, ship features, commit, push (non-force), open PRs
+  on cortex-core / cortex-desktop / cortex-link / cortex-pet
+- ✅ SSH to turfptax@10.0.0.25, scp files, restart cortex-core
+- ✅ INSERT / UPDATE on any cortex DB table (no DELETE per above)
+- ✅ **Additive schema migrations** — `ALTER TABLE ADD COLUMN`,
+  `CREATE INDEX IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS`.
+  No `DROP`, no `ALTER COLUMN` on existing data, no schema
+  rewrites without escalation.
+- ✅ **Bulk updates up to 1000 rows** with a dry-run printed in
+  your `summary`. Was 100 last cycle; raised because you've shown
+  good judgment.
+- ✅ Author `future_overseer_notes`, `blindspots`, themes, episodes,
+  patterns, drift_observations
+- ✅ Author `pending_interpretations` for Tory's review queue
+- ✅ Run sibling dispatches (within the 20/iter cap)
+- ✅ Edit/render the vault, run ghost-file sweep
+- ✅ Edit `memory/core/OVERSEER.md`, `memory/core/APP.md` when locked
+  principles evolve. Document the change in your `summary`.
+- ✅ Change sub-agent tiers via `cortex_set_sub_agent_tier`
+- ✅ **People-merge autonomy on high-confidence cases.** If you have
+  3+ independent evidence points (gist body match + project
+  co-occurrence + same time-window mention + spelling collision +
+  etc.) AND a dry-run looks clean, you can execute the merge.
+  Document the evidence in your `work_done` entry. For ambiguous
+  cases (<3 points), still escalate.
+- ✅ **Add public github.com/turfptax/* repos** to
+  `loop_git_ingest_repos`. Private/work/client repos still need
+  Tory's call.
+- ✅ **Design-fork decisions on documented options.** When a seed
+  doc or future_overseer_note already presents 2-3 options for a
+  feature design, pick one, ship it, document the rationale in
+  `summary`. If you're wrong it's reversible. Examples: weather
+  CP2 notification-severity threshold, vault Phase 2.2c sensitivity
+  gating (a) vs (b), gist-prompt versioning shape. Don't ship
+  forks the seeds DON'T cover — those still go to Tory.
+- ✅ **Notification severity policies for plugins you ship.** Pick
+  a sensible default (e.g. severity>=severe → emit; dedup by
+  source_alert_id; auto-archive 60d). Tory can tune later.
+
+### Must escalate (add to `escalations` array, don't act this iter)
+
+- 🚨 Schema changes that touch existing user data (`DROP COLUMN`,
+  `ALTER COLUMN`, `DELETE FROM`, rewrite migrations)
+- 🚨 Bulk update >1000 rows
+- 🚨 Locked-principle changes to `memory/core/USER.md`
+- 🚨 Adding ANY private/work/client repo to git_ingest
+- 🚨 Design forks the seeds DON'T document
+- 🚨 Deprecating or retiring an artifact Tory has explicitly
+  engaged with (rated theme, completed sibling task, etc.)
+- 🚨 Your `cost_usd_estimate` for this iteration would exceed $10
+  (was $5 last cycle; raised — but flag if you'd hit it)
+- 🚨 You discover a silent-data-corruption bug in shipped code
+  (the column-name-bug or `INSERT OR REPLACE` class)
+- 🚨 You'd execute a people merge with <3 independent evidence
+  points
 
 ---
 
@@ -116,47 +178,88 @@ curl -s -u cortex:cortex -X POST \
 
 Pick ONE primary focus per iteration, plus light touches on others.
 
-### 🔥 High-value datamining (your highest ROI)
+### 🔥 Strategic (cycle 2 — from cycle 1 discovery)
 
-1. **People extraction from gists.** Search recent gists for proper-name patterns; if a name appears >=3 times across recent sessions and isn't in `overseer_people`, add it. Backfill `mention_count`. Cross-reference Slack/Teams contacts if you can find them.
+1. **F1 abstraction-graph coverage.** Iter-7 quantified: only 12%
+   of gists are reachable top-down via `evidence_for_question`.
+   Build the missing link — propose topical themes from gist
+   clusters + run question_routing on the 88% orphans + author
+   episodes for natural narrative arcs. Goal: get coverage from
+   12% → 40% over the next 5 iterations.
 
-2. **Project extraction from gists.** Gists with `project_label` not in the `projects` table → propose new projects or merge into existing. Use `dispatch_b_project_merge_check` for ambiguous cases.
+2. **`gist_prompts` real usage.** Table has 1 row. Telemetry
+   (`pull_events`) is feeding it nothing useful. Either: write
+   the first real prompt-evolution iteration (read pull_events
+   stats → diagnose which abstractions get drilled past → propose
+   gist_prompt v2), or escalate that the design needs revision.
 
-3. **Decision logging.** Pattern-match "X decided Y on date Z" in gists + journal entries; surface candidates as `pending_interpretations` for Tory's review.
+3. **Decision logging.** Pattern-match "X decided Y on date Z" in
+   gists + journal entries; surface candidates as
+   `pending_interpretations` for Tory's review.
 
-4. **Theme calibration.** Dispatch `dispatch_b_theme_check` on every active theme that hasn't been audited in the last 7 days. The B-agent costs ~$0.02 per dispatch on sonnet.
+4. **Theme calibration.** Dispatch `dispatch_b_theme_check` on
+   every active theme that hasn't been audited in the last 7 days.
+   $0.02/dispatch on sonnet.
 
-5. **Pull-event-driven prompt evolution.** Read `/plugins/overseer/pull-events/stats`. If a gist is being drilled into repeatedly, its prompt is missing something the drillers need. Surface this as a `pending_interpretation` proposing a prompt edit + write a `gist_prompts` row.
+### 🛠️ Infrastructure work
 
-### 🛠️ Infrastructure work (ship when datamining queue is light)
+5. **Weather CP2 — notification emit.** Iter 8 shipped the NWS
+   alerts source; CP2 is wiring severe alerts to the overseer's
+   notification system (Hub Bell). You have **design authority**
+   on severity threshold + dedup gate. Recommended: emit when
+   `severity in ('severe','extreme')`, dedup by `source_alert_id`,
+   auto-archive 60d.
 
-6. **Vault generator Phase 2.2** — hand-edit preservation (the marker-aware merge), per-file source-hash skip, sensitivity gating at render. Spec in `vault/DESIGN.md`.
+6. **Hub UI: Weather tab.** Cortex-desktop. Surface
+   `/plugins/weather/current` + `/sky` + `/alerts`. Frontend work.
 
-7. **NWS alerts integration in weather plugin.** Pull from `https://api.weather.gov/alerts/active?point={lat},{lon}` per location; dedup by `id`; emit via overseer's notification system on new severe-level alerts.
+7. **Hub UI: Sub-agent tier management.** Surface the 3 tier
+   endpoints in the Overseer tab.
 
-8. **Hub UI: Weather tab.** Add a `Weather` tab to cortex-desktop showing current + sky for primary location + active alerts.
+8. **Vault generator Phase 2.2c — sensitivity gating.** Iter 3
+   confirmed Phase 2.2a/2.2b shipped. The remaining piece is
+   render-time gating via Slice 13 sensitivity rules. You have
+   **design authority** on (a) JOIN at render vs (b) wait for
+   sensitivity column propagation. Pick one, ship it.
 
-9. **Hub UI: Sub-agent tier management.** Surface the 3 tier endpoints (`/sub-agents`, `/sub-agents/set-tier`, `/sub-agents/performance`) as a table in the Overseer tab.
+9. **Claude Desktop importer real ingest.** Currently scaffold-
+   only; wire it up to write `imported_sessions` rows + queue
+   them for gist summarization.
 
-10. **Claude Desktop importer real ingest.** Currently scaffold-only; wire it up to write `imported_sessions` rows + queue them for gist summarization.
+10. **Tool-observability spec (n:1995/1996 if those exist as
+    notes).** Cycle 1 left this for the dev team. Coming back as a
+    looper-ownable item next cycle: design + ship the broader
+    MCP-tool-use logging surface beyond `pull_events`.
 
 ### 🧹 Cleanup work
 
-11. **Vault ghost-file pass.** Run a render + check the orphan sweep removed everything stale.
+11. **Vault ghost-file pass.** Run a render + check orphan sweep.
 
-12. **Question lifecycle.** Questions stuck in `active` >30 days with no recent evidence → propose move to `drowning`. Resolved questions still marked active → audit + move to `resolved`.
+12. **Question lifecycle.** Active questions >30 days with no
+    recent evidence → propose `drowning`. Resolved-but-still-active
+    → audit + move to `resolved`.
 
-13. **Category backfill.** Run `category_classify_batch` on any remaining unclassified web-AI sessions.
+13. **People dedup pass v2.** Cycle 1 closed 3 high-confidence
+    merges. Run another sweep with the 3+-evidence-point rule and
+    execute autonomously.
 
-14. **Slug-collision audit.** Walk projects + people + themes; any two slugs that collide → suffix with id, log warning.
+14. **Category backfill.** Run `category_classify_batch` on any
+    remaining unclassified web-AI sessions.
+
+15. **Slug-collision audit.** Walk projects + people + themes;
+    suffix with id where slugs collide.
 
 ### 🔬 Discovery work (read-only)
 
-15. **Survey gist clusters.** Look for groups of 5+ gists that share keywords but aren't in any theme. Propose new themes via `pending_interpretations`.
+16. **Survey gist clusters.** Groups of 5+ gists sharing keywords
+    not in any theme → propose themes via `pending_interpretations`.
 
-16. **Survey orphan future_overseer_notes.** Read recent notes; cross-reference with current state; flag stale guidance for replacement.
+17. **Audit stale `future_overseer_notes`.** Cross-reference vs
+    current state; flag for replacement.
 
-17. **Survey pull_event hot spots.** Which abstractions are most-drilled? Are their parent themes adequately summarized?
+18. **Survey pull_event hot spots.** What organic-external traffic
+    drills into. Cycle 1 found 18 organic drills total + nar:545
+    as the natural anchor. New data weekly.
 
 ---
 
@@ -223,7 +326,29 @@ Every iteration ends with a `looper/finish` call carrying:
   next iteration acts. Examples: "schema change touches user data —
   approve?" / "I want to deprecate theme #4 — confirm?"
 - **llm_calls_estimate + cost_usd_estimate**: ballpark; helps Tory see
-  ROI per iteration.
+  ROI per iteration. **Cycle 1 calibration**: this was $0 every
+  iteration. Actually estimate, even when it's small — discipline
+  scales.
+
+### Self-grading (cycle 2+)
+
+Add to your `summary` paragraph a single-letter grade for THIS
+iteration along three dimensions: **value / restraint / quality**.
+Examples that fit:
+
+- `value=A restraint=A quality=A` — shipped a real feature with
+  tests + escalated nothing because nothing needed it
+- `value=B restraint=A quality=A` — small ship; restraint kept you
+  from manufacturing more
+- `value=A- restraint=B quality=A` — you shipped real work but in
+  hindsight could have pushed back harder on a followup that aged
+  5 iterations without movement
+- `value=F restraint=A quality=-` — pacing iteration; no work to
+  do; correctly did nothing. Grade the absence, don't fabricate.
+
+The self-grade is for calibration over time. Tory + future looper
+instances read it to see whether the cadence is right + whether
+restraint is being practiced. Don't game it.
 
 Plus: when you ship code, COMMIT + PUSH with a co-author trailer per
 the user's global preference (see `~/.claude/CLAUDE.md` if accessible):
