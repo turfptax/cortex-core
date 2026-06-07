@@ -161,12 +161,80 @@ def rule_import_backlog(*, db, core_memory, config) -> list[dict]:
     }]
 
 
+def rule_llm_health(*, db, core_memory, config) -> list[dict]:
+    """Overseer LLM backends failing → surface it in the Bell instead of
+    dying silently in loop logs. Catches the silent-outage class: a model
+    deprecated off OpenRouter (404), the account out of credit (402), or
+    every backend timing out. Self-resolving — when calls succeed again
+    this returns [] and evaluate_rules auto-archives the alert.
+
+    Signal: among LLM calls in the last 30 min, if there are enough
+    attempts (>= min_attempts) and NONE succeeded, the LLM is down.
+    (Looper-authored 2026-06-07 after a ~day-long silent flash-model +
+    credit outage went unnoticed; see future_overseer_notes#8.)
+    """
+    try:
+        row = db._conn.execute(
+            "SELECT COUNT(*) AS n, "
+            "  SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) AS ok_n "
+            "FROM llm_calls "
+            "WHERE created_at > datetime('now', '-30 minutes')"
+        ).fetchone()
+    except Exception:
+        return []
+    n = (row["n"] if row else 0) or 0
+    ok_n = (row["ok_n"] if row else 0) or 0
+    min_attempts = int(config.get("notify_llm_health_min_attempts", 4))
+    if n < min_attempts or ok_n > 0:
+        return []  # insufficient signal, or at least one success → healthy
+    # Pick the most ACTIONABLE error across the window (credit > model >
+    # timeout) — not just the latest, which is often a fallback timeout
+    # masking the real OpenRouter cause.
+    errs = [r[0] for r in db._conn.execute(
+        "SELECT DISTINCT error FROM llm_calls "
+        "WHERE created_at > datetime('now', '-30 minutes') "
+        "  AND ok = 0 AND error IS NOT NULL AND error <> ''"
+    ).fetchall()]
+    joined = " ".join(errs).lower()
+    last_err = next((e for e in errs if "402" in e or "credit" in e.lower()),
+                    None)
+    if last_err:
+        diag = ("OpenRouter account is out of / low on credit (HTTP 402). "
+                "Add credit at https://openrouter.ai/settings/credits.")
+    elif "no endpoints" in joined or "404" in joined:
+        last_err = next((e for e in errs if "404" in e
+                         or "no endpoints" in e.lower()), errs[0] if errs else "")
+        diag = ("A configured model was removed from OpenRouter (404). "
+                "Update the model id in plugin.toml / llm_router.py.")
+    else:
+        last_err = errs[0] if errs else ""
+        diag = ("All LLM backends are failing/timing out (OpenRouter + "
+                "lmstudio + on-device). Check credit, network, and the "
+                "on-device llama-server.")
+    last_err = (last_err or "")[:200]
+    return [{
+        "rule_name": "llm_health",
+        "rule_key": "default",
+        "severity": "important",
+        "title": "Overseer LLM is DOWN — {}/{} recent calls failed".format(
+            n - ok_n, n),
+        "body": ("{diag}\n\nLatest error: {err}\n\nUntil resolved, routine "
+                 "overseer work (gist summarization, classification, "
+                 "journal, temporal narratives) is degraded.").format(
+                     diag=diag, err=last_err),
+        "related_table": "",
+        "related_id": None,
+        "action_url": "https://openrouter.ai/settings/credits",
+    }]
+
+
 # ── Registry ────────────────────────────────────────────────────
 
 RULES = [
     rule_stale_active_project,
     rule_automation_anomaly,
     rule_import_backlog,
+    rule_llm_health,
 ]
 
 
