@@ -409,6 +409,11 @@ class OverseerPlugin(Plugin):
                   self._http_looper_finish),
             Route("GET",  "/looper/recent",
                   self._http_looper_recent),
+            # ── F1 coverage snapshot (2026-06-08, deterministic
+            #    loop): single-call read of the abstraction-graph
+            #    coverage metric the looper pushed in cycle 2.
+            Route("GET",  "/f1-coverage",
+                  self._http_f1_coverage),
         ]
 
     # ── Lifecycle ───────────────────────────────────────────────
@@ -2876,6 +2881,62 @@ class OverseerPlugin(Plugin):
                     "count": len(entries)}
         except Exception as e:
             log.exception("looper_recent failed")
+            return {"ok": False, "error": str(e)}
+
+    def _http_f1_coverage(self, payload):
+        """GET /plugins/overseer/f1-coverage
+
+        Returns the F1 abstraction-graph coverage metric the looper
+        pushed in cycle 2 (11.8% → 42.3% deterministically). Single-
+        call read used by the deterministic loop + cycle 3 looper at
+        boot to track the trend.
+
+        Returns:
+          total                — total gists in summaries_gist
+          via_question         — distinct gists with evidence_for_question
+          via_theme            — distinct gists in theme_gists
+          via_either           — UNION (the F1 coverage metric)
+          coverage_pct         — via_either / total as percentage
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        try:
+            conn = self.overseer_db._conn
+            total = conn.execute(
+                "SELECT COUNT(*) FROM summaries_gist"
+            ).fetchone()[0]
+            via_q = conn.execute(
+                "SELECT COUNT(DISTINCT evidence_id) "
+                "FROM evidence_for_question "
+                "WHERE evidence_table = 'summaries_gist'"
+            ).fetchone()[0]
+            # theme_gists may not exist on older installs (added by
+            # the looper in cycle 2 iter 13); tolerate missing.
+            try:
+                via_t = conn.execute(
+                    "SELECT COUNT(DISTINCT gist_id) FROM theme_gists"
+                ).fetchone()[0]
+                via_either = conn.execute(
+                    "SELECT COUNT(DISTINCT id) FROM summaries_gist "
+                    "WHERE id IN ("
+                    "  SELECT evidence_id FROM evidence_for_question "
+                    "  WHERE evidence_table='summaries_gist'"
+                    ") OR id IN (SELECT gist_id FROM theme_gists)"
+                ).fetchone()[0]
+            except Exception:
+                via_t = 0
+                via_either = via_q
+            pct = (100.0 * via_either / total) if total else 0.0
+            return {
+                "ok": True,
+                "total": int(total),
+                "via_question": int(via_q),
+                "via_theme": int(via_t),
+                "via_either": int(via_either),
+                "coverage_pct": round(pct, 2),
+            }
+        except Exception as e:
+            log.exception("f1_coverage failed")
             return {"ok": False, "error": str(e)}
 
     def _http_vault_render(self, payload):
