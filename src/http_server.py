@@ -22,6 +22,7 @@ Endpoints:
 
 import base64
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -35,6 +36,8 @@ from config import (
     HTTP_PORT, HTTP_USERNAME, HTTP_PASSWORD, RECORDING_DIR, NOTES_DIR,
     LOG_DIR, UPLOADS_DIR, CORTEX_DB_PATH,
 )
+
+logger = logging.getLogger("cortex.http")
 
 # Directory mapping for file serving
 _FILE_DIRS = {
@@ -537,7 +540,10 @@ a {{ color: #0af; }}
                 f.write(data)
                 remaining -= len(data)
 
-        # Register file metadata in database
+        # Register file metadata in database. The file is already on
+        # disk, so a registration failure degrades to "file saved but
+        # unindexed" rather than failing the upload -- but it must be
+        # visible: log it and tell the caller via registered=false.
         file_id = None
         try:
             db = self.server.cortex_protocol._db
@@ -552,7 +558,8 @@ a {{ color: #0af; }}
                 source="http",
             )
         except Exception:
-            pass
+            logger.exception("file upload saved to %s but DB "
+                             "registration failed", dest)
 
         self._json({
             "ok": True,
@@ -560,6 +567,7 @@ a {{ color: #0af; }}
             "size": length,
             "path": dest,
             "file_id": file_id,
+            "registered": file_id is not None,
         })
 
     def _handle_delete(self, path):

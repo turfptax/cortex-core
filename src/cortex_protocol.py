@@ -7,6 +7,7 @@ Handles CHUNK:n/N:data reassembly for messages exceeding BLE MTU.
 """
 
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -15,6 +16,8 @@ import time
 from cortex_db import CortexDB
 from config import NOTES_DIR
 from note_utils import save_note
+
+logger = logging.getLogger("cortex.protocol")
 
 
 class ChunkAssembler:
@@ -192,6 +195,7 @@ class CortexProtocol:
         try:
             return handler(payload, context)
         except Exception as e:
+            logger.exception("command %s failed", cmd)
             return f"ERR:{cmd}:{e}"
 
     # --- Command handlers ---
@@ -429,9 +433,12 @@ class CortexProtocol:
         if filters:
             clauses = []
             for col, val in filters.items():
-                # Only allow alphanumeric column names
-                if not col.isalnum():
-                    continue
+                # Allow alphanumeric + underscore column names. The old
+                # col.isalnum() check rejected underscores, so filters on
+                # columns like created_at or note_type were silently
+                # dropped and the query returned unfiltered rows.
+                if not col.replace("_", "").isalnum():
+                    return f"ERR:query:invalid filter column {col!r}"
                 clauses.append(f"{col} = ?")
                 params.append(val)
             if clauses:

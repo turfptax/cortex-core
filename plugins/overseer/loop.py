@@ -1339,6 +1339,13 @@ class OverseerLoop:
         if not unprocessed:
             # Still update the mark to prevent rescan of the same window
             # next tick (in case all candidates were already processed).
+            seen = [n["created_at"] for n in candidates
+                    if n.get("created_at")]
+            if seen:
+                new_mark = max([mark] + seen)
+                if new_mark != mark:
+                    self._db.set_overseer_state(
+                        self.NOTES_MARK_KEY, new_mark)
             return
 
         batch_size = int(self._cfg.get("loop_tag_batch_size", 10))
