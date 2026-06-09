@@ -129,6 +129,155 @@ def _parse_people_json(row):
     return row
 
 
+def _render_intro_markdown(brief: dict) -> str:
+    """Render the /intro brief as a single markdown document. This is
+    what an external AI reading at the top of a conversation actually
+    wants — not nested JSON, but a 30-second human-friendly briefing.
+
+    Format intentionally mirrors what Tory described in the
+    2026-06-08 refactor: WHO IS TORY → WHAT HE'S WORKING ON → WHAT
+    HE'S THINKING ABOUT → RECENT DECISIONS → THEMES → DRIFT →
+    BLINDSPOTS → INSTITUTIONAL MEMORY → OPS (last).
+    """
+    parts: list[str] = []
+    parts.append(f"# Tory — Context Brief")
+    parts.append("")
+    parts.append(f"*Generated {brief.get('generated_at','')}*")
+    parts.append("")
+
+    who = brief.get("who_is_tory") or {}
+    if who:
+        parts.append("## Who Tory is")
+        parts.append("")
+        for k, label in (
+            ("full_name", "Name"),
+            ("title", "Title"),
+            ("employer", "Employer"),
+            ("location", "Location"),
+            ("neurotype", "Neurotype"),
+        ):
+            if who.get(k):
+                parts.append(f"- **{label}:** {who[k]}")
+        if who.get("working_style"):
+            parts.append("")
+            parts.append("### How to work with him")
+            parts.append("")
+            for line in who["working_style"]:
+                parts.append(f"- {line}")
+        if who.get("sensitive_topics"):
+            parts.append("")
+            parts.append("### Sensitive topics")
+            parts.append("")
+            for line in who["sensitive_topics"]:
+                parts.append(f"- {line}")
+        parts.append("")
+
+    working_on = brief.get("working_on") or []
+    if working_on:
+        parts.append("## What he's working on")
+        parts.append("")
+        parts.append("| Project | Status | Sessions | Minutes | Last touched |")
+        parts.append("|---|---|---:|---:|---|")
+        for p in working_on:
+            parts.append(
+                f"| **{p['project']}** | {p['status']} | "
+                f"{p['session_count']} | {p['minutes_total']} | "
+                f"{p['last_active']} |"
+            )
+        parts.append("")
+        # First project narrative if non-empty (the current focus)
+        first = working_on[0]
+        if first.get("narrative_excerpt"):
+            parts.append(f"*Current focus context:* "
+                          f"{first['narrative_excerpt']}")
+            parts.append("")
+
+    thinking = brief.get("thinking_about") or []
+    if thinking:
+        parts.append("## What he's thinking about (open questions)")
+        parts.append("")
+        for q in thinking:
+            evidence = q.get("evidence_count", 0)
+            parts.append(
+                f"- *[{q['confidence']}]* **{q['question']}** "
+                f"({evidence} evidence pieces, drill `{q['token']}`)"
+            )
+        parts.append("")
+
+    decisions = brief.get("recent_decisions") or []
+    if decisions:
+        parts.append("## Recent decisions")
+        parts.append("")
+        for d in decisions[:10]:
+            project = (f" *[{d['project']}]*" if d.get("project")
+                        else "")
+            drill = (f" — drill `{d['drill_token']}`"
+                      if d.get("drill_token") else "")
+            parts.append(
+                f"- **{d['decided_on']}**{project} {d['decision']}"
+                f"{drill}"
+            )
+        parts.append("")
+
+    themes = brief.get("recent_themes") or []
+    if themes:
+        parts.append("## Recent themes")
+        parts.append("")
+        for t in themes:
+            parts.append(
+                f"- *[{t['confidence']}]* **{t['title']}** — "
+                f"{t['claim']}"
+            )
+        parts.append("")
+
+    drift = brief.get("key_drift") or []
+    if drift:
+        parts.append("## Key drift")
+        parts.append("")
+        for d in drift:
+            direction = (f" ({d['direction']})"
+                          if d.get("direction") else "")
+            parts.append(
+                f"- *[{d['confidence']}]*{direction} "
+                f"{d['observation']}  *(observed "
+                f"{d['observed_at']})*"
+            )
+        parts.append("")
+
+    bs = brief.get("blindspots") or []
+    if bs:
+        parts.append("## Calibration notes for the AI reading this")
+        parts.append("")
+        for b in bs:
+            parts.append(f"- {b['calibration_note']}")
+        parts.append("")
+
+    notes = brief.get("recent_future_notes") or []
+    if notes:
+        parts.append("## Institutional memory (from prior instances)")
+        parts.append("")
+        for n in notes:
+            parts.append(
+                f"- *{n['written_at']}, {n['author']}:* "
+                f"{n['excerpt']}"
+            )
+        parts.append("")
+
+    ops = brief.get("ops") or {}
+    if ops:
+        parts.append("---")
+        parts.append("## Operational state (overseer's plumbing)")
+        parts.append("")
+        parts.append("*Read only if you need to reason about the "
+                      "Cortex system itself — most readers can skip.*")
+        parts.append("")
+        for k, v in ops.items():
+            parts.append(f"- `{k}`: {v}")
+        parts.append("")
+
+    return "\n".join(parts)
+
+
 class OverseerPlugin(Plugin):
     """Memory upkeep agent — slice 3b: real LLM + memory wiring + seed."""
 
@@ -414,6 +563,12 @@ class OverseerPlugin(Plugin):
             #    coverage metric the looper pushed in cycle 2.
             Route("GET",  "/f1-coverage",
                   self._http_f1_coverage),
+            # ── Context brief (2026-06-08): the new "first 30
+            #    seconds tells you Tory" surface for external AIs.
+            #    Demotes overseer's operational chatter; leads with
+            #    who, what's-being-worked-on, what's-thought-about.
+            Route("GET",  "/intro",
+                  self._http_intro),
         ]
 
     # ── Lifecycle ───────────────────────────────────────────────
@@ -2881,6 +3036,360 @@ class OverseerPlugin(Plugin):
                     "count": len(entries)}
         except Exception as e:
             log.exception("looper_recent failed")
+            return {"ok": False, "error": str(e)}
+
+    # ── Context brief (2026-06-08) ──────────────────────────────
+    #
+    # Tory's framing 2026-06-08: working_memory currently dumps 29
+    # keys, ~half operational (queue depths, sibling stats, gist
+    # source distribution, etc.). The first 30s of a new AI session
+    # should explain WHO TORY IS + WHAT HE'S WORKING ON + WHAT HE
+    # CARES ABOUT — not how many times the overseer ticked last week.
+    #
+    # /intro is the new surface for that. Leads with Tory-state from
+    # USER.md + structured tables; demotes overseer's own operational
+    # chatter to a single `ops` sub-key. working_memory stays as
+    # overseer's internal state surface (other consumers depend on
+    # the existing shape).
+
+    def _read_user_md_brief(self):
+        """Pull the human-facing brief from memory/core/USER.md.
+
+        Returns {role, location, neurotype, working_style,
+                 sensitive_topics} or {} if the file isn't readable.
+        USER.md is gitignored — exists locally on the Pi but not in
+        the public repo. If the file moves or its sections change,
+        the brief degrades gracefully.
+        """
+        from pathlib import Path
+        candidates = [
+            Path("/home/turfptax/cortex-core/memory/core/USER.md"),
+            Path(__file__).resolve().parent.parent.parent
+                / "memory" / "core" / "USER.md",
+        ]
+        text = None
+        for p in candidates:
+            if p.exists():
+                try:
+                    text = p.read_text(encoding="utf-8")
+                    break
+                except Exception:
+                    continue
+        if not text:
+            return {}
+        # Cheap section-grep: pull out short headlines we know are
+        # there. Falls back gracefully if a section is missing.
+        import re
+
+        def first_line_after(header_pattern):
+            m = re.search(
+                rf"^#+\s*{header_pattern}.*?\n(.+?)(?=\n#+\s)",
+                text, re.MULTILINE | re.DOTALL | re.IGNORECASE,
+            )
+            return m.group(1).strip() if m else ""
+
+        def grab_field(label):
+            m = re.search(
+                rf"\*\*{re.escape(label)}\*\*:?\s*([^\n]+)",
+                text, re.IGNORECASE,
+            )
+            return m.group(1).strip() if m else ""
+
+        brief = {}
+        for label, key in (
+            ("Full name", "full_name"),
+            ("Location", "location"),
+            ("Neurotype", "neurotype"),
+            ("Title", "title"),
+            ("Employer", "employer"),
+        ):
+            v = grab_field(label)
+            if v:
+                brief[key] = v
+        # Working-style + calibration block: pull bullets under
+        # "How to work with Tory" or "Working style".
+        def _clean_bullet(s):
+            # Strip the leading list-marker once (`- ` or `* `).
+            # Don't keep stripping — that would eat markdown **bold**
+            # markers that legitimately follow the list bullet.
+            s = s.strip()
+            for marker in ("- ", "* "):
+                if s.startswith(marker):
+                    s = s[len(marker):].lstrip()
+                    break
+            return s
+
+        for header in ("How to work with Tory",
+                       "Working style", "Calibration notes for AIs"):
+            chunk = first_line_after(re.escape(header))
+            if chunk:
+                # Trim to first ~10 lines so we don't dump prose.
+                lines = [_clean_bullet(l) for l in chunk.splitlines()
+                          if l.strip().startswith("-")][:10]
+                # Drop empty + truncate each to a reasonable display
+                # length so the JSON stays scannable.
+                lines = [l[:280] for l in lines if l]
+                if lines:
+                    brief["working_style"] = lines
+                    break
+        # Sensitive topics: same pattern, look for the explicit
+        # bullets under "Sensitive topics".
+        chunk = first_line_after(re.escape("Sensitive topics"))
+        if chunk:
+            lines = [_clean_bullet(l) for l in chunk.splitlines()
+                      if l.strip().startswith("-")][:8]
+            lines = [l[:280] for l in lines if l]
+            if lines:
+                brief["sensitive_topics"] = lines
+        return brief
+
+    def _http_intro(self, payload):
+        """GET /plugins/overseer/intro
+
+        Curated context brief for external AIs. Goal per Tory's
+        2026-06-08 framing: the first 30 seconds tells you who Tory
+        is, what he's working on, what he's thinking about, and what
+        matters to him.
+
+        Sections:
+          who_is_tory          — pulled from USER.md if readable
+          working_on           — top 5 projects by last_active_at
+          thinking_about       — top open_questions (high/med, by
+                                 evidence_count desc)
+          recent_decisions     — most-recent corpus_decisions rows
+          recent_themes        — high+med confidence themes
+          key_drift            — recent drift observations
+          blindspots           — active calibration notes for the AI
+                                 reading this
+          recent_future_notes  — institutional memory from prior
+                                 overseer/looper instances
+          ops                  — single demoted sub-key with the
+                                 operational counters
+        """
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        try:
+            db = self.overseer_db
+            conn = db._conn
+            import datetime as _ddt
+            brief = {
+                "generated_at": _ddt.datetime.now().astimezone()
+                                    .isoformat(timespec="seconds"),
+            }
+            # WHO: USER.md brief
+            brief["who_is_tory"] = self._read_user_md_brief()
+
+            # WORKING_ON: top projects by activity
+            try:
+                rows = db.list_project_summaries(
+                    order_by="last_active_at", descending=True,
+                )[:5]
+                brief["working_on"] = [
+                    {
+                        "project": r.get("project") or r.get("tag"),
+                        "status": r.get("status") or "active",
+                        "last_active": (r.get("last_active_at")
+                                          or "")[:10],
+                        "session_count": r.get("session_count") or 0,
+                        "minutes_total": r.get(
+                            "active_minutes_total") or 0,
+                        "narrative_excerpt": (
+                            (r.get("narrative_text") or "")[:280]
+                        ),
+                    }
+                    for r in rows
+                ]
+            except Exception as e:
+                log.warning("intro: projects failed: %s", e)
+                brief["working_on"] = []
+
+            # THINKING_ABOUT: high-confidence open questions
+            try:
+                qrows = conn.execute(
+                    "SELECT id, question, body, confidence, "
+                    "       lifecycle, evidence_count, "
+                    "       last_evidence_at "
+                    "FROM open_questions "
+                    "WHERE is_active = 1 "
+                    "ORDER BY "
+                    "  CASE confidence WHEN 'high' THEN 0 "
+                    "                  WHEN 'med' THEN 1 ELSE 2 END, "
+                    "  evidence_count DESC "
+                    "LIMIT 8"
+                ).fetchall()
+                brief["thinking_about"] = [
+                    {
+                        "question": q["question"],
+                        "confidence": q["confidence"],
+                        "lifecycle": q["lifecycle"],
+                        "evidence_count": q["evidence_count"],
+                        "last_evidence_at": (q["last_evidence_at"]
+                                              or "")[:10],
+                        "token": f"q:{q['id']}",
+                    }
+                    for q in qrows
+                ]
+            except Exception as e:
+                log.warning("intro: questions failed: %s", e)
+                brief["thinking_about"] = []
+
+            # RECENT DECISIONS: the looper's cycle-2 corpus_decisions
+            # mine. Falls back to empty list if the table doesn't
+            # exist (older installs).
+            try:
+                drows = conn.execute(
+                    "SELECT id, project, decision_text, decided_on, "
+                    "       confidence, people, themes, gist_id "
+                    "FROM corpus_decisions "
+                    "WHERE decided_on IS NOT NULL "
+                    "ORDER BY decided_on DESC, id DESC "
+                    "LIMIT 12"
+                ).fetchall()
+                brief["recent_decisions"] = [
+                    {
+                        "decision": d["decision_text"],
+                        "project": d["project"] or "",
+                        "decided_on": (d["decided_on"] or "")[:10],
+                        "confidence": d["confidence"],
+                        "people": d["people"] or "",
+                        "themes": d["themes"] or "",
+                        "drill_token": (f"g:{d['gist_id']}"
+                                          if d["gist_id"] else None),
+                    }
+                    for d in drows
+                ]
+            except Exception as e:
+                log.warning("intro: decisions failed: %s", e)
+                brief["recent_decisions"] = []
+
+            # RECENT THEMES: high + med confidence only
+            try:
+                trows = conn.execute(
+                    "SELECT id, title, body, confidence "
+                    "FROM summaries_theme "
+                    "WHERE confidence IN ('high', 'med') "
+                    "ORDER BY last_reinforced_at DESC LIMIT 8"
+                ).fetchall()
+                brief["recent_themes"] = [
+                    {
+                        "title": t["title"],
+                        "confidence": t["confidence"],
+                        "claim": (t["body"] or "")[:280],
+                        "token": f"t:{t['id']}",
+                    }
+                    for t in trows
+                ]
+            except Exception as e:
+                log.warning("intro: themes failed: %s", e)
+                brief["recent_themes"] = []
+
+            # KEY DRIFT: recent direction changes
+            try:
+                drrows = conn.execute(
+                    "SELECT id, body, direction, confidence, "
+                    "       observed_at FROM drift_observations "
+                    "WHERE confidence IN ('high', 'med') "
+                    "ORDER BY observed_at DESC LIMIT 6"
+                ).fetchall()
+                brief["key_drift"] = [
+                    {
+                        "observation": (d["body"] or "")[:280],
+                        "direction": d["direction"] or "",
+                        "confidence": d["confidence"],
+                        "observed_at": (d["observed_at"]
+                                          or "")[:10],
+                        "token": f"d:{d['id']}",
+                    }
+                    for d in drrows
+                ]
+            except Exception as e:
+                log.warning("intro: drift failed: %s", e)
+                brief["key_drift"] = []
+
+            # BLINDSPOTS: calibration notes the AI reading should know
+            try:
+                brows = conn.execute(
+                    "SELECT id, body, rationale, confidence "
+                    "FROM known_blindspots "
+                    "WHERE is_active = 1 "
+                    "ORDER BY apply_count DESC LIMIT 6"
+                ).fetchall()
+                brief["blindspots"] = [
+                    {
+                        "calibration_note": (b["body"] or "")[:300],
+                        "confidence": b["confidence"],
+                        "token": f"b:{b['id']}",
+                    }
+                    for b in brows
+                ]
+            except Exception as e:
+                log.warning("intro: blindspots failed: %s", e)
+                brief["blindspots"] = []
+
+            # INSTITUTIONAL MEMORY: most recent future_overseer_notes
+            try:
+                nrows = conn.execute(
+                    "SELECT id, instance_id, written_at, body "
+                    "FROM future_overseer_notes "
+                    "ORDER BY written_at DESC LIMIT 3"
+                ).fetchall()
+                brief["recent_future_notes"] = [
+                    {
+                        "author": n["instance_id"],
+                        "written_at": (n["written_at"] or "")[:10],
+                        "excerpt": (n["body"] or "")[:280],
+                        "token": f"n:{n['id']}",
+                    }
+                    for n in nrows
+                ]
+            except Exception as e:
+                log.warning("intro: future_notes failed: %s", e)
+                brief["recent_future_notes"] = []
+
+            # OPS: single demoted sub-key with the operational
+            # chatter. External AIs ignore this; the overseer and
+            # looper still get it for their own use.
+            try:
+                ops = {
+                    "journal_entry_count": conn.execute(
+                        "SELECT COUNT(*) FROM overseer_journal"
+                    ).fetchone()[0],
+                    "future_overseer_notes_count": conn.execute(
+                        "SELECT COUNT(*) FROM future_overseer_notes"
+                    ).fetchone()[0],
+                    "active_open_questions": conn.execute(
+                        "SELECT COUNT(*) FROM open_questions "
+                        "WHERE is_active = 1"
+                    ).fetchone()[0],
+                    "gist_count": conn.execute(
+                        "SELECT COUNT(*) FROM summaries_gist"
+                    ).fetchone()[0],
+                }
+                try:
+                    ops["theme_gists_links"] = conn.execute(
+                        "SELECT COUNT(*) FROM theme_gists"
+                    ).fetchone()[0]
+                except Exception:
+                    ops["theme_gists_links"] = 0
+                try:
+                    ops["corpus_decisions_count"] = conn.execute(
+                        "SELECT COUNT(*) FROM corpus_decisions"
+                    ).fetchone()[0]
+                except Exception:
+                    ops["corpus_decisions_count"] = 0
+                brief["ops"] = ops
+            except Exception as e:
+                log.warning("intro: ops failed: %s", e)
+                brief["ops"] = {}
+
+            fmt = str((payload or {}).get("format") or "").strip().lower()
+            if fmt == "markdown":
+                return {"ok": True,
+                        "markdown": _render_intro_markdown(brief),
+                        "brief": brief}
+            return {"ok": True, "brief": brief}
+        except Exception as e:
+            log.exception("intro failed")
             return {"ok": False, "error": str(e)}
 
     def _http_f1_coverage(self, payload):
