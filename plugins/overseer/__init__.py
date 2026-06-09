@@ -569,6 +569,16 @@ class OverseerPlugin(Plugin):
             #    who, what's-being-worked-on, what's-thought-about.
             Route("GET",  "/intro",
                   self._http_intro),
+            # ── Vector index (2026-06-10): local semantic search ──
+            #    over the gist corpus. bge-small via llama-embed on
+            #    :8082 + sqlite-vec in overseer.db. Vectors never
+            #    leave the host (Slice 13 posture).
+            Route("GET",  "/vector/status",
+                  self._http_vector_status),
+            Route("POST", "/vector/backfill",
+                  self._http_vector_backfill),
+            Route("POST", "/vector/search",
+                  self._http_vector_search),
         ]
 
     # ── Lifecycle ───────────────────────────────────────────────
@@ -3142,6 +3152,93 @@ class OverseerPlugin(Plugin):
             if lines:
                 brief["sensitive_topics"] = lines
         return brief
+
+    # ── Vector index handlers (2026-06-10) ──────────────────────
+
+    def _http_vector_status(self, payload):
+        """GET /plugins/overseer/vector/status"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        return {"ok": True, **self.overseer_db.vector_status()}
+
+    def _http_vector_backfill(self, payload):
+        """POST /plugins/overseer/vector/backfill
+
+        {batches?: int=10, batch_size?: int=32, reembed?: bool}
+
+        Embeds gists that have no vector yet, oldest first. Idempotent:
+        call repeatedly until remaining == 0. reembed=true drops every
+        vector + the model pin first (the model-swap path)."""
+        db = self.overseer_db
+        if db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        if not db.vec_available:
+            return {"ok": False, "error": "sqlite-vec unavailable"}
+        if payload.get("reembed"):
+            db.drop_all_embeddings()
+        batches = _as_int(payload, "batches", 10, max_value=200)
+        batch_size = _as_int(payload, "batch_size", 32, max_value=128)
+        embedded = 0
+        for _ in range(batches):
+            ids = db.unembedded_gist_ids(limit=batch_size)
+            if not ids:
+                break
+            n = db.embed_gists(ids)
+            if n == 0:
+                status = db.vector_status()
+                return {"ok": False,
+                        "error": "embedding service unavailable "
+                                 "mid-backfill",
+                        "embedded_this_call": embedded, **status}
+            embedded += n
+        status = db.vector_status()
+        return {"ok": True, "embedded_this_call": embedded,
+                "remaining": status["total_gists"] - status["embedded"],
+                **status}
+
+    def _http_vector_search(self, payload):
+        """POST /plugins/overseer/vector/search
+
+        {q: str, k?: int=10}
+
+        Meaning-search over the gist corpus. Returns gists ranked by
+        cosine similarity with g: drill tokens, so callers can chain
+        into the existing detail surface."""
+        db = self.overseer_db
+        if db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        if not db.vec_available:
+            return {"ok": False, "error": "sqlite-vec unavailable"}
+        q = (payload.get("q") or payload.get("query") or "").strip()
+        if not q:
+            return {"ok": False, "error": "missing q"}
+        k = _as_int(payload, "k", 10, max_value=50)
+        from embeddings import embed_one
+        vec = embed_one(q)
+        if vec is None:
+            return {"ok": False, "error": "embedding service unavailable"}
+        t0 = time.time()
+        hits = db.semantic_neighbors(vec, k=k)
+        knn_ms = round((time.time() - t0) * 1000, 1)
+        results = []
+        for h in hits:
+            row = db._conn.execute(
+                "SELECT id, body, period_label, confidence, created_at "
+                "FROM summaries_gist WHERE id = ?",
+                (h["gist_id"],)).fetchone()
+            if row is None:
+                continue
+            results.append({
+                "token": "g:{}".format(row["id"]),
+                "gist_id": row["id"],
+                "similarity": round(1.0 - h["distance"], 4),
+                "period_label": row["period_label"],
+                "confidence": row["confidence"],
+                "created_at": row["created_at"],
+                "snippet": (row["body"] or "")[:280],
+            })
+        return {"ok": True, "q": q, "count": len(results),
+                "knn_ms": knn_ms, "results": results}
 
     def _http_intro(self, payload):
         """GET /plugins/overseer/intro

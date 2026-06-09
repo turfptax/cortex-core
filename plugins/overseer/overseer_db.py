@@ -1182,6 +1182,21 @@ class OverseerDB(CortexDB):
         # Serialize all writes via this lock — every commit goes through
         # _safe_commit(). Must be created BEFORE the first commit call.
         self._write_lock = threading.RLock()
+        # Vector index CP1 (2026-06-10): load the sqlite-vec extension
+        # on this connection so the vec_gists virtual table works.
+        # Missing extension degrades gracefully: vec_available=False
+        # and every vector feature reports itself unavailable instead
+        # of breaking the plugin.
+        self.vec_available = False
+        try:
+            import sqlite_vec
+            self._conn.enable_load_extension(True)
+            sqlite_vec.load(self._conn)
+            self._conn.enable_load_extension(False)
+            self.vec_available = True
+        except Exception as e:
+            log.warning(
+                "sqlite-vec unavailable; vector index disabled: %s", e)
         self._conn.executescript(OVERSEER_SCHEMA_SQL)
         self._safe_commit()
         self._migrate_3f5()
@@ -2142,6 +2157,37 @@ class OverseerDB(CortexDB):
                     f"ALTER TABLE corpus_decisions ADD COLUMN {col} TEXT"
                 )
         self._safe_commit()
+        self._migrate_vector_index()
+
+    def _migrate_vector_index(self):
+        """Vector index CP1 (2026-06-10): vec_gists virtual table +
+        embedding_meta. Lives OUTSIDE the bootstrap SQL because vec0
+        tables require the sqlite-vec extension, which may be absent
+        (vec_available=False -> skip everything; the plugin runs fine
+        without vectors). Cosine distance declared on the column so
+        semantic_neighbors returns 0..2 cosine distances directly.
+
+        embedding_meta pins the model: vectors from different models
+        are not comparable, so a model change requires a full re-embed
+        (drop + backfill). ensure_embedding_model() enforces this.
+        """
+        if not self.vec_available:
+            return
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS embedding_meta ("
+            "  id INTEGER PRIMARY KEY CHECK (id = 1),"
+            "  model TEXT NOT NULL,"
+            "  dim INTEGER NOT NULL,"
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now'))"
+            ")"
+        )
+        self._conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_gists USING vec0("
+            "  gist_id INTEGER PRIMARY KEY,"
+            "  embedding float[384] distance_metric=cosine"
+            ")"
+        )
+        self._safe_commit()
 
     def _migrate_9_6_notification_actions(self):
         """Slice 9.6 CP1 (2026-05-19): notifications gain actions_json
@@ -2228,6 +2274,121 @@ class OverseerDB(CortexDB):
         ).fetchall()
         return [r["tag"] for r in rows]
 
+    # ── vector index (CP1/CP2, 2026-06-10) ──────────────────────
+
+    def ensure_embedding_model(self, model, dim):
+        """Pin the embedding model. Returns True if `model` matches the
+        pinned one (or pins it on first call). False means a DIFFERENT
+        model produced the existing vectors — mixing is refused; drop
+        and re-embed instead (POST /vector/backfill {"reembed": true}).
+        """
+        if not self.vec_available:
+            return False
+        row = self._conn.execute(
+            "SELECT model, dim FROM embedding_meta WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO embedding_meta (id, model, dim) "
+                "VALUES (1, ?, ?)", (model, int(dim)))
+            self._safe_commit()
+            return True
+        return row["model"] == model and row["dim"] == int(dim)
+
+    @staticmethod
+    def _vec_blob(vec):
+        import struct
+        return struct.pack("{}f".format(len(vec)), *vec)
+
+    def upsert_gist_embedding(self, gist_id, vec):
+        """Store one gist vector. vec0 has no UPSERT; delete + insert."""
+        if not self.vec_available:
+            return
+        with self._write_lock:
+            self._conn.execute(
+                "DELETE FROM vec_gists WHERE gist_id = ?", (int(gist_id),))
+            self._conn.execute(
+                "INSERT INTO vec_gists (gist_id, embedding) VALUES (?, ?)",
+                (int(gist_id), self._vec_blob(vec)))
+            self._conn.commit()
+
+    def unembedded_gist_ids(self, limit=64):
+        if not self.vec_available:
+            return []
+        rows = self._conn.execute(
+            "SELECT id FROM summaries_gist WHERE id NOT IN "
+            "(SELECT gist_id FROM vec_gists) ORDER BY id LIMIT ?",
+            (int(limit),)).fetchall()
+        return [r["id"] for r in rows]
+
+    def embed_gists(self, gist_ids):
+        """Embed the given gists via the local llama-embed service and
+        store the vectors. Best-effort: returns the number embedded;
+        0 means the service was down or the model pin mismatched, and
+        the gists stay unembedded for the next backfill pass."""
+        if not self.vec_available or not gist_ids:
+            return 0
+        from embeddings import embed_texts, MODEL_NAME, DIM
+        if not self.ensure_embedding_model(MODEL_NAME, DIM):
+            log.error("embedding model mismatch; refusing to mix "
+                      "vectors (re-embed required)")
+            return 0
+        marks = ",".join("?" for _ in gist_ids)
+        rows = self._conn.execute(
+            "SELECT id, body FROM summaries_gist WHERE id IN "
+            "({})".format(marks), [int(g) for g in gist_ids]).fetchall()
+        if not rows:
+            return 0
+        vecs = embed_texts([r["body"] or "" for r in rows])
+        if vecs is None:
+            return 0
+        for row, vec in zip(rows, vecs):
+            self.upsert_gist_embedding(row["id"], vec)
+        return len(rows)
+
+    def semantic_neighbors(self, query_vec, k=10):
+        """KNN over gist vectors. Returns [{gist_id, distance}] ranked
+        nearest-first; distance is cosine distance (0 identical .. 2
+        opposite)."""
+        if not self.vec_available:
+            return []
+        rows = self._conn.execute(
+            "SELECT gist_id, distance FROM vec_gists "
+            "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+            (self._vec_blob(query_vec), int(k))).fetchall()
+        return [{"gist_id": r["gist_id"], "distance": r["distance"]}
+                for r in rows]
+
+    def drop_all_embeddings(self):
+        """Model-swap path: clear every vector + the model pin so the
+        next backfill re-embeds the whole corpus with the new model."""
+        if not self.vec_available:
+            return
+        with self._write_lock:
+            self._conn.execute("DELETE FROM vec_gists")
+            self._conn.execute("DELETE FROM embedding_meta")
+            self._conn.commit()
+
+    def vector_status(self):
+        if not self.vec_available:
+            return {"available": False}
+        total = self._conn.execute(
+            "SELECT COUNT(*) FROM summaries_gist").fetchone()[0]
+        embedded = self._conn.execute(
+            "SELECT COUNT(*) FROM vec_gists").fetchone()[0]
+        meta = self._conn.execute(
+            "SELECT model, dim, created_at FROM embedding_meta "
+            "WHERE id = 1").fetchone()
+        return {
+            "available": True,
+            "model": meta["model"] if meta else None,
+            "dim": meta["dim"] if meta else None,
+            "total_gists": total,
+            "embedded": embedded,
+            "coverage_pct": round(100.0 * embedded / total, 1)
+            if total else 0.0,
+        }
+
     # ── summaries_gist ──────────────────────────────────────────
 
     def add_gist(self, body, *, period_label="", period_start=None,
@@ -2263,6 +2424,13 @@ class OverseerDB(CortexDB):
             )
             self._safe_commit()
         self.tag_many("summaries_gist", gid, tags)
+        # Vector index CP2 (2026-06-10): embed-on-write, best effort.
+        # Failure never blocks the gist insert; the backfill pass picks
+        # up anything missed (acceptance criterion from the seed).
+        try:
+            self.embed_gists([gid])
+        except Exception as e:
+            log.warning("embed-on-write failed for gist %s: %s", gid, e)
         return gid
 
     def recent_gists(self, limit=10):
