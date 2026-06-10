@@ -901,6 +901,22 @@ def build_context_block(*, working_memory: dict | None,
         if digest:
             lines.append("Last week digest:")
             lines.append("  " + _trunc(digest, 800))
+        # Vector CP4 (2026-06-10): whole-corpus semantic pull. These
+        # are gists the vector index found relevant to the ACTIVE
+        # questions/projects but that recency windows can't reach -
+        # exactly the context an answer about ongoing work tends to
+        # be missing. Capped tight per the Polish CP3 budget rule.
+        relevant = working_memory.get("relevant_context") or []
+        if relevant:
+            lines.append(
+                "Relevant from the whole corpus (semantic, by anchor):")
+            for r in relevant[:6]:
+                lines.append("  - [{tok}] ({anchor}) {snip}".format(
+                    tok=r.get("token", "?"),
+                    anchor=_trunc(r.get("relevant_to") or "", 40),
+                    snip=_trunc(
+                        (r.get("snippet") or "").replace("\n", " "), 150),
+                ))
         lines.append("")
     else:
         lines.append("## Working memory")

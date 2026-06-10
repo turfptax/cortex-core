@@ -2304,6 +2304,84 @@ class OverseerLoop:
 
     # ── Step 3: build working_memory artifact ────────────────────
 
+    def _build_relevant_context(self, top_questions, top_projects,
+                                exclude_ids, recent_cutoff):
+        """Vector index CP3 (2026-06-10), Tory's framing: working
+        memory should inject the most RELEVANT context from the WHOLE
+        corpus into whatever AI reads it - not just the most recent
+        slice. Anchors = what is currently active (top questions +
+        top projects); each anchor's semantic neighbors are pulled
+        from vec_gists and the merged best become relevant_context.
+
+        Gists inside the recent digest window (or already surfaced as
+        unfiled) are excluded, so this block is purely "older but
+        relevant" - the part of the corpus recency can never reach.
+
+        Pure local compute (llama-embed :8082 + sqlite-vec KNN), zero
+        LLM budget. Best-effort: any failure returns [] and the WM
+        build continues.
+        """
+        if not getattr(self._db, "vec_available", False):
+            return []
+        try:
+            from embeddings import embed_texts
+        except Exception:
+            return []
+        anchors = []
+        for q in (top_questions or [])[:3]:
+            text = (q.get("question") or "").strip()
+            if text:
+                anchors.append((_truncate(text, 60), text[:400]))
+        for p in (top_projects or [])[:3]:
+            name = (p.get("name") or p.get("tag") or "").strip()
+            if name:
+                desc = p.get("description") or ""
+                anchors.append((name, "{}. {}".format(name, desc)[:400]))
+        if not anchors:
+            return []
+        vecs = embed_texts([t for _, t in anchors])
+        if not vecs:
+            return []
+        k = int(self._cfg.get("working_memory_relevant_k", 6))
+        min_sim = float(self._cfg.get(
+            "working_memory_relevant_min_sim", 0.5))
+        cap = int(self._cfg.get("working_memory_relevant_max", 10))
+        best = {}
+        for (label, _), vec in zip(anchors, vecs):
+            try:
+                hits = self._db.semantic_neighbors(vec, k=k)
+            except Exception:
+                continue
+            for h in hits:
+                sim = 1.0 - h["distance"]
+                gid = h["gist_id"]
+                if sim < min_sim or gid in exclude_ids:
+                    continue
+                if gid not in best or sim > best[gid][0]:
+                    best[gid] = (sim, label)
+        ranked = sorted(best.items(), key=lambda kv: kv[1][0],
+                        reverse=True)
+        out = []
+        for gid, (sim, label) in ranked:
+            if len(out) >= cap:
+                break
+            row = self._db._conn.execute(
+                "SELECT id, body, period_label, created_at "
+                "FROM summaries_gist WHERE id = ?", (gid,)).fetchone()
+            if row is None:
+                continue
+            if (row["created_at"] or "") >= recent_cutoff:
+                continue  # recent window already covers it
+            out.append({
+                "gist_id": gid,
+                "token": make_token("summaries_gist", gid),
+                "similarity": round(sim, 3),
+                "relevant_to": label,
+                "snippet": _truncate(row["body"] or "", 220),
+                "created_at": row["created_at"],
+            })
+        return out
+
     def build_working_memory(self) -> dict:
         """Assemble the working_memory dict per locked design.
 
@@ -2406,6 +2484,14 @@ class OverseerLoop:
         unfiled = self._db.unfiled_recent_gists(limit=unfiled_n)
         for u in unfiled:
             u["token"] = make_token("summaries_gist", u.get("id"))
+
+        # Vector CP3: semantic pull from the whole corpus, anchored
+        # on what's currently active. See _build_relevant_context.
+        relevant_context = self._build_relevant_context(
+            top_questions, top_projects,
+            exclude_ids={u.get("id") for u in unfiled},
+            recent_cutoff=cutoff,
+        )
 
         # Slice 3f.5 #4: surface globally-applicable blindspots (ones
         # whose model_pattern matches Opus, the default summarizer)
@@ -2555,7 +2641,7 @@ class OverseerLoop:
         return {
             "built_at": _utc_iso(),
             "local_built_at": _local_built_at,
-            "schema_version": 8,  # 9.4.1: +local_built_at
+            "schema_version": 9,  # 9: +relevant_context (vector CP3)
             "top_questions": top_questions,            # PRIMARY (3f.5)
             "top_projects": top_projects,
             "recent_decisions": self._core.recent_decisions(limit=decisions_n),
@@ -2565,6 +2651,10 @@ class OverseerLoop:
             "recent_episode_titles": episode_titles,
             "last_week_digest": digest,
             "unfiled_recent_gists": unfiled,            # 3f.5: unfiled signal
+            # Vector CP3: whole-corpus semantic pull, anchored on the
+            # active questions/projects. The "inject the most relevant
+            # context" block - older material recency can never reach.
+            "relevant_context": relevant_context,
             "future_overseer_notes_count": future_total,
             "journal_entry_count": self._db.journal_count(),
             "blindspots": global_blindspots,            # 3f.5 #4
