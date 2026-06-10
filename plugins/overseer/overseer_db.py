@@ -2188,6 +2188,115 @@ class OverseerDB(CortexDB):
             ")"
         )
         self._safe_commit()
+        self._migrate_15_missions()
+
+    def _migrate_15_missions(self):
+        """Slice 15 CP1 (2026-06-10): Project Missions events spine.
+
+        Missions ARE c_agents rows with mission_focus set - reuses the
+        existing C registry, promotion flow, and scheduled-run step.
+        mission_project is TEXT (the corpus keys projects by tag/name,
+        not integer id - deliberate deviation from the seed).
+        project_events + mission_subscriptions are the trigger system
+        the seed called the missing piece; the semantic gate at match
+        time is what the vector index unblocked.
+        """
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(c_agents)").fetchall()}
+        for col, decl in (
+            ("mission_project", "TEXT"),
+            ("dispatch_authority", "TEXT NOT NULL DEFAULT 'read_only'"),
+            ("budget_usd_per_day", "REAL NOT NULL DEFAULT 0.10"),
+            ("mission_focus", "TEXT"),
+            ("mission_scratchpad", "TEXT"),
+        ):
+            if col not in cols:
+                self._conn.execute(
+                    "ALTER TABLE c_agents ADD COLUMN {} {}".format(
+                        col, decl))
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS project_events ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  kind TEXT NOT NULL,"
+            "  project TEXT NOT NULL DEFAULT '',"
+            "  payload_json TEXT NOT NULL DEFAULT '{}',"
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "  processed_at TEXT"
+            ")"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_project_events_unprocessed "
+            "ON project_events(processed_at, id)"
+        )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS mission_subscriptions ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  mission_id INTEGER NOT NULL,"
+            "  event_kind TEXT NOT NULL,"
+            "  min_similarity REAL NOT NULL DEFAULT 0.55,"
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "  UNIQUE(mission_id, event_kind)"
+            ")"
+        )
+        self._safe_commit()
+
+    # ── Slice 15: mission events ─────────────────────────────────
+
+    def publish_event(self, kind, *, project="", payload=None):
+        """Publish a project event for the missions step to drain.
+        Cheap insert; callers wrap in try/except (publishing must
+        never break the publishing code path)."""
+        cur = self._conn.execute(
+            "INSERT INTO project_events (kind, project, payload_json) "
+            "VALUES (?, ?, ?)",
+            (kind, project or "",
+             json.dumps(payload or {}, separators=(",", ":"),
+                        default=str)))
+        self._safe_commit()
+        return cur.lastrowid
+
+    def unprocessed_events(self, limit=50):
+        rows = self._conn.execute(
+            "SELECT id, kind, project, payload_json, created_at "
+            "FROM project_events WHERE processed_at IS NULL "
+            "ORDER BY id LIMIT ?", (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_events_processed(self, ids):
+        """Anchor-mark rule: events get marked processed whether or
+        not anything subscribed - never rescan the same window."""
+        if not ids:
+            return
+        marks = ",".join("?" for _ in ids)
+        self._conn.execute(
+            "UPDATE project_events SET processed_at = datetime('now') "
+            "WHERE id IN ({})".format(marks), [int(i) for i in ids])
+        self._safe_commit()
+
+    def mission_subscriptions_for(self, kind):
+        rows = self._conn.execute(
+            "SELECT s.id AS sub_id, s.event_kind, s.min_similarity, "
+            "c.id AS mission_id, c.name, c.mission_project, "
+            "c.mission_focus, c.dispatch_authority "
+            "FROM mission_subscriptions s "
+            "JOIN c_agents c ON c.id = s.mission_id "
+            "WHERE s.event_kind = ? AND c.status = 'active' "
+            "AND c.mission_focus IS NOT NULL", (kind,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def append_mission_scratchpad(self, mission_id, line, max_chars=8000):
+        """Append to the mission's lightweight scratchpad, keeping the
+        tail. The scratchpad is the CP1 landing zone (seed checkpoint
+        2: lightweight first)."""
+        row = self._conn.execute(
+            "SELECT mission_scratchpad FROM c_agents WHERE id = ?",
+            (int(mission_id),)).fetchone()
+        current = (row["mission_scratchpad"] or "") if row else ""
+        updated = (current + line)[-max_chars:]
+        self._conn.execute(
+            "UPDATE c_agents SET mission_scratchpad = ? WHERE id = ?",
+            (updated, int(mission_id)))
+        self._safe_commit()
 
     def _migrate_9_6_notification_actions(self):
         """Slice 9.6 CP1 (2026-05-19): notifications gain actions_json

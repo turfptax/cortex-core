@@ -502,6 +502,23 @@ class OverseerLoop:
                 import git_ingest as _gi
                 summary["git_ingest"] = _gi.run_scheduled(
                     self._db, self._cfg, self._log)
+                # Slice 15 CP1: publish per-repo events so missions
+                # can watch repos. Best-effort.
+                try:
+                    gi = summary.get("git_ingest") or {}
+                    if gi.get("ran"):
+                        for repo in gi.get("repos_attempted") or []:
+                            name = (repo if isinstance(repo, str)
+                                    else repo.get("repo")
+                                    or repo.get("name") or "")
+                            if name:
+                                self._db.publish_event(
+                                    "git_ingest.new_commits",
+                                    project=str(name),
+                                    payload={"repo": str(name)})
+                except Exception as e:
+                    self._log.warning(
+                        "git event publish failed: %s", e)
             except Exception as e:
                 self._log.exception("git_ingest step failed: %s", e)
                 summary["errors"].append("git_ingest: " + str(e)[:200])
@@ -523,6 +540,17 @@ class OverseerLoop:
             except Exception as e:
                 self._log.exception("tag step failed: %s", e)
                 summary["errors"].append("tag: " + str(e)[:200])
+
+        # Step 2b (Slice 15 CP1): drain project events against mission
+        # subscriptions. Read-only in CP1 - matches become Bell
+        # proposals + scratchpad lines, never dispatch. No LLM cost
+        # (semantic gate runs on local embeddings).
+        if self._cfg.get("loop_run_missions", True):
+            try:
+                self._run_missions_step(summary)
+            except Exception as e:
+                self._log.exception("missions step failed: %s", e)
+                summary["errors"].append("missions: " + str(e)[:200])
 
         # Step 3: working memory always rebuilds (no LLM call)
         if self._cfg.get("loop_build_working_memory", True):
@@ -1305,6 +1333,17 @@ class OverseerLoop:
 
         # Slice 3f.5 #2: route this new gist against open questions
         self._route_gist(gist_id, gist_text, summary, budget)
+
+        # Slice 15 CP1: publish gist.created so missions can react.
+        # Best-effort - publishing must never break summarization.
+        try:
+            self._db.publish_event(
+                "gist.created",
+                project=session.get("project") or "",
+                payload={"gist_id": gist_id,
+                         "snippet": (gist_text or "")[:300]})
+        except Exception as e:
+            self._log.warning("gist.created publish failed: %s", e)
 
         self._db.mark_session_processed(
             session["id"], gist_id=gist_id, notes_count=len(notes))
@@ -2303,6 +2342,87 @@ class OverseerLoop:
         return False
 
     # ── Step 3: build working_memory artifact ────────────────────
+
+    def _run_missions_step(self, summary):
+        """Slice 15 CP1 (2026-06-10): the trigger system the missions
+        seed called the missing piece. Drains project_events against
+        mission_subscriptions; each candidate match passes a SEMANTIC
+        gate (event payload embedded locally and cosine-compared to
+        the mission's focus text) so missions fire on meaning, not
+        keyword floods. CP1 is read-only: a match emits a Bell
+        proposal + a scratchpad line. Dispatch authority is CP3."""
+        events = self._db.unprocessed_events(limit=50)
+        if not events:
+            return
+        try:
+            from embeddings import embed_texts
+        except Exception:
+            embed_texts = None
+
+        def _cosine(a, b):
+            num = sum(x * y for x, y in zip(a, b))
+            da = sum(x * x for x in a) ** 0.5
+            db_ = sum(y * y for y in b) ** 0.5
+            return num / (da * db_) if da and db_ else 0.0
+
+        fired = 0
+        focus_vecs = {}
+        for ev in events:
+            for sub in self._db.mission_subscriptions_for(ev["kind"]):
+                if (sub.get("mission_project") and ev.get("project")
+                        and sub["mission_project"] != ev["project"]):
+                    continue
+                sim = None
+                if (embed_texts is not None
+                        and getattr(self._db, "vec_available", False)
+                        and sub.get("mission_focus")):
+                    try:
+                        mid = sub["mission_id"]
+                        if mid not in focus_vecs:
+                            v = embed_texts([sub["mission_focus"][:800]])
+                            focus_vecs[mid] = v[0] if v else None
+                        pv = (embed_texts(
+                            [(ev.get("payload_json") or "")[:800]])
+                            or [None])[0]
+                        if focus_vecs[mid] and pv:
+                            sim = _cosine(focus_vecs[mid], pv)
+                    except Exception:
+                        sim = None
+                threshold = float(sub.get("min_similarity") or 0.55)
+                if sim is not None and sim < threshold:
+                    continue
+                fired += 1
+                sim_label = ("{:.2f}".format(sim)
+                             if sim is not None else "n/a")
+                try:
+                    self._db.emit_notification(
+                        severity="info",
+                        title="Mission '{}' triggered by {}".format(
+                            sub["name"], ev["kind"]),
+                        body="Event #{} (project: {}) matched with "
+                             "similarity {}. CP1 is read-only: this "
+                             "is a proposal, no action was taken. "
+                             "Payload: {}".format(
+                                 ev["id"], ev.get("project") or "-",
+                                 sim_label,
+                                 (ev.get("payload_json") or "")[:300]),
+                        rule_name="mission_proposal",
+                        rule_key="{}:{}".format(
+                            sub["mission_id"], ev["id"]),
+                        related_table="c_agents",
+                        related_id=str(sub["mission_id"]),
+                    )
+                except Exception as e:
+                    self._log.warning(
+                        "mission notification failed: %s", e)
+                self._db.append_mission_scratchpad(
+                    sub["mission_id"],
+                    "[{}] {} event #{} project={} sim={}\n".format(
+                        _utc_iso(), ev["kind"], ev["id"],
+                        ev.get("project") or "-", sim_label))
+        self._db.mark_events_processed([e["id"] for e in events])
+        if fired:
+            summary["mission_proposals"] = fired
 
     def _build_relevant_context(self, top_questions, top_projects,
                                 exclude_ids, recent_cutoff):
