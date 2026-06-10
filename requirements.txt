@@ -5,8 +5,3 @@ bleak>=0.21.0
 Pillow>=9.0.0
 pyaudio>=0.2.11
 vosk>=0.3.44
-
-# Pet / LLM inference (optional — set PET_ENABLED=False in config.py to skip)
-# On Pi Zero 2W, compile from source:
-#   CMAKE_ARGS="-DGGML_NO_METAL=ON -DGGML_NO_CUDA=ON" pip install llama-cpp-python
-llama-cpp-python>=0.3.0

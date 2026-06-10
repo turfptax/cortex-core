@@ -6,8 +6,6 @@
 #   bash scripts/deploy.sh --no-restart # deploy only (no service restart)
 #   bash scripts/deploy.sh --install    # first-time install (creates dirs, installs service)
 #   bash scripts/deploy.sh --llama-setup # build llama-server from source on Pi (-j1, ~25 min)
-#   bash scripts/deploy.sh --pet-setup  # deploy + compile llama-cpp + download model on Pi
-#   bash scripts/deploy.sh --pet-wheel  # deploy + install pre-built wheel + download model
 #
 # Works from Git Bash on Windows (uses scp, no rsync needed).
 
@@ -36,38 +34,6 @@ deploy_src() {
     echo "  Files deployed."
 }
 
-# Pet wheel setup (deploy + install pre-built wheel + download model)
-if [ "$1" = "--pet-wheel" ]; then
-    deploy_src
-
-    echo ""
-    echo "--- Uploading pre-built wheels ---"
-    WHEELS_DIR="${REPO_DIR}/wheels"
-    if [ -d "${WHEELS_DIR}" ] && ls "${WHEELS_DIR}"/*.whl >/dev/null 2>&1; then
-        ssh "${PI}" "mkdir -p ${PI_TARGET}/wheels"
-        scp "${WHEELS_DIR}"/*.whl "${PI}:${PI_TARGET}/wheels/"
-        echo "  Wheels uploaded."
-    else
-        echo "  WARNING: No wheels found in ${WHEELS_DIR}"
-        echo "  Download wheels first — see README."
-        exit 1
-    fi
-
-    echo ""
-    echo "--- Running pet setup (wheel install — fast!) ---"
-    ssh "${PI}" "bash ${PI_TARGET}/scripts/setup_pet.sh"
-
-    echo ""
-    echo "--- Restarting service ---"
-    ssh "${PI}" "sudo systemctl restart cortex-core"
-    sleep 3
-    ssh "${PI}" "sudo systemctl status cortex-core --no-pager -l" || true
-
-    echo ""
-    echo "Pet setup complete (from pre-built wheel)!"
-    exit 0
-fi
-
 # llama-server setup (deploy + build llama-server from source on Pi)
 # IMPORTANT: Uses -j1 to avoid OOM on 2GB boards (~20-30 min build)
 if [ "$1" = "--llama-setup" ]; then
@@ -86,25 +52,6 @@ if [ "$1" = "--llama-setup" ]; then
 
     echo ""
     echo "llama-server setup complete!"
-    exit 0
-fi
-
-# Pet setup (deploy + compile from source on Pi)
-if [ "$1" = "--pet-setup" ]; then
-    deploy_src
-
-    echo ""
-    echo "--- Running pet setup on Pi (this takes 30-60 min for compilation) ---"
-    ssh "${PI}" "bash ${PI_TARGET}/scripts/setup_pet.sh"
-
-    echo ""
-    echo "--- Restarting service ---"
-    ssh "${PI}" "sudo systemctl restart cortex-core"
-    sleep 3
-    ssh "${PI}" "sudo systemctl status cortex-core --no-pager -l" || true
-
-    echo ""
-    echo "Pet setup complete!"
     exit 0
 fi
 

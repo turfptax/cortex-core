@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Generate placeholder WAV sound effects for Cortex Pet Tamagotchi.
+"""Generate placeholder WAV sound effects for Cortex Core.
+
+Core itself only plays boot.wav at startup (src/main.py). The rest of
+the set (feed, clean, evolve, etc.) are legacy Cortex Pet effects from
+before the Slice 11 extraction, kept because plugins can reach them
+through the SoundManager fallback in plugin_api.py.
 
 Creates simple sine-wave based sounds using only Python stdlib (wave + struct).
 These are functional placeholders — replace with real sound design later.

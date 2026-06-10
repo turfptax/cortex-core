@@ -1,5 +1,5 @@
 [Unit]
-Description=llama-server (Cortex Pet LLM inference)
+Description=llama-server (LLM inference for Cortex overseer router)
 After=network.target
 Before=cortex-core.service
 

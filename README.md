@@ -8,7 +8,7 @@ AI Agent ──MCP──> cortex-mcp ──WiFi HTTP──> [this code] Orange P
                                                           ├── SQLite DB (10 tables)
                                                           ├── HTTP API (port 8420)
                                                           ├── BLE client (bleak)
-                                                          ├── Pet Engine (llama-server, Qwen3.5-0.8B)
+                                                          ├── On-device LLM (llama-server, overseer router)
                                                           ├── Voice STT (Vosk)
                                                           ├── Audio recorder
                                                           └── Display UI (PIL, 240x280 ST7789)
@@ -34,12 +34,6 @@ cortex-core/
 │   ├── logger.py           # JSONL activity logger
 │   └── power.py            # WiFi power management
 ├── plugins/                # First-class plugins (auto-discovered, hot-loaded)
-│   ├── pet/                # Tamagotchi-style pet (was src/pet.py)
-│   │   ├── __init__.py
-│   │   ├── pet_engine.py
-│   │   ├── tamagotchi_display.py
-│   │   ├── plugin.toml
-│   │   └── data/           # Per-plugin SQLite + assets
 │   └── overseer/           # Memory-upkeep agent (Slice 3 + 4)
 │       ├── __init__.py             # Plugin lifecycle + ~30 HTTP routes
 │       ├── overseer_db.py          # Schema + CRUD (15+ tables)
@@ -66,7 +60,6 @@ cortex-core/
 ├── scripts/
 │   ├── deploy.sh                       # scp + restart service on Pi
 │   ├── setup_llama_server.sh           # Build llama-server (-j1 for 2GB boards)
-│   ├── setup_pet.sh                    # Install llama-cpp-python + model
 │   ├── setup_power.sh                  # Pi power optimization
 │   └── backfill_session_stats.py       # Slice 4: one-shot per-session enrichment
 ├── systemd/
@@ -89,11 +82,12 @@ The runtime hosts plugins under `plugins/`. Each plugin owns:
 - Its own SQLite at `plugin_data/` (the runtime gives a typed `db` handle)
 - A `routes` list — `Route("GET"|"POST", "/path", handler)` mounted under `/plugins/<name>/...`
 
-Two ship today:
+One ships in-tree today:
 
-- **pet** — Tamagotchi engine (vitals, mood, evolution, LLM chat, display rendering, gamepad input)
 - **overseer** — Memory-upkeep agent. Reads notes / sessions / imported Claude Code conversations and produces interpretive layers via OpenRouter (Opus 4.7 + Sonnet 4.6 dialectic). Background loop with 9 tick steps as of v0.17 cycle (Slice 5 added the temporal cadence step). Slice 3 + Slice 4 + Slice 5 — full feature set documented in [cortex-desktop/CLAUDE.md](https://github.com/turfptax/cortex-desktop/blob/master/CLAUDE.md#overseer-slice-3--4--5--added-in-v013017).
   **Locked principle (Slice 5):** the Overseer stays a quiet, lightweight memory layer. Captures, surfaces, connects. Not a journaling app or life coach.
+
+The Tamagotchi pet was extracted to the [cortex-pet](https://github.com/turfptax/cortex-pet) sister repo (Slice 11). It can still load out-of-tree by cloning that repo into `plugins/pet/`; all pet code, assets, and docs live there now.
 
 ## Development Workflow
 
@@ -166,13 +160,13 @@ File categories: `recordings`, `notes`, `logs`, `uploads`.
 
 BLE auto-discovery: After connecting to the ESP32 over BLE, the Pi sends a `DISCOVER:` message containing its IP, HTTP port, and auth token to the computer. This enables automatic WiFi transport setup with no manual configuration.
 
-## Pet Engine
+## On-Device LLM (llama-server)
 
-An AI Tamagotchi running a small LLM (Qwen3.5-0.8B, Q4_K_M quantized, ~533 MB) locally on the Pi via `llama-server` (HTTP backend). The pet evolves through interaction stages, has a mood/vitals system, autonomous heartbeat reflections, and dream-cycle training.
+A small LLM (Qwen3.5-0.8B base, fine-tuned bloom-21 in production) runs locally on the Pi via `llama-server` (HTTP backend, port 8081). The overseer's LLM router uses it as the on-device tier.
 
 ### llama-server Setup
 
-The pet's brain runs as a separate `llama-server` systemd service. **Always build with `-j1` on 2GB boards** — using `-j4` will OOM and crash the system.
+The model runs as a separate `llama-server` systemd service. **Always build with `-j1` on 2GB boards** — using `-j4` will OOM and crash the system.
 
 ```bash
 # Full setup: build llama-server + download model + install service (~25 min)
@@ -188,61 +182,6 @@ bash scripts/setup_llama_server.sh --cleanup       # remove build dir (~1.5 GB)
 The build uses static linking (`-DBUILD_SHARED_LIBS=OFF`) so there are no shared library dependencies. The resulting binary is fully self-contained.
 
 **⚠️ IMPORTANT**: Never compile on 2GB Pi boards with more than `-j1`. The `-j4` flag will exhaust RAM, trigger OOM, and freeze the board requiring a power cycle.
-
-### Pet Setup
-
-```bash
-# Deploy code + restart service
-bash scripts/deploy.sh
-
-# Or via deploy script with pet setup:
-bash scripts/deploy.sh --pet-setup
-```
-
-Set `PET_ENABLED=False` in `config.py` to disable the pet entirely.
-
-### Voice Interaction
-
-Say **"pet"** followed by a prompt (e.g., "pet how are you"), or say just **"pet"** to enter pet-listening mode where everything spoken becomes the prompt.
-
-### Evolution Stages
-
-| Stage | Name | Interactions | Behavior |
-|-------|------|-------------|----------|
-| 0 | Primordial | 0-49 | Very short phrases (1-5 words), curious but confused |
-| 1 | Babbling | 50-199 | Short sentences (5-15 words), repeats words, excited |
-| 2 | Echoing | 200-999 | Simple conversations (1-2 sentences), developing personality |
-| 3 | Responding | 1000-4999 | Real conversations (1-3 sentences), remembers things |
-| 4 | Conversing | 5000+ | Mature companion (1-4 sentences), thoughtful and creative |
-
-### Mood System
-
-Mood is a rolling average of sentiment from the last 20 interactions. Sentiment uses weighted keyword scoring with negation handling ("not good" → negative), intensity modifiers ("very", "extremely"), and punctuation cues. Mood adjusts the LLM's generation temperature (kind = more coherent, mean = more cautious) and response length.
-
-| Mood | Score Range | Effect |
-|------|------------|--------|
-| Happy | > 0.4 | Lower temperature, longer responses |
-| Content | 0.15 - 0.4 | Slightly lower temperature |
-| Neutral | -0.15 - 0.15 | Default behavior |
-| Uneasy | -0.4 - -0.15 | Higher temperature, shorter responses |
-| Sad | < -0.4 | Highest temperature, shortest responses |
-
-### Protocol Commands
-
-| Command | Payload | Response |
-|---------|---------|----------|
-| `pet_ask` | `{"prompt": "hello"}` | `ACK:pet_ask:<id>` (response arrives async) |
-| `pet_response` | `{}` | `RSP:pet_response:[...]` (poll for completed responses) |
-| `pet_status` | `{}` | `RSP:pet_status:{...}` (stage, mood, stats) |
-| `pet_mood` | `{}` | `RSP:pet_mood:{...}` (detailed mood info) |
-| `pet_history` | `{"limit": 10}` | `RSP:pet_history:[...]` (recent interactions) |
-| `pet_analytics` | `{"days": 7}` | `RSP:pet_analytics:{...}` (mood trends, performance, stage progression) |
-
-### Display States
-
-- **PET_ASKING** — Shown while the pet is thinking. Displays the user's prompt and animated "Thinking..." indicator.
-- **PET_RESPONSE** — Shows the pet's response text, inference stats, and mood/stage. Auto-dismisses after 15 seconds.
-- **NOTE_TAKING (pet mode)** — When capturing a pet prompt via voice, shows "PET" badge and "Ask your pet..." placeholder.
 
 ## Shell Exec
 
@@ -281,6 +220,7 @@ A full walkthrough — including the source taxonomy (which `source=` values exi
 
 - [cortex](https://github.com/turfptax/cortex) — MCP server, CLI, and daemon (runs on PC)
 - [cortex-link](https://github.com/turfptax/cortex-link) — ESP32-S3 USB-BLE bridge firmware
+- [cortex-pet](https://github.com/turfptax/cortex-pet) — extracted Tamagotchi pet plugin (loads out-of-tree under `plugins/pet/`)
 
 ## License
 
