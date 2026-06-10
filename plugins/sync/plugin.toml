@@ -1,0 +1,23 @@
+[plugin]
+name = "sync"
+version = "0.1.0"
+description = "Contract-v2 sync transport over the Pi LAN HTTP API (phone syncs direct when on home WiFi)"
+author = "turfptax"
+entrypoint = "sync"
+enabled = true
+
+[capabilities]
+db = true                       # owns plugins/sync/data/sync.db (uuid -> row map)
+display_screens = false
+mcp_tools = false
+http_routes = true              # /plugins/sync/push|pull|status
+background_tasks = false        # reconciler may arrive here later
+core_memory_read = false
+core_memory_write = true        # phone-pushed notes land in cortex.db
+llm = false
+
+[config]
+
+[dependencies]
+core_min = "0.1.0"
+plugins = []
