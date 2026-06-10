@@ -2284,6 +2284,64 @@ class OverseerDB(CortexDB):
             "AND c.mission_focus IS NOT NULL", (kind,)).fetchall()
         return [dict(r) for r in rows]
 
+    def create_mission(self, *, name, focus, project="",
+                       event_kinds=None, min_similarity=0.55):
+        """Slice 15 CP2: one-call mission creation. cadence_minutes
+        is set huge + last_run_at fresh so the scheduled C runner
+        never fires missions as C agents (CP1 lesson)."""
+        kinds = [k for k in (event_kinds or ["gist.created"]) if k]
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO c_agents (name, graduated_from_b_name, "
+                "cadence_minutes, system_prompt, status, last_run_at, "
+                "mission_project, mission_focus, dispatch_authority) "
+                "VALUES (?, 'mission', 525600, ?, 'active', "
+                "datetime('now'), ?, ?, 'read_only')",
+                (name, "Mission: " + focus, project or "", focus))
+        except sqlite3.IntegrityError:
+            return {"ok": False,
+                    "error": "mission name already exists: " + name}
+        mid = cur.lastrowid
+        for k in kinds:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO mission_subscriptions "
+                "(mission_id, event_kind, min_similarity) "
+                "VALUES (?, ?, ?)", (mid, k, float(min_similarity)))
+        self._safe_commit()
+        return {"ok": True, "mission_id": mid, "name": name,
+                "subscribed": kinds,
+                "min_similarity": float(min_similarity)}
+
+    def list_missions(self):
+        rows = self._conn.execute(
+            "SELECT id, name, status, mission_project, mission_focus, "
+            "dispatch_authority, budget_usd_per_day, created_at, "
+            "mission_scratchpad FROM c_agents "
+            "WHERE mission_focus IS NOT NULL ORDER BY id").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            subs = self._conn.execute(
+                "SELECT event_kind, min_similarity "
+                "FROM mission_subscriptions WHERE mission_id = ?",
+                (r["id"],)).fetchall()
+            d["subscriptions"] = [dict(s) for s in subs]
+            pad = d.pop("mission_scratchpad") or ""
+            d["scratchpad_tail"] = pad[-500:]
+            out.append(d)
+        return out
+
+    def set_mission_status(self, name, status):
+        """Retire/revive a mission by name. Scratchpad untouched, so
+        a revived mission keeps its full prior context (seed
+        acceptance criterion). Returns affected row count."""
+        cur = self._conn.execute(
+            "UPDATE c_agents SET status = ? "
+            "WHERE name = ? AND mission_focus IS NOT NULL",
+            (status, name))
+        self._safe_commit()
+        return cur.rowcount
+
     def append_mission_scratchpad(self, mission_id, line, max_chars=8000):
         """Append to the mission's lightweight scratchpad, keeping the
         tail. The scratchpad is the CP1 landing zone (seed checkpoint

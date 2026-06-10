@@ -1218,6 +1218,105 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
+    # ── Slice 15 CP2 (2026-06-10): mission lifecycle ─────────────
+    # Missions are the harness's assignment layer: a persistent watch
+    # bound to the corpus, triggered by project events through a
+    # SEMANTIC gate (event payload embedded vs the mission's focus
+    # text). CP2 is read-only authority: a triggered mission emits a
+    # Bell proposal + scratchpad line, never dispatches work.
+    {
+        "type": "function",
+        "function": {
+            "name": "create_mission",
+            "description": (
+                "Create a persistent mission: a standing watch on the "
+                "corpus that fires when semantically-matching events "
+                "arrive. Use when Tory asks you to 'watch', 'track', "
+                "or 'keep an eye on' something ongoing. The focus "
+                "text is what events are compared against - write it "
+                "as a dense topical description, not instructions. "
+                "Live event kinds: gist.created (a new session gist "
+                "landed), git_ingest.new_commits (a watched repo got "
+                "commits). Missions survive restarts and appear in "
+                "list_missions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Short unique slug, e.g. "
+                                       "'openmuscle-hardware-watch'.",
+                    },
+                    "focus": {
+                        "type": "string",
+                        "description": "Dense topical description the "
+                                       "semantic gate matches events "
+                                       "against.",
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Optional project tag filter; "
+                                       "empty = all projects.",
+                    },
+                    "event_kinds": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Default ['gist.created'].",
+                    },
+                    "min_similarity": {
+                        "type": "number",
+                        "description": "Semantic gate floor 0-1 "
+                                       "(default 0.55).",
+                    },
+                },
+                "required": ["name", "focus"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_missions",
+            "description": (
+                "List all missions (active and retired) with their "
+                "focus, subscriptions, authority, and the tail of "
+                "each scratchpad (recent trigger activity)."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "end_mission",
+            "description": (
+                "Retire a mission by name. The scratchpad is kept - "
+                "a retired mission can be revived later with its "
+                "full prior context."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "revive_mission",
+            "description": (
+                "Reactivate a retired mission by name with its prior "
+                "scratchpad context intact."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 # ── Slice 10 (2026-05-20): Category B agent tools ────────────────
@@ -1623,6 +1722,45 @@ def _dispatch(name: str, args: dict, *, db, core_memory,
             return {"ok": True, "tag": tag, "status": status}
         except Exception as e:
             return {"error": f"update_project_status failed: {e}"[:200]}
+
+    # ── Slice 15 CP2: mission lifecycle ──────────────────────────
+    if name == "create_mission":
+        m_name = (args.get("name") or "").strip()
+        focus = (args.get("focus") or "").strip()
+        if not m_name or not focus:
+            return {"error": "name and focus are required"}
+        sim = args.get("min_similarity")
+        try:
+            sim = float(sim) if sim is not None else 0.55
+        except (TypeError, ValueError):
+            sim = 0.55
+        return db.create_mission(
+            name=m_name, focus=focus,
+            project=(args.get("project") or "").strip(),
+            event_kinds=args.get("event_kinds"),
+            min_similarity=max(0.0, min(1.0, sim)))
+
+    if name == "list_missions":
+        missions = db.list_missions()
+        return {"count": len(missions), "missions": missions}
+
+    if name == "end_mission":
+        m_name = (args.get("name") or "").strip()
+        if not m_name:
+            return {"error": "name required"}
+        n = db.set_mission_status(m_name, "retired")
+        return ({"ok": True, "retired": m_name,
+                 "note": "scratchpad kept; revivable"}
+                if n else {"error": "no mission named " + m_name})
+
+    if name == "revive_mission":
+        m_name = (args.get("name") or "").strip()
+        if not m_name:
+            return {"error": "name required"}
+        n = db.set_mission_status(m_name, "active")
+        return ({"ok": True, "revived": m_name,
+                 "note": "prior scratchpad context intact"}
+                if n else {"error": "no mission named " + m_name})
 
     if name == "create_project":
         tag = (args.get("tag") or "").strip()
