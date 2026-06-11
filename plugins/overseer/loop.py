@@ -523,6 +523,40 @@ class OverseerLoop:
                 self._log.exception("git_ingest step failed: %s", e)
                 summary["errors"].append("git_ingest: " + str(e)[:200])
 
+        # Step 1c.6 (2026-06-11): periodic YouTube persona-channel
+        # ingest. Same shape as git ingest: own schedule, rows picked
+        # up by the NEXT tick's summarize step. Publishes
+        # social.post.created only for videos INSERTED this run, so a
+        # manual CLI backfill (rows pre-exist as duplicates) never
+        # floods missions with old uploads (anchor-mark rule).
+        if self._cfg.get("loop_youtube_ingest_enabled", False):
+            try:
+                import youtube_ingest as _yt
+                summary["youtube_ingest"] = _yt.run_scheduled(
+                    self._db, self._cfg, self._log)
+                try:
+                    yt = summary.get("youtube_ingest") or {}
+                    if yt.get("ran"):
+                        for ch in yt.get("channels_attempted") or []:
+                            for vid in ch.get("new_videos") or []:
+                                self._db.publish_event(
+                                    "social.post.created",
+                                    project=str(
+                                        ch.get("project") or ""),
+                                    payload={
+                                        "platform": "youtube",
+                                        "persona": ch.get("persona"),
+                                        "video_id": vid.get("id"),
+                                        "title": vid.get("title"),
+                                    })
+                except Exception as e:
+                    self._log.warning(
+                        "youtube event publish failed: %s", e)
+            except Exception as e:
+                self._log.exception("youtube_ingest step failed: %s", e)
+                summary["errors"].append(
+                    "youtube_ingest: " + str(e)[:200])
+
         # Step 1d: generate missing automation rollups (cheap, Sonnet 4.6).
         if (self._cfg.get("loop_run_rollups", True)
                 and not budget.exhausted()):
@@ -2777,6 +2811,11 @@ class OverseerLoop:
         except Exception:
             git_ingest_state = {}
         try:
+            import youtube_ingest as _yt
+            youtube_ingest_state = _yt.last_run_state(self._db)
+        except Exception:
+            youtube_ingest_state = {}
+        try:
             sibling_stats = self._db.sibling_dispatch_stats(
                 daily_cap=sibling_daily_cap)
         except Exception as e:
@@ -2846,6 +2885,10 @@ class OverseerLoop:
             # block answer "is the git channel current?" and "what am I
             # NOT seeing?" — overseer's explicit caveat on the slice.
             "git_ingest": git_ingest_state,
+            # 2026-06-11: youtube persona-channel ingest state. Same
+            # freshness contract as git_ingest: when the channel last
+            # refreshed and what it did/didn't see.
+            "youtube_ingest": youtube_ingest_state,
             # 9.6 CP3: unread notification responses from Tory. Bell
             # tab is now a two-way channel; this is the count of
             # action-button clicks / free-text replies overseer hasn't

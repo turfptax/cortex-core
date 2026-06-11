@@ -355,6 +355,21 @@ loop_git_ingest_repos = [
 loop_git_ingest_interval_hours = 6
 loop_git_ingest_lookback_days = 7
 
+# ── YouTube persona-channel ingest (2026-06-11) ─────────────────────
+# Polls each channel's public RSS feed (no API key, no quota) and
+# writes one imported_sessions row per video, source youtube:<persona>.
+# The persona layer: git channel = what Tory ships, chat channels =
+# what he thinks, this = what his public personas say. Format is
+# persona:channel_id[:project_tag]; project tag routes gist.created
+# events to missions watching that project.
+loop_youtube_ingest_enabled = true
+loop_youtube_channels = [
+    "turfptax:UCqUkg2M11LXsoSusLoh20YA:turfptax",
+    "duelinggroks:UCwRZ7ZJgUOUoAF3QtIhae3Q:dueling-groks",
+    "openmuscle:UC12raMSYtI46-IMjA5DaQ_g:open-muscle",
+]
+loop_youtube_ingest_interval_hours = 12
+
 # ── Slice 3e: notifications rules ─────────────────────────────────
 loop_run_notifications = true
 notify_stale_project_days = 14          # warn after N days untouched
