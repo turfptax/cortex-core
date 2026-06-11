@@ -1418,6 +1418,39 @@ class OverseerLoop:
         self._db.set_overseer_state(self.NOTES_MARK_KEY, anchor)
         return anchor
 
+    def _writeback_note_tags(self, note_id, tags):
+        """Write tags to cortex.db's notes.tags column via the local
+        core API (the overseer's direct core handle is read-only by
+        design; the HTTP upsert is the public write contract and
+        UPDATEs only supplied columns). Best-effort: failure logs and
+        the sidecar tags still exist."""
+        import base64
+        import urllib.request
+        try:
+            try:
+                from config import HTTP_USERNAME, HTTP_PASSWORD
+            except ImportError:
+                HTTP_USERNAME, HTTP_PASSWORD = "cortex", "cortex"
+            body = json.dumps({
+                "command": "upsert",
+                "payload": {"table": "notes",
+                            "data": {"id": int(note_id),
+                                     "tags": ",".join(tags)}},
+            }).encode("utf-8")
+            auth = base64.b64encode("{}:{}".format(
+                HTTP_USERNAME, HTTP_PASSWORD).encode()).decode()
+            req = urllib.request.Request(
+                "http://127.0.0.1:8420/api/cmd", data=body,
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Basic " + auth},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except Exception as e:
+            self._log.warning(
+                "tags column write-back failed for note %s: %s",
+                note_id, e)
+
     def _tag_one_batch(self, batch: list[dict], budget: TickBudget,
                        max_per_note: int) -> tuple[int, int]:
         # Build numbered prompt
@@ -1467,6 +1500,15 @@ class OverseerLoop:
             try:
                 if tags:
                     self._db.tag_many("notes", note["id"], tags)
+                    # 2026-06-11 (phone pipeline vetting): ALSO write
+                    # the tags to cortex.db's notes.tags column. The
+                    # sidecar tags table is only visible to overseer
+                    # internals; notes_search, audits, and the Hub
+                    # read the column. Surfaced by the first big
+                    # source of untagged notes (mobile sync). Routed
+                    # through the local core API because the
+                    # overseer's core handle is read-only by design.
+                    self._writeback_note_tags(note["id"], tags)
                     self._db.mark_note_processed(
                         note["id"], tags_added=",".join(tags))
                     tagged_n += 1
