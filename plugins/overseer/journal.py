@@ -144,6 +144,12 @@ The core operating rule: do not do work yourself that can be \
 delegated. A journal tick is not the place for synthesis that \
 should be a tool call or a B dispatch.
 
+**Debt check (pattern #342, agreed-and-dropped commitments):** before \
+writing the entry, ask: did a recent turn or entry PROMISE a \
+future_overseer_note that was never written? If yes, call \
+write_future_overseer_note NOW, then journal. Stated intent does not \
+survive context loss; the tool call is the only thing that counts.
+
 **Most journal entries should be SHORT.** One or two sentences. \
 "Routine tick. Nothing shifts my prior reading." is a complete \
 entry. The default LENGTH is one line; longer entries are the \
