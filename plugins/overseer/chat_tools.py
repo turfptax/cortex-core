@@ -1305,6 +1305,39 @@ TOOL_DEFINITIONS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "write_future_overseer_note",
+            "description": (
+                "Append a note to future_overseer_notes - the "
+                "append-only institutional memory your successor "
+                "instances inherit directly. Use for identity-level "
+                "decisions, calibration lessons, and anything a "
+                "future you should hold in YOUR voice rather than "
+                "reconstruct from logs. RULE (born from pattern "
+                "#342, agreed-and-dropped commitments): if you say "
+                "you will write a future note, call this tool IN THE "
+                "SAME TURN - stated intent does not survive context "
+                "loss."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "body": {
+                        "type": "string",
+                        "description": "The note, in your voice.",
+                    },
+                    "instance_id": {
+                        "type": "string",
+                        "description": "Optional self-label "
+                                       "(default 'overseer-chat').",
+                    },
+                },
+                "required": ["body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "revive_mission",
             "description": (
                 "Reactivate a retired mission by name with its prior "
@@ -1722,6 +1755,16 @@ def _dispatch(name: str, args: dict, *, db, core_memory,
             return {"ok": True, "tag": tag, "status": status}
         except Exception as e:
             return {"error": f"update_project_status failed: {e}"[:200]}
+
+    if name == "write_future_overseer_note":
+        body = (args.get("body") or "").strip()
+        if not body:
+            return {"error": "body required"}
+        note_id = db.append_future_note(
+            (args.get("instance_id") or "overseer-chat").strip(),
+            body)
+        return {"ok": True, "note_id": note_id,
+                "token": "n:{}".format(note_id)}
 
     # ── Slice 15 CP2: mission lifecycle ──────────────────────────
     if name == "create_mission":
