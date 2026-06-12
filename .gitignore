@@ -67,3 +67,4 @@ vault/**/*
 tools/pipeline_lab/runs/
 tools/pipeline_lab/dataset.json
 tools/pipeline_lab/imported_samples/
+tools/pipeline_lab/audit_manifest.json

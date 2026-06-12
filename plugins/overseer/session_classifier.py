@@ -64,12 +64,32 @@ _SCHEDULED_RX = re.compile(
 
 _TOOL_RESULT_PREFIX = "[tool_result"
 
+# User-role messages that are actually the HARNESS talking, not the human:
+# scheduled-task preambles, task notifications, system reminders, slash
+# command machinery (/loop re-injections), and session-continuation banners.
+# 2026-06-11 audit finding: one /loop session had 160 of 172 "human" turns
+# that were loop machinery; counting them fools every volume heuristic.
+_HARNESS_PREFIXES = (
+    "<scheduled-task", "<task-notification", "<system-reminder",
+    "<command-name", "<local-command-caveat", "[SYSTEM NOTIFICATION",
+)
+_CONTINUATION_RX = re.compile(
+    r"^This session is being continued from a previous", re.IGNORECASE)
+
+
+def _is_harness_turn(text: str) -> bool:
+    t = text.lstrip()
+    return (t.startswith(_HARNESS_PREFIXES)
+            or bool(_CONTINUATION_RX.match(t))
+            or bool(_SCHEDULED_RX.search(t[:300])))
+
 
 def extract_signals(metadata: dict, messages: list[dict]) -> dict:
     """Cheap, explainable features. Every value here is shown to the
     human in Pipeline Lab; keep them interpretable."""
     n_user = n_assistant = tool_msgs = 0
     human_texts: list[str] = []
+    harness_texts: list[str] = []
     for m in messages:
         role = m.get("role")
         text = (m.get("content_text") or "").strip()
@@ -79,17 +99,34 @@ def extract_signals(metadata: dict, messages: list[dict]) -> dict:
                 tool_msgs += 1
         elif role == "user":
             n_user += 1
-            # Tool results echo back as user-role messages; they are
-            # machine traffic, not the human typing.
-            if text and not text.startswith(_TOOL_RESULT_PREFIX):
+            if not text or text.startswith(_TOOL_RESULT_PREFIX):
+                continue  # tool results echo back as user-role messages
+            if _is_harness_turn(text):
+                harness_texts.append(text)
+            else:
                 human_texts.append(text)
 
     n_total = len(messages)
     n_human = len(human_texts)
     opener = human_texts[0] if human_texts else ""
-    scheduled_hits = sum(
-        1 for t in human_texts[:5] if _SCHEDULED_RX.search(t))
+    # WHO OPENED the session: the first substantive user-role turn.
+    # A harness notification arriving MID-session must not flip a human
+    # session to automation (2026-06-11 audit regression lesson).
+    first_user = None
+    for m in messages:
+        if m.get("role") == "user":
+            t = (m.get("content_text") or "").strip()
+            if t and not t.startswith(_TOOL_RESULT_PREFIX):
+                first_user = t
+                break
+    opened_by_scheduler = bool(first_user and _is_harness_turn(first_user))
     uniq_human = len({t[:200] for t in human_texts}) if human_texts else 0
+    # Loop-driven sessions re-inject the same prompt many times; subtract
+    # the dominant repeated template to estimate distinct human effort.
+    from collections import Counter
+    rep = Counter(t[:120] for t in human_texts)
+    max_repeated = max(rep.values()) if rep else 0
+    genuine_human = n_human - max(0, max_repeated - 1)
 
     return {
         "source": metadata.get("source") or "claude-code",
@@ -97,11 +134,14 @@ def extract_signals(metadata: dict, messages: list[dict]) -> dict:
         "user_messages": n_user,
         "assistant_messages": n_assistant,
         "human_messages": n_human,
+        "genuine_human_messages": genuine_human,
+        "harness_messages": len(harness_texts),
         "human_share": round(n_human / n_total, 3) if n_total else 0.0,
         "tool_use_fraction": round(tool_msgs / n_assistant, 3) if n_assistant else 0.0,
         "median_human_chars": int(statistics.median([len(t) for t in human_texts])) if human_texts else 0,
         "unique_human_ratio": round(uniq_human / n_human, 3) if n_human else 0.0,
-        "scheduled_markers_in_openers": scheduled_hits,
+        "max_repeated_human_turn": max_repeated,
+        "opened_by_scheduler": opened_by_scheduler,
         "opener_is_template": bool(opener[:1] in "<[" or _SCHEDULED_RX.search(opener[:400])),
         "duration_minutes": int(metadata.get("duration_minutes") or 0),
     }
@@ -118,44 +158,56 @@ def score_categories(s: dict) -> tuple[dict, list[dict]]:
         contrib.append({"signal": signal, "category": category,
                         "points": points, "note": note})
 
-    if s["scheduled_markers_in_openers"]:
-        add("automation-checkin", 0.55, "scheduled_markers_in_openers",
-            "scheduled-task / system-notification markers in the opening turns")
-    if s["opener_is_template"]:
+    genuine = s["genuine_human_messages"]
+
+    if s["opened_by_scheduler"] and genuine <= 3:
+        add("automation-checkin", 0.55, "opened_by_scheduler",
+            "session initiated by the scheduler with little or no human follow-up")
+    elif s["opened_by_scheduler"]:
+        add("automation-checkin", 0.1, "opened_by_scheduler",
+            "scheduler opened it, but a human engaged substantively afterward")
+    if s["opener_is_template"] and genuine <= 3:
         add("automation-checkin", 0.15, "opener_is_template",
             "first human turn starts with a template/harness tag")
-    if s["unique_human_ratio"] and s["unique_human_ratio"] < 0.6:
+    if s["max_repeated_human_turn"] >= 5 and genuine <= 5:
+        add("automation-checkin", 0.25, "max_repeated_human_turn",
+            "the same prompt re-injected many times with little else (loop-shaped)")
+    if s["unique_human_ratio"] and s["unique_human_ratio"] < 0.6 and genuine <= 5:
         add("automation-checkin", 0.15, "unique_human_ratio",
             "human turns repeat (templated prompts)")
 
-    if s["human_messages"] == 0:
+    if s["human_messages"] == 0 and s["harness_messages"]:
+        add("automation-checkin", 0.3, "harness_messages",
+            "only harness-injected turns, nothing human-typed")
+    elif s["human_messages"] == 0:
         add("automation-batch", 0.6, "human_messages",
             "no human-typed turns at all")
-    elif s["human_messages"] <= 2 and s["messages_total"] >= 20:
-        add("automation-batch", 0.35, "human_messages",
-            "long session with almost no human turns")
-    if s["tool_use_fraction"] >= 0.5 and s["human_messages"] <= 2:
+    elif genuine <= 2 and s["messages_total"] >= 20 \
+            and not s["opened_by_scheduler"]:
+        add("automation-batch", 0.35, "genuine_human_messages",
+            "long session with almost no distinct human turns")
+    if s["tool_use_fraction"] >= 0.5 and genuine <= 2:
         add("automation-batch", 0.15, "tool_use_fraction",
             "tool-dominated with no human steering")
 
-    if s["human_messages"] >= 5 and s["tool_use_fraction"] >= 0.3:
+    if genuine >= 5 and s["tool_use_fraction"] >= 0.3:
         add("human-build", 0.45, "tool_use_fraction",
             "human steering a tool-heavy work session")
-    if s["human_messages"] >= 3 and 0.05 < s["tool_use_fraction"] < 0.3:
+    if genuine >= 3 and 0.05 < s["tool_use_fraction"] < 0.3:
         add("human-build", 0.15, "tool_use_fraction",
             "some tool use under human direction")
 
-    if s["human_messages"] >= 3 and s["tool_use_fraction"] <= 0.05:
+    if genuine >= 3 and s["tool_use_fraction"] <= 0.05:
         add("human-dialogue", 0.45, "tool_use_fraction",
             "conversation with essentially no tool traffic")
-    if s["median_human_chars"] >= 200:
+    if s["median_human_chars"] >= 200 and genuine >= 3:
         add("human-dialogue", 0.15, "median_human_chars",
             "long, composed human messages")
-    if s["human_share"] >= 0.4 and s["human_messages"] >= 3:
+    if s["human_share"] >= 0.4 and genuine >= 3:
         add("human-dialogue", 0.15, "human_share",
             "human turns dominate the session")
-    if s["source"] not in ("claude-code",) and s["human_messages"] >= 3 \
-            and not s["scheduled_markers_in_openers"]:
+    if s["source"] not in ("claude-code",) and genuine >= 3 \
+            and not s["opened_by_scheduler"]:
         add("human-dialogue", 0.1, "source",
             "web-AI source (no tool harness)")
 
@@ -253,6 +305,17 @@ def classify_session(metadata: dict, messages: list[dict], *,
         "ambiguous": ambiguous,
         "llm": None,
     }
+
+    # Deterministic override (2026-06-11 audit): a session OPENED by the
+    # scheduler with zero or one human-typed turn IS a check-in. Not a
+    # heuristic, a structural fact; score normalization should not dilute it.
+    if (signals["opened_by_scheduler"]
+            and signals["human_messages"] <= 1
+            and result["category"] == "automation-checkin"):
+        result["confidence"] = 0.98 if signals["human_messages"] == 0 else 0.9
+        result["method"] = "rules-deterministic"
+        result["ambiguous"] = False
+        ambiguous = False
 
     if ambiguous and llm is not None:
         prompt = CLASSIFY_PROMPT_TEMPLATE.format(
