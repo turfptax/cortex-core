@@ -102,7 +102,7 @@ def _build_snippet(session_row: dict) -> str:
                 # First user-role message
                 for m in messages:
                     if m.get("role") == "user":
-                        body = (m.get("content") or "").strip()
+                        body = (m.get("content_text") or "").strip()
                         if body:
                             parts.append(
                                 f"FIRST USER TURN: {body[:1200]}")
