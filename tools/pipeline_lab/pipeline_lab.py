@@ -244,12 +244,20 @@ def run_pipeline(body: dict) -> dict:
 def context_status() -> dict:
     secrets, path = _load_secrets()
     manifest = load_manifest_llm()
+    dataset = None
+    ds_file = HERE / "dataset.json"
+    if ds_file.is_file():
+        try:
+            dataset = json.loads(ds_file.read_text(encoding="utf-8"))
+        except Exception:
+            dataset = None
     return {
         "openrouter_key": bool(_get_openrouter_api_key(secrets)),
         "secrets_path": str(path) if path else None,
         "models": manifest.get("model_overrides", {}),
         "default_model": manifest.get("model"),
         "pi": fetch_pi_context(),
+        "dataset": dataset,
         "runs": sorted((p.stem for p in RUNS_DIR.glob("*.json")), reverse=True)
         if RUNS_DIR.is_dir() else [],
     }

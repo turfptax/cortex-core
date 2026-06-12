@@ -91,6 +91,8 @@
         <textarea id="rawText" placeholder="Paste a conversation transcript here..."></textarea>
       </div>
       <div id="jsonlIn" style="display:none">
+        <label>Study dataset (build with tools/pipeline_lab/build_dataset.py)</label>
+        <select id="dataset" style="width:100%"><option value="">Pick a session...</option></select>
         <label>.jsonl path on this machine</label>
         <input type="text" id="jsonlPath" placeholder="C:\Users\User\.claude\projects\...\session.jsonl">
       </div>
@@ -138,6 +140,10 @@ document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = () => {
   $('jsonlIn').style.display = m === 'jsonl' ? '' : 'none';
 });
 
+$('dataset').onchange = () => {
+  if ($('dataset').value) $('jsonlPath').value = $('dataset').value;
+};
+
 async function loadContext() {
   try {
     const c = await (await fetch('/api/context')).json();
@@ -148,6 +154,19 @@ async function loadContext() {
     for (const sel of [$('loadRun'), $('compareRun')]) {
       sel.length = 1;
       c.runs.forEach(r => sel.add(new Option(r, r)));
+    }
+    if (c.dataset) {
+      const sel = $('dataset'); sel.length = 1;
+      const grp = (label, rows) => {
+        const g = document.createElement('optgroup'); g.label = label;
+        rows.forEach(r => {
+          const tag = `${r.duration_minutes}min · ${r.user_messages}u · ${r.project.slice(0, 28)}`;
+          g.appendChild(new Option(`${tag}${r.why ? ' — ' + r.why : ''}`, r.path));
+        });
+        sel.appendChild(g);
+      };
+      grp(`Curated (${c.dataset.curated.length})`, c.dataset.curated);
+      grp(`Random sample (${c.dataset.random.length}, seed ${c.dataset.seed})`, c.dataset.random);
     }
   } catch (e) { $('status').textContent = 'context error: ' + e; }
 }

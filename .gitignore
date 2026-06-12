@@ -65,3 +65,4 @@ vault/**/*
 !vault/notes-for-future-overseer/
 !vault/_meta/
 tools/pipeline_lab/runs/
+tools/pipeline_lab/dataset.json
