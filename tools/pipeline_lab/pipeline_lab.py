@@ -6,9 +6,16 @@ conversation or a local Claude Code .jsonl, and shows every intermediate:
 the rendered prompts, the raw model responses, the parsed structures, and
 per-stage cost. Nothing here writes to overseer.db or cortex.db.
 
-Run:
+Run the web UI:
     python tools/pipeline_lab/pipeline_lab.py
     -> http://localhost:8777
+
+Run from the command line (results print AND save for the UI's
+saved-run / compare dropdowns):
+    python tools/pipeline_lab/pipeline_lab.py --run path/to/session.jsonl
+    python tools/pipeline_lab/pipeline_lab.py --batch curated
+    python tools/pipeline_lab/pipeline_lab.py --batch random
+    python tools/pipeline_lab/pipeline_lab.py --batch all
 
 Requirements:
     - Python 3.11+ (tomllib)
@@ -258,9 +265,24 @@ def context_status() -> dict:
         "default_model": manifest.get("model"),
         "pi": fetch_pi_context(),
         "dataset": dataset,
-        "runs": sorted((p.stem for p in RUNS_DIR.glob("*.json")), reverse=True)
-        if RUNS_DIR.is_dir() else [],
+        "runs": list_runs(),
     }
+
+
+def list_runs() -> list[dict]:
+    """Saved runs with enough label info to tell them apart in a dropdown."""
+    out = []
+    if not RUNS_DIR.is_dir():
+        return out
+    for p in sorted(RUNS_DIR.glob("*.json"), reverse=True):
+        try:
+            r = json.loads(p.read_text(encoding="utf-8"))
+            out.append({"id": r.get("id", p.stem), "source": r.get("source", "?"),
+                        "project": r.get("project", ""),
+                        "cost": r.get("total_cost_usd", 0)})
+        except Exception:
+            out.append({"id": p.stem, "source": "?", "project": "", "cost": 0})
+    return out
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -309,10 +331,74 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": str(e)}, 500)
 
 
+def cli_run_one(path: str, use_pi: bool) -> dict:
+    r = run_pipeline({
+        "mode": "jsonl", "jsonl_path": path, "project": Path(path).parent.name,
+        "use_pi_context": use_pi, "run_insight": True, "run_routing": True,
+    })
+    print(f"\n=== {Path(path).name}  (run {r['id']}, ${r['total_cost_usd']})")
+    for st in r["stages"]:
+        p = st["parsed"]
+        if st["name"] == "transcript":
+            s = p["stats"]
+            print(f"  transcript: {s['messages_used']}/{s['messages_total']} messages used, "
+                  f"{s['messages_omitted']} omitted ({s['strategy']})")
+        elif st["name"] == "gist":
+            print(f"  GIST: {p['gist']}")
+        elif st["name"] == "routing":
+            if p["decisions"]:
+                for d in p["decisions"]:
+                    print(f"  ROUTE: {d['contribution']} -> {d['question'][:70]}")
+            else:
+                print("  ROUTE: unfiled")
+        elif st["name"] == "insight":
+            if p["insights"]:
+                for i in p["insights"]:
+                    print(f"  {i['kind'].upper()} [{i['confidence']}]: {i['title']}")
+            else:
+                print("  INSIGHTS: none proposed (bar held)")
+    return r
+
+
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Pipeline Lab: serve the UI, or run sessions headless.")
+    ap.add_argument("--run", metavar="JSONL", help="run one session file and print the result")
+    ap.add_argument("--batch", choices=["curated", "random", "all"],
+                    help="run dataset.json sessions (build with build_dataset.py)")
+    ap.add_argument("--no-pi", action="store_true", help="skip live Pi context")
+    args = ap.parse_args()
+
     status = context_status()
+    if not status["openrouter_key"]:
+        print("WARNING: no OpenRouter key (set OPENROUTER_API_KEY or ~/.cortex/secrets.toml)")
+
+    if args.run or args.batch:
+        targets = []
+        if args.run:
+            targets = [args.run]
+        else:
+            ds = status.get("dataset")
+            if not ds:
+                print("No dataset.json; run build_dataset.py first.")
+                return
+            if args.batch in ("curated", "all"):
+                targets += [r["path"] for r in ds["curated"]]
+            if args.batch in ("random", "all"):
+                targets += [r["path"] for r in ds["random"]]
+        total = 0.0
+        for i, t in enumerate(targets, 1):
+            print(f"\n[{i}/{len(targets)}]", end="")
+            try:
+                total += cli_run_one(t, use_pi=not args.no_pi)["total_cost_usd"]
+            except Exception as e:
+                print(f"  ERROR: {e}")
+        print(f"\nDone: {len(targets)} sessions, ${round(total, 4)} total. "
+              f"Runs saved for the UI's load/compare dropdowns.")
+        return
+
     print(f"Pipeline Lab on http://localhost:{PORT}")
-    print(f"  OpenRouter key: {'found' if status['openrouter_key'] else 'MISSING (set OPENROUTER_API_KEY or ~/.cortex/secrets.toml)'}")
+    print(f"  OpenRouter key: {'found' if status['openrouter_key'] else 'MISSING'}")
     print(f"  Pi context: {'reachable' if status['pi'].get('reachable') else 'unreachable (existing lists + questions will be empty)'}")
     print(f"  Gist model: {status['models'].get('summarize-session', status['default_model'])}")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

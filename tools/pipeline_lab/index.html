@@ -153,7 +153,7 @@ async function loadContext() {
       ' · gist model: ' + (c.models['summarize-session'] || c.default_model);
     for (const sel of [$('loadRun'), $('compareRun')]) {
       sel.length = 1;
-      c.runs.forEach(r => sel.add(new Option(r, r)));
+      c.runs.forEach(r => sel.add(new Option(`${r.id} · ${r.source}`, r.id)));
     }
     if (c.dataset) {
       const sel = $('dataset'); sel.length = 1;
