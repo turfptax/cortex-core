@@ -22,6 +22,7 @@ this plugin only writes the canonical UTC created_at the phone sends.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import sys
@@ -39,12 +40,46 @@ log = logging.getLogger("plugin.sync")
 
 OVERSEER_DB = _HERE.parent / "overseer" / "data" / "overseer.db"
 
-# kind -> (cursor prefix, pull columns); identical to the Gateway's table
+# kind -> (cursor prefix, pull columns). Extended 2026-06-12: the phone
+# mirrors the WHOLE interpretive layer, not just gists + narratives.
 PULL_KINDS = {
     "summaries_gist": ("g", ["id", "period_label", "body", "confidence", "created_at"]),
     "temporal_narratives": ("nar", ["id", "kind", "period_label", "period_start",
                                     "period_end", "narrative", "created_at"]),
+    "summaries_theme": ("t", ["id", "title", "body", "confidence", "created_at"]),
+    "summaries_episode": ("e", ["id", "title", "body", "created_at"]),
+    # Pi schema realities (2026-06-12): open_questions tracks is_active not
+    # status; the journal and future notes stamp written_at. Aliases keep
+    # the phone-facing column names uniform.
+    "open_questions": ("q", ["id", "question", "body", "confidence",
+                             "CASE WHEN is_active = 1 THEN 'open' ELSE 'closed' END AS status",
+                             "created_at"]),
+    "patterns": ("p", ["id", "name", "body", "confidence", "created_at"]),
+    "drift_observations": ("d", ["id", "body", "direction", "created_at"]),
+    "overseer_journal": ("j", ["id", "body", "written_at AS created_at"]),
+    "known_blindspots": ("b", ["id", "body", "rationale", "created_at"]),
+    "future_overseer_notes": ("n", ["id", "body", "written_at AS created_at"]),
 }
+
+# Per-gist nature weight, computed from session_nature (the Stage 0.5
+# classification) via the period_label tail join. LEFT JOIN: gists without
+# a classified session keep weight 1.0.
+GIST_NATURE_SQL = """
+SELECT g.id AS gist_id,
+       COALESCE(sn.category, '') AS category,
+       COALESCE(CASE sn.category
+           WHEN 'human-dialogue'     THEN 1.0
+           WHEN 'human-build'        THEN 0.8
+           WHEN 'automation-checkin' THEN 0.2
+           WHEN 'automation-batch'   THEN 0.1
+       END, 1.0) AS weight
+FROM summaries_gist g
+LEFT JOIN session_nature sn
+       ON substr(sn.session_id, -12) = substr(g.period_label, -12)
+WHERE g.id > ? ORDER BY g.id LIMIT ?
+"""
+
+EMBED_URL = "http://127.0.0.1:8082/embedding"
 
 # kind -> (target db, insertable columns); phone-authored, append-only
 PUSH_KINDS = {
@@ -102,6 +137,7 @@ class SyncPlugin(Plugin):
             Route("POST", "/push", self._http_push),
             Route("POST", "/pull", self._http_pull),
             Route("GET", "/status", self._http_status),
+            Route("POST", "/embed", self._http_embed),
         ]
 
     def _http_push(self, payload):
@@ -165,6 +201,10 @@ class SyncPlugin(Plugin):
 
     def _http_pull(self, payload):
         kind = str(payload.get("kind") or "")
+        if kind == "gist_nature":
+            return self._pull_gist_nature(payload)
+        if kind == "gist_vectors":
+            return self._pull_gist_vectors(payload)
         spec = PULL_KINDS.get(kind)
         if spec is None:
             return {"ok": False, "error": "unknown pull kind: {}".format(kind)}
@@ -199,16 +239,121 @@ class SyncPlugin(Plugin):
         return {"ok": True, "kind": kind, "rows": rows, "more": more,
                 "next_cursor": next_cursor}
 
+    @staticmethod
+    def _cursor_id(payload, prefix):
+        cursor = str(payload.get("cursor") or "")
+        if cursor.startswith(prefix + ":"):
+            try:
+                return int(cursor.split(":", 1)[1])
+            except ValueError:
+                return 0
+        return 0
+
+    @staticmethod
+    def _limit(payload, default=50, cap=100):
+        try:
+            n = int(payload.get("limit") or default)
+        except (TypeError, ValueError):
+            n = default
+        return max(1, min(n, cap))
+
+    def _pull_gist_nature(self, payload):
+        """Virtual pull kind: per-gist memory weight from session_nature."""
+        last_id = self._cursor_id(payload, "gn")
+        limit = self._limit(payload)
+        con = self._connect(OVERSEER_DB)
+        try:
+            rows = [dict(r) for r in con.execute(GIST_NATURE_SQL, (last_id, limit))]
+            more = False
+            if rows:
+                more = con.execute(
+                    "SELECT 1 FROM summaries_gist WHERE id > ?",
+                    (rows[-1]["gist_id"],)).fetchone() is not None
+        finally:
+            con.close()
+        next_cursor = "gn:{}".format(rows[-1]["gist_id"]) if rows \
+            else str(payload.get("cursor") or "")
+        return {"ok": True, "kind": "gist_nature", "rows": rows,
+                "more": more, "next_cursor": next_cursor}
+
+    def _pull_gist_vectors(self, payload):
+        """Virtual pull kind: bge-small embeddings from the sqlite-vec table,
+        base64-encoded for JSON transport. Needs the sqlite_vec extension."""
+        import base64
+        last_id = self._cursor_id(payload, "gv")
+        limit = self._limit(payload, default=50, cap=50)
+        con = self._connect(OVERSEER_DB)
+        try:
+            try:
+                import sqlite_vec
+                con.enable_load_extension(True)
+                sqlite_vec.load(con)
+                con.enable_load_extension(False)
+            except Exception as e:
+                return {"ok": False,
+                        "error": "sqlite-vec unavailable: {}".format(e)}
+            raw = con.execute(
+                "SELECT gist_id, embedding FROM vec_gists "
+                "WHERE gist_id > ? ORDER BY gist_id LIMIT ?",
+                (last_id, limit)).fetchall()
+            rows = [{"gist_id": r["gist_id"],
+                     "dim": len(r["embedding"]) // 4,
+                     "vec_b64": base64.b64encode(r["embedding"]).decode()}
+                    for r in raw]
+            more = False
+            if rows:
+                more = con.execute(
+                    "SELECT 1 FROM vec_gists WHERE gist_id > ?",
+                    (rows[-1]["gist_id"],)).fetchone() is not None
+        finally:
+            con.close()
+        next_cursor = "gv:{}".format(rows[-1]["gist_id"]) if rows \
+            else str(payload.get("cursor") or "")
+        return {"ok": True, "kind": "gist_vectors", "rows": rows,
+                "more": more, "next_cursor": next_cursor}
+
+    def _http_embed(self, payload):
+        """Embed query text via the local llama-embed service so the phone
+        can run semantic KNN over its synced vectors."""
+        import urllib.request
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            return {"ok": False, "error": "missing text"}
+        req = urllib.request.Request(
+            EMBED_URL, data=json.dumps({"content": text[:2000]}).encode(),
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as e:
+            return {"ok": False, "error": "llama-embed: {}".format(e)}
+        # llama.cpp variants: {"embedding": [...]}, [{"embedding": [...]}],
+        # or {"data": [{"embedding": [...]}]}.
+        emb = None
+        if isinstance(data, dict):
+            emb = data.get("embedding") or (
+                (data.get("data") or [{}])[0].get("embedding")
+                if isinstance(data.get("data"), list) else None)
+        elif isinstance(data, list) and data:
+            emb = data[0].get("embedding")
+        if isinstance(emb, list) and emb and isinstance(emb[0], list):
+            emb = emb[0]  # some builds nest one level deeper
+        if not isinstance(emb, list) or not emb:
+            return {"ok": False, "error": "unexpected llama-embed reply shape"}
+        return {"ok": True, "embedding": emb, "dim": len(emb)}
+
     def _http_status(self, payload):
         counts, newest = {}, {}
         con = self._connect(OVERSEER_DB)
         try:
-            for kind in PULL_KINDS:
+            for kind, (_prefix, cols) in PULL_KINDS.items():
                 counts[kind] = con.execute(
                     "SELECT count(*) AS c FROM {}".format(kind)).fetchone()["c"]
+                # cols may carry aliases (written_at AS created_at), so select
+                # the kind's own column expressions rather than a literal name.
                 row = con.execute(
-                    "SELECT created_at FROM {} ORDER BY id DESC LIMIT 1".format(
-                        kind)).fetchone()
+                    "SELECT {} FROM {} ORDER BY id DESC LIMIT 1".format(
+                        ", ".join(cols), kind)).fetchone()
                 newest[kind] = str(row["created_at"]) if row else None
         finally:
             con.close()
