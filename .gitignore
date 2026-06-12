@@ -64,3 +64,4 @@ vault/**/*
 !vault/narratives/*/
 !vault/notes-for-future-overseer/
 !vault/_meta/
+tools/pipeline_lab/runs/

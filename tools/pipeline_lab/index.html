@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Cortex Pipeline Lab</title>
+<style>
+  :root {
+    --bg:#0b0f14; --card:#151c26; --card2:#1c2632; --text:#e9eef4;
+    --dim:#95a2b0; --accent:#4cc2ff; --border:#243140; --ok:#3fb950;
+    --theme:#b388ff; --pattern:#ffb454; --drift:#ff8fa3; --question:#7ee787;
+    --gist:#4cc2ff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.5 'Segoe UI', system-ui, sans-serif; }
+  header { padding:14px 20px; border-bottom:1px solid var(--border);
+           display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; }
+  .dim { color:var(--dim); font-size:12px; }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:14px; padding:14px 20px; }
+  @media (max-width: 1100px) { main { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--border);
+          border-radius:12px; padding:14px; margin-bottom:14px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em;
+             color:var(--dim); margin:0 0 10px; }
+  textarea, input[type=text] { width:100%; background:var(--card2); color:var(--text);
+    border:1px solid var(--border); border-radius:8px; padding:8px 10px;
+    font:13px/1.5 Consolas, monospace; }
+  textarea { min-height:140px; resize:vertical; }
+  label { font-size:12px; color:var(--dim); display:block; margin:8px 0 4px; }
+  .row { display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  .row label { display:flex; gap:5px; margin:0; align-items:center; }
+  button { background:var(--accent); color:#06121d; border:0; border-radius:8px;
+           padding:9px 18px; font-weight:700; cursor:pointer; font-size:14px; }
+  button.ghost { background:transparent; color:var(--accent);
+                 border:1px solid var(--border); font-weight:600; }
+  button:disabled { opacity:.5; cursor:default; }
+  .pill { display:inline-block; border:1px solid; border-radius:999px;
+          padding:1px 9px; font-size:11px; font-weight:700; margin-right:6px; }
+  .pill.theme   { color:var(--theme);   border-color:var(--theme);   background:#b388ff22; }
+  .pill.pattern { color:var(--pattern); border-color:var(--pattern); background:#ffb45422; }
+  .pill.drift   { color:var(--drift);   border-color:var(--drift);   background:#ff8fa322; }
+  .pill.question{ color:var(--question);border-color:var(--question);background:#7ee78722; }
+  .pill.gist    { color:var(--gist);    border-color:var(--gist);    background:#4cc2ff22; }
+  .pill.meta    { color:var(--dim);     border-color:var(--border); }
+  #raw { font:12px/1.6 Consolas, monospace; white-space:pre-wrap; max-height:75vh;
+         overflow:auto; }
+  #raw .ln { padding:1px 6px; border-radius:4px; }
+  #raw .ln.hl-theme   { background:#b388ff2e; outline:1px solid #b388ff66; }
+  #raw .ln.hl-pattern { background:#ffb4542e; outline:1px solid #ffb45466; }
+  #raw .ln.hl-drift   { background:#ff8fa32e; outline:1px solid #ff8fa366; }
+  #raw .ln.hl-gist    { background:#4cc2ff2e; outline:1px solid #4cc2ff66; }
+  .abs { border-left:3px solid var(--border); border-radius:8px;
+         background:var(--card2); padding:10px 12px; margin:8px 0; cursor:pointer; }
+  .abs:hover { outline:1px solid var(--accent); }
+  .abs.active { outline:2px solid var(--accent); }
+  .abs .title { font-weight:700; }
+  .abs .body { margin-top:4px; }
+  .abs .rationale { margin-top:4px; font-size:12px; color:var(--dim); }
+  details { margin-top:8px; }
+  details summary { cursor:pointer; color:var(--accent); font-size:12px; }
+  details pre { background:#0d1117; border:1px solid var(--border); border-radius:8px;
+                padding:10px; font-size:11px; white-space:pre-wrap; max-height:320px;
+                overflow:auto; }
+  .stagehead { display:flex; justify-content:space-between; align-items:baseline; }
+  .gisttext { font-size:16px; line-height:1.5; border-left:3px solid var(--gist);
+              padding:8px 12px; background:var(--card2); border-radius:8px; }
+  .err { color:#ff6b6b; white-space:pre-wrap; }
+  select { background:var(--card2); color:var(--text); border:1px solid var(--border);
+           border-radius:8px; padding:7px 9px; }
+  .note { font-size:12px; color:var(--dim); font-style:italic; margin-top:6px; }
+  .spin { color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Cortex Pipeline Lab</h1>
+  <span class="dim">raw &rarr; gist &rarr; abstraction, with the hood open &middot; spec: docs/PIPELINE.md</span>
+  <span id="status" class="dim"></span>
+</header>
+<main>
+  <section>
+    <div class="card">
+      <h2>Input</h2>
+      <div class="row">
+        <label><input type="radio" name="mode" value="text" checked> Paste conversation</label>
+        <label><input type="radio" name="mode" value="jsonl"> Claude Code .jsonl path</label>
+      </div>
+      <div id="textIn">
+        <label>Raw conversation text</label>
+        <textarea id="rawText" placeholder="Paste a conversation transcript here..."></textarea>
+      </div>
+      <div id="jsonlIn" style="display:none">
+        <label>.jsonl path on this machine</label>
+        <input type="text" id="jsonlPath" placeholder="C:\Users\User\.claude\projects\...\session.jsonl">
+      </div>
+      <label>Project label (affects insight-scan framing)</label>
+      <input type="text" id="project" value="cortex">
+      <label>Prior gists in the arc (optional, one per line; simulates the 7-day window the production scan reads)</label>
+      <textarea id="priorGists" style="min-height:70px"
+        placeholder="The user shipped X...&#10;The user decided Y..."></textarea>
+      <div class="row" style="margin-top:10px">
+        <label><input type="checkbox" id="usePi" checked> Use live EXISTING lists + open questions from the Pi</label>
+        <label><input type="checkbox" id="runInsight" checked> Insight scan</label>
+        <label><input type="checkbox" id="runRouting" checked> Question routing</label>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button id="run">Run pipeline</button>
+        <select id="loadRun"><option value="">Load saved run...</option></select>
+        <select id="compareRun"><option value="">Compare with...</option></select>
+        <span id="cost" class="dim"></span>
+      </div>
+      <div id="error" class="err"></div>
+    </div>
+    <div class="card">
+      <h2>Raw transcript <span class="dim">(click an abstraction to see its likely source lines; lexical alignment is tool instrumentation, not pipeline output)</span></h2>
+      <div id="raw" class="dim">Run the pipeline to see the transcript the model actually received, including truncation.</div>
+    </div>
+  </section>
+  <section id="results">
+    <div class="card"><h2>Pipeline output</h2>
+      <div class="dim">Stages appear here: gist, question routing, insight scan. Each shows the exact rendered prompt, the model + cost, the raw response, and the parsed result.</div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let current = null, compare = null;
+
+const STOP = new Set(('this that with from have what were they their about which would could'
+ + ' there these those been being session user assistant tool result the and for not are was'
+ + ' has had can will into over more than then when where also just like').split(' '));
+const toks = (s) => (s.toLowerCase().match(/[a-z0-9]{4,}/g) || []).filter(t => !STOP.has(t));
+
+document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = () => {
+  const m = document.querySelector('input[name=mode]:checked').value;
+  $('textIn').style.display = m === 'text' ? '' : 'none';
+  $('jsonlIn').style.display = m === 'jsonl' ? '' : 'none';
+});
+
+async function loadContext() {
+  try {
+    const c = await (await fetch('/api/context')).json();
+    $('status').textContent =
+      (c.openrouter_key ? 'key ok' : 'NO OPENROUTER KEY') + ' · ' +
+      (c.pi.reachable ? `Pi live (${c.pi.themes.length} themes, ${c.pi.questions.length} open questions)` : 'Pi unreachable') +
+      ' · gist model: ' + (c.models['summarize-session'] || c.default_model);
+    for (const sel of [$('loadRun'), $('compareRun')]) {
+      sel.length = 1;
+      c.runs.forEach(r => sel.add(new Option(r, r)));
+    }
+  } catch (e) { $('status').textContent = 'context error: ' + e; }
+}
+loadContext();
+
+$('run').onclick = async () => {
+  $('run').disabled = true; $('error').textContent = '';
+  $('cost').innerHTML = '<span class="spin">running (LLM calls take ~5-20s)...</span>';
+  try {
+    const body = {
+      mode: document.querySelector('input[name=mode]:checked').value,
+      text: $('rawText').value, jsonl_path: $('jsonlPath').value,
+      project: $('project').value, prior_gists: $('priorGists').value,
+      use_pi_context: $('usePi').checked,
+      run_insight: $('runInsight').checked, run_routing: $('runRouting').checked,
+    };
+    const r = await fetch('/api/run', { method: 'POST', body: JSON.stringify(body) });
+    const data = await r.json();
+    if (data.error) throw new Error(data.error);
+    current = data; render(); loadContext();
+  } catch (e) { $('error').textContent = String(e); }
+  finally { $('run').disabled = false; }
+};
+
+$('loadRun').onchange = async () => {
+  if (!$('loadRun').value) return;
+  current = await (await fetch('/api/runs/' + $('loadRun').value)).json();
+  render();
+};
+$('compareRun').onchange = async () => {
+  compare = $('compareRun').value
+    ? await (await fetch('/api/runs/' + $('compareRun').value)).json() : null;
+  render();
+};
+
+function esc(s) { return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+
+function renderRaw() {
+  const lines = (current.transcript || '').split('\n');
+  $('raw').classList.remove('dim');
+  $('raw').innerHTML = lines.map((l, i) =>
+    `<div class="ln" data-i="${i}">${esc(l) || '&nbsp;'}</div>`).join('');
+}
+
+function highlight(absText, kind) {
+  const want = new Set(toks(absText));
+  const lines = [...document.querySelectorAll('#raw .ln')];
+  lines.forEach(l => l.className = 'ln');
+  const scored = lines.map(l => {
+    const lt = toks(l.textContent);
+    if (!lt.length) return { l, s: 0 };
+    const hits = lt.filter(t => want.has(t)).length;
+    return { l, s: hits / Math.sqrt(lt.length) };
+  }).filter(x => x.s > 0.4).sort((a, b) => b.s - a.s).slice(0, 12);
+  scored.forEach(x => x.l.classList.add('hl-' + kind));
+  if (scored.length) scored[0].l.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+function stageCard(st, tag) {
+  let inner = '';
+  if (st.name === 'transcript') {
+    const s = st.parsed.stats;
+    inner = `<div class="dim">${s.messages_used}/${s.messages_total} messages used,
+      ${s.messages_omitted} omitted (${esc(s.strategy)}), ${s.char_length} chars</div>
+      <div class="note">${esc(st.note || '')}</div>`;
+  } else if (st.name === 'gist') {
+    inner = `<div class="gisttext abs" data-kind="gist"
+        data-text="${esc(st.parsed.gist)}">${esc(st.parsed.gist) || '<span class=dim>(empty)</span>'}</div>`;
+  } else if (st.name === 'routing') {
+    const d = st.parsed.decisions;
+    inner = d.length ? d.map(x =>
+      `<div class="abs" data-kind="question" data-text="${esc(x.reason + ' ' + x.question)}">
+        <span class="pill question">${esc(x.contribution)}</span>
+        <span class="title">${esc(x.question)}</span>
+        <div class="rationale">${esc(x.reason)}</div></div>`).join('')
+      : `<div class="dim">unfiled (no open question matched; conservative is correct)</div>`;
+  } else if (st.name === 'insight') {
+    const ins = st.parsed.insights;
+    inner = (ins.length ? ins.map(x =>
+      `<div class="abs" data-kind="${x.kind}"
+            data-text="${esc(x.title + ' ' + x.body + ' ' + (x.rationale || ''))}"
+            style="border-left-color:var(--${x.kind})">
+        <span class="pill ${x.kind}">${x.kind}${x.direction ? ' · ' + esc(x.direction) : ''}</span>
+        <span class="pill meta">${esc(x.confidence)}</span>
+        <span class="title">${esc(x.title)}</span>
+        <div class="body">${esc(x.body)}</div>
+        <div class="rationale">${esc(x.rationale || '')}</div></div>`).join('')
+      : `<div class="dim">No insights proposed. With a small arc that is the designed outcome:
+         the bar is "I'd defend this to a careful reader."</div>`)
+      + `<div class="note">arc of ${st.parsed.arc_size} gist(s); existing dedup lists:
+         ${st.parsed.existing_counts.themes} themes, ${st.parsed.existing_counts.patterns}
+         patterns, ${st.parsed.existing_counts.drift} drift</div>`;
+  }
+  const meta = st.model
+    ? `<span class="dim">${esc(st.model)} · $${(st.cost_usd || 0).toFixed(5)}</span>` : '';
+  const details = (st.prompt ? `<details><summary>exact prompt sent</summary>
+      <pre>${esc(st.prompt)}</pre></details>` : '')
+    + (st.raw_response ? `<details><summary>raw model response</summary>
+      <pre>${esc(st.raw_response)}</pre></details>` : '');
+  return `<div class="card"><div class="stagehead"><h2>${esc(st.label)}${tag}</h2>${meta}</div>
+          ${inner}${details}</div>`;
+}
+
+function render() {
+  if (!current) return;
+  renderRaw();
+  let html = current.stages.map(st => stageCard(st, '')).join('');
+  if (compare && compare.id !== current.id) {
+    html += `<div class="card"><h2>Comparison run ${esc(compare.id)}
+             <span class="dim">(${esc(compare.source)})</span></h2></div>`
+         + compare.stages.filter(s => s.name !== 'transcript')
+             .map(st => stageCard(st, ' <span class="dim">[compare]</span>')).join('');
+  }
+  $('results').innerHTML = html;
+  $('cost').textContent = `run ${current.id} · $${current.total_cost_usd} · ${current.elapsed_s}s`;
+  document.querySelectorAll('.abs').forEach(el => el.onclick = () => {
+    document.querySelectorAll('.abs').forEach(o => o.classList.remove('active'));
+    el.classList.add('active');
+    highlight(el.dataset.text, el.dataset.kind);
+  });
+}
+</script>
+</body>
+</html>
