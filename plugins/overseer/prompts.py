@@ -285,3 +285,26 @@ The overseer's compression layers (Slice 3f.5):
 Each layer drops a specific kind of thing. Retrieval is predictable
 because the layers were built for it.
 """
+
+
+# ── Mobile capture digest (step 1c.7, 2026-06-12) ────────────────
+# Phone-captured notes are the user's OWN voice (highest-value content
+# per the locked pipeline vision) but carry no session_id, so the
+# session gist path never sees them. Each complete local day of
+# captures becomes one gist via this prompt, then routes against open
+# questions like any other gist.
+
+def mobile_digest_prompt(*, day: str, n_notes: int, body: str) -> str:
+    return (
+        "You are summarizing ONE DAY of the user's own quick captures "
+        "(voice notes and typed notes from their phone) into one or two "
+        "sentences that capture THE CHANGE.\n\n"
+        "These are the user's first-person thoughts: decisions, events, "
+        "worries, wins, things they want remembered. What changed about "
+        "their standing situation across this day? Keep concrete names, "
+        "projects, and events; drop filler and pleasantries. If the "
+        "captures are purely routine with no net change, say so plainly.\n\n"
+        "Day: {day}\nCaptures: {n}\n\n{body}\n\n"
+        "Write only the one-or-two-sentence digest. No preamble. No quotes."
+        + MARKER_PRESERVATION_RULE
+    ).format(day=day, n=n_notes, body=body)

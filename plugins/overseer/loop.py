@@ -557,6 +557,22 @@ class OverseerLoop:
                 summary["errors"].append(
                     "youtube_ingest: " + str(e)[:200])
 
+        # Step 1c.7 (2026-06-12): mobile capture digest. Phone notes are
+        # sessionless (synced via the sync plugin), so the session gist
+        # path never sees them; this folds each complete local day of
+        # captures into one gist + question routing. Highest-value
+        # content per the locked pipeline vision.
+        if (self._cfg.get("loop_mobile_digest_enabled", True)
+                and not budget.exhausted()):
+            try:
+                import mobile_digest as _md
+                summary["mobile_digest"] = _md.run_mobile_digest(
+                    core=self._core, db=self._db, llm=self._llm,
+                    budget=budget, log=self._log, summary=summary)
+            except Exception as e:
+                self._log.exception("mobile digest step failed: %s", e)
+                summary["errors"].append("mobile_digest: " + str(e)[:200])
+
         # Step 1d: generate missing automation rollups (cheap, Sonnet 4.6).
         if (self._cfg.get("loop_run_rollups", True)
                 and not budget.exhausted()):
