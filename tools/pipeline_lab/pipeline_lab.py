@@ -364,7 +364,7 @@ def main():
     import argparse
     ap = argparse.ArgumentParser(description="Pipeline Lab: serve the UI, or run sessions headless.")
     ap.add_argument("--run", metavar="JSONL", help="run one session file and print the result")
-    ap.add_argument("--batch", choices=["curated", "random", "all"],
+    ap.add_argument("--batch", choices=["curated", "random", "imported", "all"],
                     help="run dataset.json sessions (build with build_dataset.py)")
     ap.add_argument("--no-pi", action="store_true", help="skip live Pi context")
     args = ap.parse_args()
@@ -386,6 +386,8 @@ def main():
                 targets += [r["path"] for r in ds["curated"]]
             if args.batch in ("random", "all"):
                 targets += [r["path"] for r in ds["random"]]
+            if args.batch in ("imported", "all"):
+                targets += [r["path"] for r in ds.get("imported", [])]
         total = 0.0
         for i, t in enumerate(targets, 1):
             print(f"\n[{i}/{len(targets)}]", end="")

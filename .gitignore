@@ -66,3 +66,4 @@ vault/**/*
 !vault/_meta/
 tools/pipeline_lab/runs/
 tools/pipeline_lab/dataset.json
+tools/pipeline_lab/imported_samples/

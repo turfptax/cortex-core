@@ -40,6 +40,10 @@ sys.path.insert(0, str(REPO / "plugins" / "overseer"))
 from claude_jsonl import parse_claude_code_jsonl  # noqa: E402
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+# Non-Claude sources (ChatGPT, Grok, ...): the Pi importers normalize them to
+# the same .jsonl shape; copy samples from the Pi's
+# plugins/overseer/data/imports/ into this dir as <source>__<id>.jsonl.
+SAMPLES_DIR = HERE / "imported_samples"
 MIN_USER_MSGS = 5
 GIANTS = ("C--dev-ttx-Cortex", "C--dev-dg-UFOSINT")
 
@@ -126,6 +130,28 @@ def main():
     randoms = rng.sample(rest, min(args.random_n, len(rest)))
     randoms.sort(key=lambda r: r["started_at"])
 
+    imported = []
+    for f in sorted(SAMPLES_DIR.glob("*.jsonl")) if SAMPLES_DIR.is_dir() else []:
+        try:
+            meta, _ = parse_claude_code_jsonl(str(f))
+        except Exception as e:
+            print(f"  skip sample {f.name}: {e}")
+            continue
+        u = int(meta.get("user_message_count") or 0)
+        a = int(meta.get("assistant_message_count") or 0)
+        imported.append({
+            "path": str(f).replace("\\", "/"),
+            "project": f.name.split("__")[0],
+            "file": f.name,
+            "size_kb": round(f.stat().st_size / 1024),
+            "started_at": meta.get("started_at") or "",
+            "duration_minutes": int(meta.get("duration_minutes") or 0),
+            "messages": int(meta.get("message_count") or 0),
+            "user_messages": u,
+            "assistant_messages": a,
+            "human_share": round(u / (u + a), 3) if (u + a) else 0.0,
+        })
+
     out = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "seed": args.seed,
@@ -134,6 +160,7 @@ def main():
         "eligible": len(eligible),
         "curated": curated,
         "random": randoms,
+        "imported": imported,
     }
     dest = HERE / "dataset.json"
     dest.write_text(json.dumps(out, indent=1), encoding="utf-8")
@@ -143,6 +170,7 @@ def main():
         print(f"  {r['duration_minutes']:>4}min {r['user_messages']:>4}u "
               f"{r['project'][:36]:<36} {r['why']}")
     print(f"\nRANDOM: {len(randoms)} sessions, seed {args.seed}")
+    print(f"IMPORTED SAMPLES: {len(imported)} (from {SAMPLES_DIR.name}/)")
 
 
 if __name__ == "__main__":

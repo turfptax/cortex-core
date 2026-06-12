@@ -167,6 +167,9 @@ async function loadContext() {
       };
       grp(`Curated (${c.dataset.curated.length})`, c.dataset.curated);
       grp(`Random sample (${c.dataset.random.length}, seed ${c.dataset.seed})`, c.dataset.random);
+      if (c.dataset.imported?.length) {
+        grp(`ChatGPT / Grok imports (${c.dataset.imported.length})`, c.dataset.imported);
+      }
     }
   } catch (e) { $('status').textContent = 'context error: ' + e; }
 }
