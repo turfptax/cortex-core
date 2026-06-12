@@ -45,15 +45,21 @@ import json
 import re
 import statistics
 
-CATEGORIES = ("human-dialogue", "human-build", "automation-checkin", "automation-batch")
+CATEGORIES = ("human-dialogue", "human-build", "human-monologue",
+              "automation-checkin", "automation-batch")
 
 # category -> (memory weight 0..1, pipeline treatment)
 TREATMENT = {
     "human-dialogue": (1.0, "gist"),
     "human-build": (0.8, "gist"),
+    "human-monologue": (1.0, "gist"),
     "automation-checkin": (0.2, "rollup"),
     "automation-batch": (0.1, "rollup-or-skip"),
 }
+
+# Sources whose sessions are captured human media by construction:
+# the user's video transcripts, voice recordings, published-video records.
+MEDIA_SOURCES = ("video-transcript", "recorder-google")
 
 # Markers that betray a scheduled / harness-driven opener.
 _SCHEDULED_RX = re.compile(
@@ -160,6 +166,19 @@ def score_categories(s: dict) -> tuple[dict, list[dict]]:
 
     genuine = s["genuine_human_messages"]
 
+    # Monologue gate (2026-06-12): zero assistant turns means no AI was in
+    # the room. This is captured human media (video transcripts, voice
+    # journals, published-content records), not a conversation; every
+    # conversation rule below would misfire (transcripts open with
+    # "[Speaker 1]" / "[chunk ...]" and have one giant human turn).
+    if s["assistant_messages"] == 0 and s["human_messages"] >= 1:
+        add("human-monologue", 0.6, "assistant_messages",
+            "no assistant turns at all: captured human media, not a chat")
+        if s["source"] in MEDIA_SOURCES or str(s["source"]).startswith("youtube"):
+            add("human-monologue", 0.3, "source",
+                "known media source (video / voice / published content)")
+        return scores, contrib
+
     if s["opened_by_scheduler"] and genuine <= 3:
         add("automation-checkin", 0.55, "opened_by_scheduler",
             "session initiated by the scheduler with little or no human follow-up")
@@ -221,6 +240,8 @@ system. The categories:
   human-dialogue     the user thinking, talking, creating, deciding
   human-build        the user directing a hands-on work session
                      (assistant runs tools, user steers)
+  human-monologue    captured human media with no AI present: video
+                     transcripts, voice journals, published content
   automation-checkin a scheduled or recurring system session
                      (check-ins, health checks, harness-driven)
   automation-batch   programmatic traffic with negligible human input
@@ -305,6 +326,17 @@ def classify_session(metadata: dict, messages: list[dict], *,
         "ambiguous": ambiguous,
         "llm": None,
     }
+
+    # Deterministic override (2026-06-12): a known media source with no
+    # assistant turns IS human media. Structural fact, full confidence.
+    if (result["category"] == "human-monologue"
+            and signals["assistant_messages"] == 0
+            and (signals["source"] in MEDIA_SOURCES
+                 or str(signals["source"]).startswith("youtube"))):
+        result["confidence"] = 0.95
+        result["method"] = "rules-deterministic"
+        result["ambiguous"] = False
+        ambiguous = False
 
     # Deterministic override (2026-06-11 audit): a session OPENED by the
     # scheduler with zero or one human-typed turn IS a check-in. Not a

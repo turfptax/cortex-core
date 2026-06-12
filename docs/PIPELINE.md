@@ -64,6 +64,7 @@ yet wired into loop.py (study-first directive).
 |---|---|---|---|
 | human-dialogue | the user thinking / talking / creating | 1.0 | gist |
 | human-build | user-directed work session, assistant executes | 0.8 | gist |
+| human-monologue | captured human media, no AI present (video transcripts, voice journals, published content) | 1.0 | gist |
 | automation-checkin | scheduled or recurring system session | 0.2 | rollup |
 | automation-batch | programmatic traffic, negligible human input | 0.1 | rollup or skip |
 
