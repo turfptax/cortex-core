@@ -77,6 +77,17 @@ is thin. Relationship to existing classifiers: orthogonal to
 session-granular refinement of Slice 3e's per-project `treat_as`
 (human/automation/ignore), whose treatment vocabulary it reuses.
 
+## Stage 1b: Mobile capture digest (LIVE, loop step 1c.7, 2026-06-12)
+
+Phone-captured notes arrive sessionless (sync plugin, source='mobile'),
+so the session gist path never sees them. Step 1c.7 folds each complete
+local day of captures into one gist (`mobile-notes:<date>`, THE CHANGE
+framing, summarize-session tier), routes it against open questions, and
+lets the embeddings backfill pick it up. High-water mark in
+overseer_state; today is always skipped so digests see whole days.
+Phone journal entries need no equivalent: the temporal narratives
+already consume human_journal_entries directly.
+
 ## Stage 1: Gist generation (one LLM call per conversation)
 
 - Code: `loop.py::_summarize_one_imported()` (imports) and
