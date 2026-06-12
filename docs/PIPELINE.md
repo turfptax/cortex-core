@@ -37,6 +37,30 @@ exceeds 30,000 chars, it keeps the first 30 and last 20 messages with a
 `[... K messages omitted ...]` marker between. This truncation is the
 first lossy decision in the pipeline and it happens BEFORE the model.
 
+## Stage 0.5 (PROPOSED, Lab-only as of 2026-06-11): session classification
+
+Before any gist work, classify each session's NATURE so mechanical
+high-volume threads stop skewing the memory system. Implemented in
+`plugins/overseer/session_classifier.py`, exposed in Pipeline Lab, NOT
+yet wired into loop.py (study-first directive).
+
+| Category | Meaning | Weight | Treatment |
+|---|---|---|---|
+| human-dialogue | the user thinking / talking / creating | 1.0 | gist |
+| human-build | user-directed work session, assistant executes | 0.8 | gist |
+| automation-checkin | scheduled or recurring system session | 0.2 | rollup |
+| automation-batch | programmatic traffic, negligible human input | 0.1 | rollup or skip |
+
+Method: deterministic signals first (human-typed turns vs tool-result
+echoes, tool-use fraction, scheduled-task markers in the opening turns,
+message-length and repetition statistics), scored by transparent additive
+rules where every point records the signal that produced it. One Flash
+call (purpose `session-classify`) breaks ties only when the rule margin
+is thin. Relationship to existing classifiers: orthogonal to
+`category_classifier.py` (topic: work/cortex/personal) and a
+session-granular refinement of Slice 3e's per-project `treat_as`
+(human/automation/ignore), whose treatment vocabulary it reuses.
+
 ## Stage 1: Gist generation (one LLM call per conversation)
 
 - Code: `loop.py::_summarize_one_imported()` (imports) and

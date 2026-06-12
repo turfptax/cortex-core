@@ -75,6 +75,10 @@ secrets_paths = [
 # for web-AI sessions (chatgpt/grok-com without cwd). 8-token output,
 # routine pattern match — Flash is exactly the right tier.
 "category-classify" = "google/gemini-2.5-flash"
+# Session NATURE classifier (session_classifier.py, proposed Stage 0.5,
+# 2026-06-11). Only called on rule-margin ambiguity; tiny JSON output.
+# Not wired into the loop yet; Pipeline Lab uses it for study.
+"session-classify"  = "google/gemini-2.5-flash"
 # Slice 14.7 (2026-05-22): router-tier chat. Flash sits in front of
 # Opus-overseer, handles routine turns with thin context, escalates
 # when the question needs the full agent. ~30x cheaper than Opus.

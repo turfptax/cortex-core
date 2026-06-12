@@ -43,6 +43,15 @@
   .pill.question{ color:var(--question);border-color:var(--question);background:#7ee78722; }
   .pill.gist    { color:var(--gist);    border-color:var(--gist);    background:#4cc2ff22; }
   .pill.meta    { color:var(--dim);     border-color:var(--border); }
+  .pill.human-dialogue     { color:#7ee787; border-color:#7ee787; background:#7ee78722; }
+  .pill.human-build        { color:#4cc2ff; border-color:#4cc2ff; background:#4cc2ff22; }
+  .pill.automation-checkin { color:#ffb454; border-color:#ffb454; background:#ffb45422; }
+  .pill.automation-batch   { color:#ff8fa3; border-color:#ff8fa3; background:#ff8fa322; }
+  table.sig { width:100%; border-collapse:collapse; font-size:12px; margin-top:8px; }
+  table.sig td { padding:3px 8px; border-top:1px solid var(--border); }
+  table.sig td:first-child { color:var(--dim); }
+  .bar { height:6px; border-radius:3px; background:var(--card2); margin:6px 0 2px; overflow:hidden; }
+  .bar > div { height:100%; background:var(--accent); }
   #raw { font:12px/1.6 Consolas, monospace; white-space:pre-wrap; max-height:75vh;
          overflow:auto; }
   #raw .ln { padding:1px 6px; border-radius:4px; }
@@ -235,6 +244,28 @@ function stageCard(st, tag) {
     inner = `<div class="dim">${s.messages_used}/${s.messages_total} messages used,
       ${s.messages_omitted} omitted (${esc(s.strategy)}), ${s.char_length} chars</div>
       <div class="note">${esc(st.note || '')}</div>`;
+  } else if (st.name === 'classify') {
+    const p = st.parsed;
+    const rows = Object.entries(p.signals).map(([k, v]) =>
+      `<tr><td>${esc(k)}</td><td>${esc(String(v))}</td></tr>`).join('');
+    const contribs = p.contributions.map(c =>
+      `<div class="rationale"><span class="pill ${c.category}">${esc(c.category)}</span>
+       +${c.points} from <b>${esc(c.signal)}</b>: ${esc(c.note)}</div>`).join('')
+      || '<div class="dim">no rule fired (fell through to default)</div>';
+    const scores = Object.entries(p.scores).map(([k, v]) =>
+      `<span class="pill ${k}">${esc(k)} ${v}</span>`).join(' ');
+    inner = `
+      <div><span class="pill ${p.category}" style="font-size:14px;padding:4px 14px">${esc(p.category)}</span>
+        <span class="pill meta">confidence ${p.confidence}</span>
+        <span class="pill meta">margin ${p.margin}</span>
+        <span class="pill meta">${esc(p.method)}</span>
+        <span class="pill meta">weight ${p.weight} -> ${esc(p.treatment)}</span></div>
+      <div class="bar"><div style="width:${Math.round(p.confidence * 100)}%"></div></div>
+      <div class="note">${p.ambiguous ? 'Rule margin was thin: LLM consulted.' : 'Rules decided alone; no LLM call needed.'}</div>
+      <details open><summary>why (per-signal contributions)</summary>${contribs}
+        <div style="margin-top:6px">${scores}</div></details>
+      <details><summary>measured signals</summary><table class="sig">${rows}</table></details>
+      ${st.parsed && p.method === 'rules+llm' ? '' : ''}`;
   } else if (st.name === 'gist') {
     inner = `<div class="gisttext abs" data-kind="gist"
         data-text="${esc(st.parsed.gist)}">${esc(st.parsed.gist) || '<span class=dim>(empty)</span>'}</div>`;

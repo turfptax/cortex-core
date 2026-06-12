@@ -57,6 +57,7 @@ from insight_scan import (  # noqa: E402
 from llm_router import LLMRouter, _get_openrouter_api_key, _load_secrets  # noqa: E402
 from prompts import import_gist_prompt  # noqa: E402
 from question_routing import build_routing_prompt, parse_routing_response  # noqa: E402
+from session_classifier import classify_session  # noqa: E402
 
 PORT = 8777
 PI_BASE = "http://10.0.0.25:8420"
@@ -153,6 +154,26 @@ def run_pipeline(body: dict) -> dict:
         "name": "transcript", "label": "Stage 0: raw -> transcript",
         "parsed": {"metadata": meta, "stats": tstats},
         "note": "Head/tail truncation here is the first lossy step and happens before any model.",
+    })
+
+    # ── Stage 0.5: session NATURE classification (proposed) ──────
+    if mode == "jsonl":
+        cls_messages = messages
+    else:
+        cls_messages = [{"role": "user", "content_text": body.get("text") or "",
+                         "has_tool_use": False}]
+    cls = classify_session(meta, cls_messages, llm=router)
+    llm_part = cls.get("llm") or {}
+    stages.append({
+        "name": "classify", "label": "Stage 0.5: session classification (proposed, Lab-only)",
+        "prompt": llm_part.get("prompt"),
+        "model": llm_part.get("model"), "cost_usd": llm_part.get("cost_usd"),
+        "raw_response": llm_part.get("raw_response"),
+        "parsed": {k: cls[k] for k in (
+            "category", "confidence", "margin", "method", "weight",
+            "treatment", "ambiguous", "scores", "signals", "contributions")},
+        "note": "Deterministic rules first; one Flash call only when the rule margin is thin. "
+                "Not wired into the production loop yet.",
     })
 
     # ── Stage 1: gist ─────────────────────────────────────────────
@@ -343,6 +364,9 @@ def cli_run_one(path: str, use_pi: bool) -> dict:
             s = p["stats"]
             print(f"  transcript: {s['messages_used']}/{s['messages_total']} messages used, "
                   f"{s['messages_omitted']} omitted ({s['strategy']})")
+        elif st["name"] == "classify":
+            print(f"  CLASS: {p['category']} ({p['confidence']:.2f} conf, "
+                  f"{p['method']}, weight {p['weight']}, -> {p['treatment']})")
         elif st["name"] == "gist":
             print(f"  GIST: {p['gist']}")
         elif st["name"] == "routing":
