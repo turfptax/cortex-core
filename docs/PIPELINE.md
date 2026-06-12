@@ -4,6 +4,22 @@ Human-readable spec of how Cortex turns raw conversations into searchable
 memory. Written 2026-06-10 alongside the pipeline-lab inspection tool
 (`tools/pipeline_lab/`). If you change the logic, change this doc.
 
+## North star (Tory, locked 2026-06-11)
+
+The pipeline exists to preserve the most valuable parts of 4+ years of AI
+conversations for FUTURE, MORE CAPABLE AIs. Three commitments follow:
+
+1. Classification comes before everything. Human thinking is high-value
+   and preserved richly; automation/monitoring traffic is radically
+   compressed ("it exists, it ran X times, did it produce anything
+   meaningful?"), with anomalies surfaced rather than buried.
+2. Each stage is a signal PURIFICATION layer, not just a summarizer:
+   progressively remove noise, increase usefulness of what remains.
+3. The raw layer stays intact; purification shapes what is served. As
+   models improve they should be able to mine old conversations for new
+   insight, which only works if automation noise is not drowning the
+   real thinking.
+
 The design principle (locked 2026-05-02, Slice 3f.5): **each layer is lossy
 on purpose, in a specific way.**
 
