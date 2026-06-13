@@ -85,7 +85,21 @@ EMBED_URL = "http://127.0.0.1:8082/embedding"
 PUSH_KINDS = {
     "human_journal_entries": ("overseer", ["text", "entry_type", "created_at"]),
     "notes": ("core", ["content", "note_type", "project", "tags", "created_at"]),
+    # Device notification capture (2026-06-12): the phone's notification
+    # stream as a passive dataset source. Lands in overseer.db; table is
+    # created on plugin load.
+    "device_notifications": ("overseer", ["app", "title", "body",
+                                          "posted_at", "created_at"]),
 }
+
+DEVICE_NOTIFICATIONS_DDL = """CREATE TABLE IF NOT EXISTS device_notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  app TEXT NOT NULL,
+  title TEXT DEFAULT '',
+  body TEXT DEFAULT '',
+  posted_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)"""
 
 
 class SyncPlugin(Plugin):
@@ -109,6 +123,12 @@ class SyncPlugin(Plugin):
             con.commit()
         finally:
             con.close()
+        ocon = self._connect(OVERSEER_DB)
+        try:
+            ocon.execute(DEVICE_NOTIFICATIONS_DDL)
+            ocon.commit()
+        finally:
+            ocon.close()
         log.info("sync plugin loaded (core=%s, overseer=%s)",
                  self._core_db_path(), OVERSEER_DB)
 
