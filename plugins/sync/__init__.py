@@ -90,6 +90,15 @@ PUSH_KINDS = {
     # created on plugin load.
     "device_notifications": ("overseer", ["app", "title", "body",
                                           "posted_at", "created_at"]),
+    # Person-notes dictated on the phone (2026-06-13): a voice note scoped
+    # to a synced contact. Lands in overseer.db person_notes. The phone
+    # sends person_id (the SERVER id it received from the overseer_people
+    # pull) + body; provenance defaults to tory-voice + created_by_agent
+    # to mobile (see _http_push). note_kind / modality optional (DB
+    # defaults apply). local_created_at: phone is authority on its own tz.
+    "person_notes": ("overseer", ["person_id", "body", "note_kind",
+                                  "modality", "provenance", "created_at",
+                                  "local_created_at", "created_by_agent"]),
 }
 
 DEVICE_NOTIFICATIONS_DDL = """CREATE TABLE IF NOT EXISTS device_notifications (
@@ -193,6 +202,11 @@ class SyncPlugin(Plugin):
                 values = {c: row.get(c) for c in cols if row.get(c) is not None}
                 if kind == "notes":
                     values.setdefault("source", "mobile")
+                if kind == "person_notes":
+                    # Phone-authored = spoken by Tory unless the row says
+                    # otherwise (his consent ruling). Stamp authorship too.
+                    values.setdefault("provenance", "tory-voice")
+                    values.setdefault("created_by_agent", "mobile")
                 if not values:
                     rejected.append({"id": uid, "reason": "no insertable columns"})
                     continue
@@ -225,6 +239,8 @@ class SyncPlugin(Plugin):
             return self._pull_gist_nature(payload)
         if kind == "gist_vectors":
             return self._pull_gist_vectors(payload)
+        if kind == "overseer_people":
+            return self._pull_contacts(payload)
         spec = PULL_KINDS.get(kind)
         if spec is None:
             return {"ok": False, "error": "unknown pull kind: {}".format(kind)}
@@ -330,6 +346,47 @@ class SyncPlugin(Plugin):
         next_cursor = "gv:{}".format(rows[-1]["gist_id"]) if rows \
             else str(payload.get("cursor") or "")
         return {"ok": True, "kind": "gist_vectors", "rows": rows,
+                "more": more, "next_cursor": next_cursor}
+
+    def _pull_contacts(self, payload):
+        """Virtual pull kind: canonical contacts (overseer_people), LIVE
+        rows only (merged/archived dupes excluded server-side). JSON cols
+        are parsed to arrays so the phone gets clean aliases/tags. Cursor
+        'person:<id>'. Phone-facing only over LAN/BLE; contacts are NOT in
+        any cloud/Gateway push (Slice 13 PII posture)."""
+        def _arr(s):
+            try:
+                return json.loads(s or "[]")
+            except Exception:
+                return []
+        last_id = self._cursor_id(payload, "person")
+        limit = self._limit(payload)
+        con = self._connect(OVERSEER_DB)
+        try:
+            raw = con.execute(
+                "SELECT id, name, display_name, aliases_json, tags_json, "
+                "notes, last_interacted_at, created_at "
+                "FROM overseer_people "
+                "WHERE merged_into_id IS NULL AND id > ? "
+                "ORDER BY id LIMIT ?",
+                (last_id, limit)).fetchall()
+            rows = []
+            for r in raw:
+                d = dict(r)
+                d["aliases"] = _arr(d.pop("aliases_json", "[]"))
+                d["tags"] = _arr(d.pop("tags_json", "[]"))
+                rows.append(d)
+            more = False
+            if rows:
+                more = con.execute(
+                    "SELECT 1 FROM overseer_people "
+                    "WHERE merged_into_id IS NULL AND id > ?",
+                    (rows[-1]["id"],)).fetchone() is not None
+        finally:
+            con.close()
+        next_cursor = "person:{}".format(rows[-1]["id"]) if rows \
+            else str(payload.get("cursor") or "")
+        return {"ok": True, "kind": "overseer_people", "rows": rows,
                 "more": more, "next_cursor": next_cursor}
 
     def _http_embed(self, payload):
