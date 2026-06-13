@@ -126,6 +126,7 @@ def _parse_people_json(row):
     row["areas_of_expertise"] = _safe_json_loads(
         row.pop("areas_of_expertise_json", "[]"), [])
     row["tags"] = _safe_json_loads(row.pop("tags_json", "[]"), [])
+    row["aliases"] = _safe_json_loads(row.pop("aliases_json", "[]"), [])
     return row
 
 
@@ -485,6 +486,13 @@ class OverseerPlugin(Plugin):
                   self._http_people_for_project),
             Route("GET",  "/people/stats",
                   self._http_people_stats),
+            # person_notes (2026-06-13 taxonomy build)
+            Route("GET",  "/people/notes",
+                  self._http_list_person_notes),
+            Route("POST", "/people/notes/add",
+                  self._http_add_person_note),
+            Route("POST", "/people/notes/delete",
+                  self._http_delete_person_note),
             # ── Slice 9.3: sibling task dispatch ─────────────────
             Route("POST", "/sibling/dispatch",
                   self._http_sibling_dispatch),
@@ -1842,6 +1850,7 @@ class OverseerPlugin(Plugin):
                     payload.get("areas_of_expertise")),
                 notes=(payload.get("notes") or "").strip(),
                 tags=_safe_list(payload.get("tags")),
+                aliases=_safe_list(payload.get("aliases")),
                 last_interacted_at=payload.get("last_interacted_at"),
                 created_by_agent=(payload.get("created_by_agent")
                                   or "manual"),
@@ -1875,6 +1884,7 @@ class OverseerPlugin(Plugin):
                 areas_of_expertise=_safe_list_or_none(
                     payload.get("areas_of_expertise")),
                 tags=_safe_list_or_none(payload.get("tags")),
+                aliases=_safe_list_or_none(payload.get("aliases")),
                 notes_append=payload.get("notes_append"),
                 notes_replace=payload.get("notes_replace"),
                 last_interacted_at=payload.get("last_interacted_at"),
@@ -1926,6 +1936,76 @@ class OverseerPlugin(Plugin):
         if person_id is None:
             return {"ok": False, "error": "id required"}
         n = self.overseer_db.delete_person(int(person_id))
+        return {"ok": True, "deleted": n}
+
+    # ── person_notes routes (2026-06-13 taxonomy build) ──────────────
+
+    def _http_list_person_notes(self, payload):
+        """GET /plugins/overseer/people/notes?person_id=N — structured
+        notes about a person, newest first, live (non-superseded) only
+        unless include_superseded is set."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        person_id = payload.get("person_id") or payload.get("id")
+        if person_id is None:
+            return {"ok": False, "error": "person_id required"}
+        include_superseded = payload.get("include_superseded") in (
+            True, "1", "true", "yes")
+        try:
+            notes = self.overseer_db.list_person_notes(
+                int(person_id),
+                include_superseded=bool(include_superseded),
+                limit=_as_int(payload, "limit", 200, max_value=500))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "person_id must be integer"}
+        return {"ok": True, "notes": notes, "count": len(notes)}
+
+    def _http_add_person_note(self, payload):
+        """POST /plugins/overseer/people/notes/add — append a structured
+        note carrying the taxonomy axes. Body: {person_id, body,
+        provenance?, modality?, note_kind?, created_by_agent?}."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        person_id = payload.get("person_id") or payload.get("id")
+        body = (payload.get("body") or "").strip()
+        if person_id is None or not body:
+            return {"ok": False, "error": "person_id + body required"}
+        try:
+            from temporal import format_local_iso as _fmt_local
+            local_created_at = _fmt_local()
+        except Exception:
+            local_created_at = None
+        try:
+            note = self.overseer_db.add_person_note(
+                int(person_id), body=body,
+                provenance=(payload.get("provenance") or "overseer"),
+                modality=(payload.get("modality") or "statement"),
+                note_kind=(payload.get("note_kind") or "context"),
+                created_by_agent=(payload.get("created_by_agent")
+                                  or "manual"),
+                created_by_session_id=(
+                    payload.get("created_by_session_id") or ""),
+                local_created_at=local_created_at)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            log.exception("add_person_note failed")
+            return {"ok": False, "error": str(e)}
+        if note is None:
+            return {"ok": False, "error": "person not found"}
+        return {"ok": True, "note": note}
+
+    def _http_delete_person_note(self, payload):
+        """POST /plugins/overseer/people/notes/delete — remove one note."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        note_id = payload.get("note_id") or payload.get("id")
+        if note_id is None:
+            return {"ok": False, "error": "note_id required"}
+        try:
+            n = self.overseer_db.delete_person_note(int(note_id))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "note_id must be integer"}
         return {"ok": True, "deleted": n}
 
     def _http_link_project_person(self, payload):

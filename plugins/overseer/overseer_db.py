@@ -824,6 +824,7 @@ CREATE TABLE IF NOT EXISTS overseer_people (
     areas_of_expertise_json TEXT NOT NULL DEFAULT '[]', -- JSON array of tags
     notes TEXT NOT NULL DEFAULT '',                -- free-form, append-mode by default
     tags_json TEXT NOT NULL DEFAULT '[]',          -- general flexible tags
+    aliases_json TEXT NOT NULL DEFAULT '[]',       -- nicknames / alternate spellings that resolve to this person (name stays the canonical key)
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     last_interacted_at TEXT,                       -- nullable; updatable by agents but no nudge driven from this
@@ -849,6 +850,30 @@ CREATE TABLE IF NOT EXISTS project_people (
 );
 CREATE INDEX IF NOT EXISTS idx_project_people_project
     ON project_people(project);
+
+-- person_notes (2026-06-13 taxonomy build): structured, queryable notes
+-- ABOUT a person, carrying the locked taxonomy axes. The free-form
+-- overseer_people.notes blob stays for back-compat; this is the channel
+-- Tory uses to add interaction history / context / preferences, and the
+-- one external AIs query along axes. Integrity pair = provenance+modality.
+CREATE TABLE IF NOT EXISTS person_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    provenance TEXT NOT NULL DEFAULT 'overseer',   -- WHO authored: tory-voice/tory-typed/overseer/ai-convo/import
+    modality TEXT NOT NULL DEFAULT 'statement',     -- claim TYPE: observation/statement/inference/hypothesis/value-judgment/external-claim/pattern
+    note_kind TEXT NOT NULL DEFAULT 'context',      -- lens-ish: context/interaction/preference/commitment/fact
+    superseded_by INTEGER,                          -- stance/supersession edge: NULL = live; else the note id that replaced this
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    local_created_at TEXT,                          -- time axis: local-with-offset per the locked tz rule
+    created_by_agent TEXT NOT NULL DEFAULT '',
+    created_by_session_id TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (person_id) REFERENCES overseer_people(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_person_notes_person
+    ON person_notes(person_id);
+CREATE INDEX IF NOT EXISTS idx_person_notes_live
+    ON person_notes(person_id, superseded_by);
 CREATE INDEX IF NOT EXISTS idx_project_people_person
     ON project_people(person_id);
 
@@ -1669,6 +1694,17 @@ class OverseerDB(CortexDB):
                 "merged_into_id INTEGER")
             self._safe_commit()
             log.info("_migrate_6_people: added merged_into_id column")
+        # 2026-06-13 taxonomy build: aliases (nicknames / alternate
+        # spellings). name stays the canonical key; aliases_json lets a
+        # nickname search/collapse onto the right person. Additive +
+        # idempotent. person_notes table itself is created by the CREATE
+        # TABLE IF NOT EXISTS in OVERSEER_SCHEMA_SQL on every open().
+        if "aliases_json" not in cols:
+            self._conn.execute(
+                "ALTER TABLE overseer_people ADD COLUMN "
+                "aliases_json TEXT NOT NULL DEFAULT '[]'")
+            self._safe_commit()
+            log.info("_migrate_6_people: added aliases_json column")
         self._migrate_8_chat_files()
 
     def _migrate_8_chat_files(self):
@@ -6004,16 +6040,18 @@ class OverseerDB(CortexDB):
             "  OR LOWER(online_handles_json) LIKE LOWER(?) "
             "  OR LOWER(areas_of_expertise_json) LIKE LOWER(?) "
             "  OR LOWER(tags_json) LIKE LOWER(?) "
+            "  OR LOWER(aliases_json) LIKE LOWER(?) "
             "  OR LOWER(notes) LIKE LOWER(?) "
             ") ORDER BY last_interacted_at DESC, updated_at DESC "
             "LIMIT ?",
-            (like, like, like, like, like, like, int(limit)),
+            (like, like, like, like, like, like, like, int(limit)),
         ).fetchall()
         return [dict(r) for r in rows]
 
     def add_person(self, *, name, display_name="", online_handles=None,
                     social_links=None, areas_of_expertise=None,
-                    notes="", tags=None, last_interacted_at=None,
+                    notes="", tags=None, aliases=None,
+                    last_interacted_at=None,
                     created_by_agent="", created_by_session_id=""):
         """Idempotent on case-insensitive name. Returns dict with
         {person, created} where `created` is True if a new row was
@@ -6030,9 +6068,9 @@ class OverseerDB(CortexDB):
         cur = self._conn.execute(
             "INSERT INTO overseer_people (name, display_name, online_handles_json, "
             " social_links_json, areas_of_expertise_json, notes, "
-            " tags_json, last_interacted_at, created_by_agent, "
+            " tags_json, aliases_json, last_interacted_at, created_by_agent, "
             " created_by_session_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 name.strip(),
                 display_name.strip() if display_name else "",
@@ -6041,6 +6079,7 @@ class OverseerDB(CortexDB):
                 json.dumps(areas_of_expertise or []),
                 notes.strip() if notes else "",
                 json.dumps(tags or []),
+                json.dumps(aliases or []),
                 last_interacted_at,
                 created_by_agent or "",
                 created_by_session_id or "",
@@ -6052,7 +6091,7 @@ class OverseerDB(CortexDB):
     def update_person(self, person_id, *, display_name=None,
                        online_handles=None, social_links=None,
                        areas_of_expertise=None, notes_append=None,
-                       notes_replace=None, tags=None,
+                       notes_replace=None, tags=None, aliases=None,
                        last_interacted_at=None):
         """Update a person row. JSON fields (handles/links/expertise/
         tags) are REPLACE-mode by default — agent passes the full
@@ -6084,6 +6123,9 @@ class OverseerDB(CortexDB):
         if tags is not None:
             sets.append("tags_json = ?")
             params.append(json.dumps(tags))
+        if aliases is not None:
+            sets.append("aliases_json = ?")
+            params.append(json.dumps(aliases))
         if last_interacted_at is not None:
             sets.append("last_interacted_at = ?")
             params.append(last_interacted_at)
@@ -6111,6 +6153,71 @@ class OverseerDB(CortexDB):
     def delete_person(self, person_id):
         cur = self._conn.execute(
             "DELETE FROM overseer_people WHERE id = ?", (int(person_id),))
+        self._safe_commit()
+        return cur.rowcount
+
+    # ── person_notes (2026-06-13 taxonomy build) ──────────────────────
+    # Structured, queryable notes ABOUT a person, each carrying the
+    # integrity pair (provenance = who authored, modality = claim type)
+    # plus a lens-ish note_kind and a supersession edge. The person's
+    # free-form `notes` blob stays for back-compat; this is the channel
+    # Tory adds context through and external AIs query along axes.
+
+    def get_person_note(self, note_id):
+        row = self._conn.execute(
+            "SELECT * FROM person_notes WHERE id = ?", (int(note_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def add_person_note(self, person_id, *, body, provenance="overseer",
+                        modality="statement", note_kind="context",
+                        created_by_agent="", created_by_session_id="",
+                        local_created_at=None):
+        """Append a structured note about a person. Returns the new note
+        dict, or None if the person doesn't exist."""
+        if not self.get_person(person_id):
+            return None
+        if not body or not body.strip():
+            raise ValueError("body required")
+        cur = self._conn.execute(
+            "INSERT INTO person_notes (person_id, body, provenance, "
+            " modality, note_kind, created_by_agent, "
+            " created_by_session_id, local_created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (int(person_id), body.strip(), provenance or "overseer",
+             modality or "statement", note_kind or "context",
+             created_by_agent or "", created_by_session_id or "",
+             local_created_at),
+        )
+        # Touch the person so last-edited ordering stays meaningful.
+        self._conn.execute(
+            "UPDATE overseer_people SET updated_at = datetime('now') "
+            "WHERE id = ?", (int(person_id),))
+        self._safe_commit()
+        return self.get_person_note(cur.lastrowid)
+
+    def list_person_notes(self, person_id, *, include_superseded=False,
+                          limit=200):
+        sql = "SELECT * FROM person_notes WHERE person_id = ? "
+        if not include_superseded:
+            sql += "AND superseded_by IS NULL "
+        sql += "ORDER BY created_at DESC LIMIT ?"
+        rows = self._conn.execute(
+            sql, (int(person_id), int(limit))).fetchall()
+        return [dict(r) for r in rows]
+
+    def supersede_person_note(self, old_note_id, new_note_id):
+        """Mark old_note as superseded by new_note (stance/supersession
+        edge). Representation-improvement keeps the old as history."""
+        self._conn.execute(
+            "UPDATE person_notes SET superseded_by = ? WHERE id = ?",
+            (int(new_note_id), int(old_note_id)))
+        self._safe_commit()
+        return self.get_person_note(old_note_id)
+
+    def delete_person_note(self, note_id):
+        cur = self._conn.execute(
+            "DELETE FROM person_notes WHERE id = ?", (int(note_id),))
         self._safe_commit()
         return cur.rowcount
 
