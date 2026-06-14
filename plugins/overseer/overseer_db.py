@@ -48,6 +48,9 @@ CREATE TABLE IF NOT EXISTS summaries_gist (
     confidence TEXT DEFAULT 'med',         -- high | med | low
     raw_pointer_id INTEGER,                -- → raw_pointers.id (nullable)
     prompt_version_id INTEGER,             -- → gist_prompts.id (Phase 1d, 2026-05-27)
+    modality TEXT,                         -- taxonomy Modality axis (integrity pair): observation|statement|inference|hypothesis|value-judgment|external-claim|pattern
+    lens TEXT,                             -- taxonomy Lens axis: comma-sep of the 6 controlled lenses, or 'none' (2026-06-13)
+    axis_processed_at TEXT,                -- when the axis reprocess stamped modality+lens (NULL = not yet); resumability marker
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (raw_pointer_id) REFERENCES raw_pointers(id),
     FOREIGN KEY (prompt_version_id) REFERENCES gist_prompts(id)
@@ -2310,6 +2313,32 @@ class OverseerDB(CortexDB):
             "  UNIQUE(mission_id, event_kind)"
             ")"
         )
+        self._safe_commit()
+        self._migrate_taxonomy_gist_axes()
+
+    def _migrate_taxonomy_gist_axes(self):
+        """Taxonomy build (2026-06-13): the Modality + Lens axes on gists.
+
+        Modality is half the integrity pair (Provenance + Modality); Lens
+        carries the 6 controlled interpretive lenses. Both are stamped by
+        scripts/taxonomy_reprocess.py reading the RAW transcript (the gist
+        body optimizes for THE CHANGE and discarded the lens signal at
+        generation time). axis_processed_at is NULL until reprocessed, so
+        the reprocessor is resumable and cost-capped over many runs.
+        Additive + idempotent ALTER TABLE for the live .25 install.
+        """
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(summaries_gist)").fetchall()}
+        for col, decl in (
+            ("modality", "TEXT"),
+            ("lens", "TEXT"),
+            ("axis_processed_at", "TEXT"),
+        ):
+            if col not in cols:
+                self._conn.execute(
+                    "ALTER TABLE summaries_gist ADD COLUMN {} {}".format(
+                        col, decl))
+                log.info("_migrate_taxonomy_gist_axes: added %s column", col)
         self._safe_commit()
 
     # ── Slice 15: mission events ─────────────────────────────────
