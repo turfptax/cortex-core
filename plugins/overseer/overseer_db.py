@@ -874,6 +874,42 @@ CREATE INDEX IF NOT EXISTS idx_person_notes_person
     ON person_notes(person_id);
 CREATE INDEX IF NOT EXISTS idx_person_notes_live
     ON person_notes(person_id, superseded_by);
+
+-- Notification classification (2026-06-13): a sidecar over the sync
+-- plugin's device_notifications, like processed_imported_sessions over
+-- imported_sessions. 3 tiers: signal (keep as corpus context), ambient
+-- (parse into a time-series), drop (device/media chatter). App-level +
+-- deterministic; no LLM. Anchor-mark via LEFT JOIN (unclassified only).
+CREATE TABLE IF NOT EXISTS notification_classification (
+    notification_id INTEGER PRIMARY KEY,
+    tier TEXT NOT NULL,                 -- signal / ambient / drop
+    category TEXT NOT NULL,             -- comms/social/interests/weather/media/device/unknown
+    app TEXT NOT NULL DEFAULT '',       -- denormalized for easy filtering
+    classified_at TEXT NOT NULL DEFAULT (datetime('now')),
+    local_classified_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_notif_class_tier
+    ON notification_classification(tier, category);
+
+-- Ambient observations (2026-06-13): structured time-series parsed OUT of
+-- ambient notifications - currently the phone weather widget ("72 deg in
+-- Lincoln"). Tory: "good for ongoing data" - a historical temp/time record
+-- at his real location. Deliberately SEPARATE from the weather plugin's
+-- forecast store: this is an OBSERVATION (provenance: phone-widget), not a
+-- forecast (provenance: a model) - the taxonomy provenance/modality split.
+CREATE TABLE IF NOT EXISTS ambient_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL DEFAULT 'temperature',
+    temp_f INTEGER,
+    location TEXT,
+    observed_at TEXT NOT NULL,          -- the notification's posted_at
+    local_observed_at TEXT,
+    source TEXT NOT NULL DEFAULT 'phone-widget',
+    raw_notification_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ambient_obs_at
+    ON ambient_observations(observed_at);
 CREATE INDEX IF NOT EXISTS idx_project_people_person
     ON project_people(person_id);
 
@@ -6220,6 +6256,66 @@ class OverseerDB(CortexDB):
             "DELETE FROM person_notes WHERE id = ?", (int(note_id),))
         self._safe_commit()
         return cur.rowcount
+
+    # ── notification classification + ambient observations (2026-06-13) ──
+
+    def unclassified_notifications(self, limit=300):
+        """device_notifications rows with no classification row yet
+        (anchor-mark via LEFT JOIN)."""
+        try:
+            rows = self._conn.execute(
+                "SELECT d.* FROM device_notifications d "
+                "LEFT JOIN notification_classification c "
+                "  ON c.notification_id = d.id "
+                "WHERE c.notification_id IS NULL "
+                "ORDER BY d.id LIMIT ?", (int(limit),)).fetchall()
+        except sqlite3.OperationalError:
+            # device_notifications may not exist on installs without the
+            # sync plugin / phone capture yet.
+            return []
+        return [dict(r) for r in rows]
+
+    def record_notification_classification(self, notification_id, tier,
+                                           category, *, app="",
+                                           local_classified_at=None):
+        self._conn.execute(
+            "INSERT OR REPLACE INTO notification_classification "
+            "(notification_id, tier, category, app, local_classified_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (int(notification_id), tier, category, app or "",
+             local_classified_at))
+        self._safe_commit()
+
+    def add_ambient_observation(self, *, temp_f, location, observed_at,
+                                local_observed_at=None, source="phone-widget",
+                                raw_notification_id=None, kind="temperature"):
+        cur = self._conn.execute(
+            "INSERT INTO ambient_observations "
+            "(kind, temp_f, location, observed_at, local_observed_at, "
+            " source, raw_notification_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (kind, temp_f, location, observed_at, local_observed_at,
+             source, raw_notification_id))
+        self._safe_commit()
+        return cur.lastrowid
+
+    def notification_tier_counts(self):
+        """{tier: count} over all classified notifications."""
+        try:
+            return {r["tier"]: r["c"] for r in self._conn.execute(
+                "SELECT tier, COUNT(*) c FROM notification_classification "
+                "GROUP BY tier")}
+        except sqlite3.OperationalError:
+            return {}
+
+    def recent_ambient(self, *, kind="temperature", limit=200):
+        try:
+            rows = self._conn.execute(
+                "SELECT * FROM ambient_observations WHERE kind = ? "
+                "ORDER BY observed_at DESC LIMIT ?",
+                (kind, int(limit))).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [dict(r) for r in rows]
 
     def merge_people(self, from_id, into_id, *, dry_run=False,
                       agent="looper"):

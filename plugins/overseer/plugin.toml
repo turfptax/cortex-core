@@ -187,6 +187,9 @@ loop_max_cost_usd_per_tick = 0.50     # cost cap unchanged — Gemma is
                                        # moves the cost dial
 loop_auto_summarize_sessions = true
 loop_auto_tag_notes = true
+# Tier captured phone notifications (signal/ambient/drop) + parse weather
+# into ambient_observations. Deterministic app-level rules, no LLM cost.
+loop_classify_notifications = true
 loop_build_working_memory = true
 loop_session_summary_max_notes = 50     # truncate per-session prompt to N notes
 loop_tag_batch_size = 10                # how many notes per tag-batch LLM call

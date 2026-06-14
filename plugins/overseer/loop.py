@@ -602,6 +602,18 @@ class OverseerLoop:
                 self._log.exception("missions step failed: %s", e)
                 summary["errors"].append("missions: " + str(e)[:200])
 
+        # Step 2c (2026-06-13): tier new device_notifications (signal /
+        # ambient / drop) + parse weather into ambient_observations.
+        # Deterministic app-level rules, no LLM/budget. Anchor-mark via
+        # the unclassified LEFT JOIN.
+        if self._cfg.get("loop_classify_notifications", True):
+            try:
+                self._classify_notifications_step(summary)
+            except Exception as e:
+                self._log.exception("notif classify step failed: %s", e)
+                summary["errors"].append(
+                    "notif_classify: " + str(e)[:200])
+
         # Step 3: working memory always rebuilds (no LLM call)
         if self._cfg.get("loop_build_working_memory", True):
             try:
@@ -2434,6 +2446,49 @@ class OverseerLoop:
         return False
 
     # ── Step 3: build working_memory artifact ────────────────────
+
+    def _classify_notifications_step(self, summary):
+        """Tier new device_notifications (signal / ambient / drop) by app,
+        deterministically. Ambient weather notifications are additionally
+        parsed into ambient_observations (a temp time-series). No LLM."""
+        import notification_classify as _nc
+        pending = self._db.unclassified_notifications(limit=500)
+        if not pending:
+            return
+        try:
+            from temporal import format_local_iso as _fmt_local
+            local_ts = _fmt_local()
+        except Exception:
+            local_ts = None
+        classified = 0
+        ambient = 0
+        for n in pending:
+            app = n.get("app") or ""
+            title = n.get("title") or ""
+            tier, category = _nc.classify(app, title, n.get("body") or "")
+            self._db.record_notification_classification(
+                n["id"], tier, category, app=app,
+                local_classified_at=local_ts)
+            classified += 1
+            if tier == "ambient" and category == "weather":
+                w = _nc.parse_weather(title)
+                if w:
+                    try:
+                        self._db.add_ambient_observation(
+                            temp_f=w["temp_f"], location=w["location"],
+                            observed_at=(n.get("posted_at")
+                                         or n.get("created_at")),
+                            local_observed_at=n.get("local_posted_at"),
+                            raw_notification_id=n["id"])
+                        ambient += 1
+                    except Exception as e:
+                        self._log.warning(
+                            "ambient obs write failed: %s", e)
+        summary["notifications_classified"] = classified
+        if ambient:
+            summary["ambient_observations"] = ambient
+        self._log.info(
+            "notif classify: %d tiered, %d weather obs", classified, ambient)
 
     def _run_missions_step(self, summary):
         """Slice 15 CP1 (2026-06-10): the trigger system the missions
