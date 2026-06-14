@@ -6880,6 +6880,87 @@ class OverseerDB(CortexDB):
             "pending_for_me": pending_for_me_n,
         }
 
+    # ── Lemon Squeezer dispatch export (2026-06-13) ─────────────────
+    # Read-only assembler: completed + rated sibling dispatches in the
+    # exact shape Lemon Squeezer's /ingest/dispatches expects (see the
+    # Swarm Board dispatch-export contract). METADATA ONLY - no prompt or
+    # response text. The desktop connector pulls this and pushes to Lemon;
+    # the cursor lives in desktop (Lemon is idempotent on dispatch_id), so
+    # Core stays stateless - no exported_at column, no ack handshake.
+
+    @staticmethod
+    def _dispatch_latency_ms(claimed_at, completed_at):
+        """A-tier wall-clock ms (completed - claimed); None if unparseable."""
+        if not claimed_at or not completed_at:
+            return None
+        import datetime as _dt
+
+        def _p(s):
+            try:
+                return _dt.datetime.fromisoformat(
+                    str(s).replace("Z", "+00:00"))
+            except Exception:
+                return None
+        a, b = _p(claimed_at), _p(completed_at)
+        if a is None or b is None:
+            return None
+        ms = int((b - a).total_seconds() * 1000)
+        return ms if ms >= 0 else None
+
+    def graded_dispatches_for_export(self, *, since_id=0, limit=500):
+        """Return graded dispatches as Lemon-shaped dicts.
+
+        task_type (the routing tag): the B/C agent name when the target
+        encodes one ('b-agent:<name>'/'c-agent:<name>'), else the free-form
+        task_type column, else the target. latency_ms: B/C agents carry an
+        exact value in b_invocation_transcripts; A-tier siblings get
+        completed_at - claimed_at. since_id trims the read once the desktop
+        connector has shipped everything up to a high-water mark.
+        """
+        rows = self._conn.execute(
+            "SELECT s.id, s.target, s.task_type, s.actual_model_used, "
+            "       s.quality_rating, s.result_cost_usd, "
+            "       s.claimed_at, s.completed_at, "
+            "       (SELECT t.latency_ms FROM b_invocation_transcripts t "
+            "        WHERE t.sibling_task_id = s.id "
+            "        ORDER BY t.id DESC LIMIT 1) AS b_latency_ms "
+            "FROM sibling_tasks s "
+            "WHERE s.status = 'completed' "
+            "  AND s.quality_rating IS NOT NULL "
+            "  AND s.actual_model_used IS NOT NULL "
+            "  AND s.actual_model_used <> '' "
+            "  AND CAST(s.id AS INTEGER) > ? "
+            "ORDER BY CAST(s.id AS INTEGER) ASC LIMIT ?",
+            (int(since_id), int(limit)),
+        ).fetchall()
+        out = []
+        for r in rows:
+            target = r["target"] or ""
+            if target.startswith("b-agent:"):
+                task_type = target[len("b-agent:"):]
+            elif target.startswith("c-agent:"):
+                task_type = target[len("c-agent:"):]
+            else:
+                task_type = (r["task_type"] or target or "").strip()
+            try:
+                rating = int(r["quality_rating"])
+            except (TypeError, ValueError):
+                continue
+            latency = r["b_latency_ms"]
+            if latency is None:
+                latency = self._dispatch_latency_ms(
+                    r["claimed_at"], r["completed_at"])
+            out.append({
+                "task_type": task_type,
+                "model": r["actual_model_used"],
+                "rating": rating,
+                "dispatch_id": str(r["id"]),
+                "cost_usd": (float(r["result_cost_usd"])
+                             if r["result_cost_usd"] is not None else None),
+                "latency_ms": latency,
+            })
+        return out
+
     # ── Slice 10 (2026-05-20): Category B agent helpers ─────────────
     # B agents are stateless callables (Sonnet calls with frozen
     # system prompts + snapshot-on-demand inputs) dispatched as tools

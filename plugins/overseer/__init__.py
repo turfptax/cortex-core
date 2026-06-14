@@ -520,6 +520,9 @@ class OverseerPlugin(Plugin):
                   self._http_runs_export),
             Route("POST", "/runs/rate",
                   self._http_runs_rate),
+            # ── Lemon Squeezer dispatch export (2026-06-13) ───────
+            Route("GET",  "/dispatch-export",
+                  self._http_dispatch_export),
             # ── Work-org (2026-05-21): targeted import processing ─
             Route("POST", "/imports/tag-machine",
                   self._http_imports_tag_machine),
@@ -2515,6 +2518,35 @@ class OverseerPlugin(Plugin):
         except Exception as e:
             log.exception("runs_export failed")
             return {"ok": False, "error": str(e)}
+
+    def _http_dispatch_export(self, payload):
+        """GET /plugins/overseer/dispatch-export?since=<id>&limit=<n>
+
+        Read-only. Returns completed + rated sibling dispatches in the exact
+        shape Lemon Squeezer's /ingest/dispatches expects (metadata only —
+        no prompt/response text). The Cortex Desktop connector pulls this,
+        POSTs to Lemon, and owns the high-water cursor; Lemon is idempotent
+        on dispatch_id, so Core stays stateless. `max_id` is returned to make
+        the desktop cursor advance trivial. See Swarm Board dispatch-export
+        contract (2026-06-13)."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        since_id = _as_int(payload, "since", 0)
+        limit = _as_int(payload, "limit", 500, max_value=2000)
+        try:
+            rows = self.overseer_db.graded_dispatches_for_export(
+                since_id=since_id, limit=limit)
+        except Exception as e:
+            log.exception("dispatch_export failed")
+            return {"ok": False, "error": str(e)}
+        max_id = since_id
+        for r in rows:
+            try:
+                max_id = max(max_id, int(r["dispatch_id"]))
+            except (TypeError, ValueError):
+                pass
+        return {"ok": True, "dispatches": rows, "count": len(rows),
+                "max_id": max_id}
 
     def _http_runs_rate(self, payload):
         """POST /plugins/overseer/runs/rate
