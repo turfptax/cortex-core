@@ -98,10 +98,13 @@ class Messenger:
     trusted: iterable of agent_ids we trust (exact or hostname-prefix). on_message
     is called for every inbound message (dict with from/fromId/message/trusted)."""
 
-    def __init__(self, trusted=None, on_message=None):
+    def __init__(self, trusted=None, on_message=None, relay=("10.0.0.195", 31415)):
         self.agent_id = stable_agent_id()
         self.trusted = set(trusted or [])
         self.on_message = on_message
+        # Relay monitor (the dashboard). Mirror every sent/received event here
+        # so the human operator sees the overseer's traffic. None disables it.
+        self.relay_addr = tuple(relay) if relay else None
         self.inbox: list[dict] = []
         self.discovered: list[dict] = []
         self.running = True
@@ -112,6 +115,22 @@ class Messenger:
         self.sock.settimeout(1.0)
         self._thread = threading.Thread(target=self._listen, daemon=True)
         self._thread.start()
+
+    def _relay(self, event: str, peer_id, peer_address: str, payload: str):
+        """Forward a sent/received/system event to the relay monitor so it
+        shows on the dashboard. Best-effort; never breaks the real path."""
+        if not self.relay_addr:
+            return
+        try:
+            pkt = json.dumps({
+                "magic": MAGIC, "type": "relay", "relay_event": event,
+                "agent_id": self.agent_id, "peer_id": peer_id or "unknown",
+                "peer_address": peer_address, "payload": payload,
+                "timestamp": _now_ms(),
+            }).encode()
+            self.sock.sendto(pkt, self.relay_addr)
+        except OSError:
+            pass
 
     def is_trusted(self, peer_id: str) -> bool:
         if peer_id in self.trusted:
@@ -160,6 +179,7 @@ class Messenger:
                     "trusted": self.is_trusted(pid),
                 }
                 self.inbox.append(rec)
+                self._relay("received", pid, paddr, payload)
                 if self.on_message:
                     try:
                         self.on_message(rec)
@@ -187,13 +207,14 @@ class Messenger:
                 out.append(d)
         return out
 
-    def send(self, ip: str, port: int, text: str):
+    def send(self, ip: str, port: int, text: str, peer_id=None):
         pkt = json.dumps({
             "magic": MAGIC, "type": "message",
             "sender_id": self.agent_id, "sender_port": PORT,
             "payload": text, "timestamp": _now_ms(),
         }).encode()
         self.sock.sendto(pkt, (ip, int(port)))
+        self._relay("sent", peer_id, f"{ip}:{int(port)}", text)
 
     def drain_inbox(self) -> list[dict]:
         msgs, self.inbox = self.inbox, []
