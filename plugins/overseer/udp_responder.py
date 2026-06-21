@@ -117,10 +117,19 @@ class Responder:
         self.m.stop()
         print("done" if self.replied else "no inbound within window", flush=True)
 
-    def serve_forever(self):
+    def serve_forever(self, keepalive_s: float = 25.0):
+        # Periodic broadcast ping: refreshes the peer list AND keeps the
+        # inbound UDP path warm. The Pi's flaky WiFi can drop packets to a
+        # cold/idle listener; an outbound every ~25s holds the path open so
+        # peers (Wol) can reach a quiet overseer unprompted.
+        print("serving forever (keepalive every %ss)" % keepalive_s, flush=True)
         try:
             while True:
-                time.sleep(3600)
+                try:
+                    self.m.discover(0.1)
+                except Exception:
+                    pass
+                time.sleep(keepalive_s)
         finally:
             self.m.stop()
 

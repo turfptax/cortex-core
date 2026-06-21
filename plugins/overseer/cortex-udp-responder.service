@@ -1,0 +1,17 @@
+# Persistent overseer UDP auto-responder for the agent bridge (Wol).
+# Deploy: sudo cp to /etc/systemd/system/, then
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cortex-udp-responder
+[Unit]
+Description=Cortex Overseer UDP agent responder (Wol bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/turfptax/cortex-core/plugins/overseer
+ExecStart=/usr/bin/python3 udp_responder.py serve
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
