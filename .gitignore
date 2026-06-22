@@ -68,3 +68,13 @@ tools/pipeline_lab/runs/
 tools/pipeline_lab/dataset.json
 tools/pipeline_lab/imported_samples/
 tools/pipeline_lab/audit_manifest.json
+tools/pipeline_lab/imports_mirror/
+
+# Local-only persona / work-scratch / phone-data (never commit; contains PII)
+PERSONA_DRAFT_*.md
+PERSONA_SYNTHESIS_*.md
+memory/WORK_MAP.md
+scripts/classify_backlog_local.py
+tools/phone_extract/
+tools/sms_lab/
+tools/pipeline_lab/backlog_sessions.json
