@@ -1895,28 +1895,20 @@ class OverseerDB(CortexDB):
             "SELECT COUNT(*) FROM sensitivity_rules"
         ).fetchone()[0]
         if existing == 0:
+            # Example placeholders only. Real per-deployment patterns (which
+            # name an employer/clients) are added via the sensitivity admin
+            # path or a gitignored local config and are never committed to the
+            # public repo. The running instance keeps its rules in the DB
+            # (this seed only fires once, when the table is empty).
             seeds = [
                 # (match_type, pattern, tier, retention, priority, note)
-                ("cwd_like", "%ProjectX%", "restricted", "no-import", 300,
-                 "ProjectX acquisition — deal IP, never import raw"),
-                ("cwd_like", "%ClientA%", "confidential", "gist-and-drop",
-                 200, "ClientA work — clinical / HIPAA-adjacent"),
-                ("cwd_like", "%/home/workuser%", "confidential",
-                 "gist-and-drop", 200, "an employer tenant work"),
-                ("cwd_like", "%workuser%", "confidential",
-                 "gist-and-drop", 180,
-                 "Work-computer user profile path"),
-                ("cwd_like", "%an employer%", "confidential",
-                 "gist-and-drop", 180, "an employer doc paths"),
-                ("cwd_like", "%exec-email%", "confidential",
-                 "gist-and-drop", 200, "COO email parsing — exec comms"),
-                # Forward-looking: healthcare-contractor orgs.
-                ("cwd_like", "%\\rhd%", "confidential", "gist-and-drop",
-                 160, "Contractor A contractor work"),
-                ("cwd_like", "%\\hhs%", "confidential", "gist-and-drop",
-                 160, "Contractor B contractor work"),
-                ("cwd_like", "%nahm%", "confidential", "gist-and-drop",
-                 160, "Contractor C contractor work"),
+                ("cwd_like", "%acquisition%", "restricted", "no-import", 300,
+                 "Example: M&A / deal-IP path, never import raw"),
+                ("cwd_like", "%client-confidential%", "confidential",
+                 "gist-and-drop", 200,
+                 "Example: confidential client / HIPAA-adjacent work"),
+                ("cwd_like", "%employer-profile%", "confidential",
+                 "gist-and-drop", 180, "Example: employer doc paths"),
             ]
             for mt, pat, tier, ret, pri, note in seeds:
                 self._conn.execute(
@@ -7956,15 +7948,11 @@ class OverseerDB(CortexDB):
         # kind ∈ {'sensitivity', 'cwd_lower_contains', 'project_lower_contains', 'source_eq'}
         ("sensitivity",         "confidential",      "work"),
         ("sensitivity",         "restricted",        "work"),
-        ("cwd_lower_contains",  "ClientA",              "work"),
-        ("cwd_lower_contains",  "workuser",      "work"),
-        ("cwd_lower_contains",  "clientb",          "work"),
-        ("cwd_lower_contains",  "employer",            "work"),
-        ("cwd_lower_contains",  "employer",           "work"),
-        ("cwd_lower_contains",  "infusion",          "work"),
-        ("cwd_lower_contains",  "ClientD",    "work"),
-        ("cwd_lower_contains",  "ProjectX",               "work"),
-        ("cwd_lower_contains",  "sidegig",            "work"),
+        # Confidential employer/client cwd patterns are intentionally NOT
+        # hardcoded in the public repo. Confidential/restricted sensitivity
+        # (the two rules above) already routes that work to 'work', and the
+        # LLM classifier is the fallback. Add real patterns via a gitignored
+        # local config if exact cwd matching is needed.
         # cortex bucket — Cortex itself + its sibling repos
         ("cwd_lower_contains",  "cortex-pet",        "cortex"),
         ("cwd_lower_contains",  "cortex-link",       "cortex"),
@@ -7988,9 +7976,6 @@ class OverseerDB(CortexDB):
         # project field also worth checking
         ("project_lower_contains", "openmuscle",     "personal"),
         ("project_lower_contains", "cortex",         "cortex"),
-        ("project_lower_contains", "ClientA",           "work"),
-        ("project_lower_contains", "ProjectX",            "work"),
-        ("project_lower_contains", "client-d", "work"),
     ]
 
     def resolve_category(self, *, cwd="", source="", project="",

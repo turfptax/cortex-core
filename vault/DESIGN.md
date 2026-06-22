@@ -138,9 +138,9 @@ render_at: 2026-05-27T04:30:00-05:00
 type: person
 name: Jane Mentor
 slug: jane-mentor
-role: father / consulting partner
-org: Jane Mentor Leadership Consulting
-expertise_tags: [leadership, consulting, political-strategy]
+role: mentor / advisor
+org: Acme Advisory
+expertise_tags: [leadership, consulting, strategy]
 first_mentioned: 2025-01-12
 mention_count: 47
 sensitivity: internal
@@ -156,7 +156,7 @@ render_at: 2026-05-27T04:30:00-05:00
 {overseer_people.body}
 
 ### Linked projects
-- [[jane-mentor-leadership-consulting]] — strategic engine role
+- [[acme-advisory-engagement]] — strategic engine role
 - ...
 
 ### Recent activity references (last 3)

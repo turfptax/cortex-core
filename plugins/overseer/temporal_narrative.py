@@ -359,8 +359,8 @@ Organize the narrative into category sections. Use these section
 markers EXACTLY:
 
   [WORK]
-  Two-three sentences naming what moved on clinical / an employer
-  / ClientA / ProjectX / regulatory / business work this week. Real numbers
+  Two-three sentences naming what moved on clinical / employer /
+  regulatory / business work this week. Real numbers
   (hours, sessions, projects). Skip the section entirely if zero
   activity.
 
@@ -782,7 +782,7 @@ FORMAT — sectioned synthesis, under 400 words total:
 Use these section markers EXACTLY when each has activity:
 
   [WORK]
-  Two-three sentences on clinical / an employer / ClientA / ProjectX /
+  Two-three sentences on clinical / employer / regulatory /
   business/regulatory work. What moved, what stalled, what shifted
   vs prior month. Skip the section entirely if zero work activity.
 
@@ -1027,8 +1027,8 @@ FORMAT — sectioned synthesis, under 500 words total:
 Use these section markers EXACTLY when each has activity:
 
   [WORK]
-  Two-three sentences on the year's arc in clinical / an employer /
-  ClientA / ProjectX / business — what stayed live across months, what
+  Two-three sentences on the year's arc in clinical / employer /
+  regulatory / business: what stayed live across months, what
   resolved, what kept showing up. Skip if zero work activity.
 
   [CORTEX]

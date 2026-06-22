@@ -1197,7 +1197,7 @@ class OverseerLoop:
 
         Filters (provide at least one):
           cwd_likes:    list of SQL LIKE patterns matched against cwd
-                        e.g. ['%ClientA%', '%workuser%']
+                        e.g. ['%client-cwd%', '%work-profile%']
           source_likes: list of SQL LIKE patterns matched against
                         source. Added Slice 14.7.2 (2026-05-26) for
                         the grok-com backfill drain — sessions

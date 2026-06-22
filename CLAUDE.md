@@ -156,9 +156,9 @@ cortex-core/
 
 ## Working style (calibration from Tory)
 
-- **Precision over speed.** Flag uncertainty rather than confabulate. The previous dossier's "a person is probably a minor" inference was wrong — that's the failure mode he doesn't want.
+- **Precision over speed.** Flag uncertainty rather than confabulate. An over-confident inference about a person in a prior draft turned out wrong; that's the failure mode he doesn't want.
 - **Honest disagreement welcome.** Push back rather than agree to avoid friction.
-- **Sensitive topics handled carefully**: personal and confidential calibration notes (redacted) (Slice 13 confidential).
+- **Sensitive topics handled carefully**: some of Tory's personal history and confidential client work must stay out of tracked/public files. Keep specifics in the gitignored identity files (memory/core/) and treat anything flagged confidential (Slice 13) with care.
 - **Format**: concise with concrete detail; tables for comparisons; real numbers preferred.
 - **Tory understates his own strengths** — calibrate when he describes his own capabilities.
 
