@@ -3007,7 +3007,7 @@ class OverseerPlugin(Plugin):
         """POST /plugins/overseer/sub-agents/set-tier
 
         Body: {agent_type: 'b'|'c', agent_name: str,
-               tier: 'flash'|'sonnet'|'opus', notes?: str}
+               tier: 'flash'|'glm'|'sonnet'|'opus', notes?: str}
 
         Changes the tier for one sub-agent. Persists across restarts.
         Next dispatch picks up the new tier.
@@ -3026,7 +3026,7 @@ class OverseerPlugin(Plugin):
             return {"ok": False, "error": "agent_name is required"}
         if not tier:
             return {"ok": False,
-                    "error": "tier is required (flash|sonnet|opus)"}
+                    "error": "tier is required (flash|glm|sonnet|opus)"}
         try:
             row = self.overseer_db.set_sub_agent_tier(
                 agent_type, agent_name, tier,

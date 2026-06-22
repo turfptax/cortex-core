@@ -5580,7 +5580,7 @@ class OverseerDB(CortexDB):
     # persist across restarts so a system reboot doesn't reset a
     # manual upgrade.
 
-    _VALID_TIERS = ("flash", "sonnet", "opus")
+    _VALID_TIERS = ("flash", "glm", "sonnet", "opus")
 
     def get_sub_agent_tier(self, agent_type, agent_name):
         """Return the row for one sub-agent. None if no row exists

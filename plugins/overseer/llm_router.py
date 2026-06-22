@@ -59,10 +59,16 @@ SECRETS_DEFAULT_CANDIDATES = (
 #   flash  ~$0.003 — Gemini 2.5 Flash (2.0-flash-001 was 404'd off
 #                    OpenRouter 2026-06-07; 2.5-flash is the successor,
 #                    a few× the old cost but still ~40× cheaper than Opus)
+#   glm    ~$0.01  — Z.ai GLM-5.2 (open-weights). Leading open model on the
+#                    Artificial Analysis index (51); ~Opus-4.8-class on coding
+#                    + agentic/tool-use (SWE-bench Pro 62.1 > GPT-5.5, MCP-Atlas
+#                    77.0) at ~1/6 the price ($1.40/$4.40 per 1M in/out). A
+#                    strong mid-tier between flash and sonnet/opus. (2026-06-21)
 #   sonnet ~$0.02  — Claude Sonnet 4.6
 #   opus   ~$0.10  — Claude Opus 4.7
 SUB_AGENT_TIER_TO_MODEL = {
     "flash":  "google/gemini-2.5-flash",
+    "glm":    "z-ai/glm-5.2",
     "sonnet": "anthropic/claude-sonnet-4.6",
     "opus":   "anthropic/claude-opus-4.7",
 }
