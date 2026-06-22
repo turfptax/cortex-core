@@ -24,17 +24,40 @@ import re
 
 # (tier, category) per app package id.
 APP_TIERS = {
-    # comms (signal)
+    # comms (signal) — interpersonal: messages, mail, calls, meetings
     "com.google.android.apps.messaging": ("signal", "comms"),    # SMS
     "com.microsoft.office.outlook":      ("signal", "comms"),     # email
     "com.google.android.gm":             ("signal", "comms"),     # gmail
     "com.google.android.dialer":         ("signal", "comms"),     # calls
+    "com.android.server.telecom":        ("signal", "comms"),     # call events
+    "com.microsoft.teams":               ("signal", "comms"),
+    "org.telegram.messenger":            ("signal", "comms"),
+    "com.whatsapp":                      ("signal", "comms"),
+    "com.facebook.orca":                 ("signal", "comms"),     # Messenger
+    "us.zoom.videomeetings":             ("signal", "comms"),
+    "com.google.android.calendar":       ("signal", "comms"),     # invites/events
+    "com.google.android.apps.tycho":     ("signal", "comms"),     # Google Fi
     # social (signal)
     "com.reddit.frontpage":              ("signal", "social"),
     "com.twitter.android":               ("signal", "social"),
     "com.discord":                       ("signal", "social"),
     "com.google.android.youtube":        ("signal", "social"),
     "com.zhiliaoapp.musically":          ("signal", "social"),    # tiktok
+    # ai (signal) — assistant apps Tory uses
+    "com.anthropic.claude":              ("signal", "ai"),
+    "ai.x.grok":                         ("signal", "ai"),
+    # health (signal) — wearables + digital wellbeing
+    "com.fitbit.FitbitMobile":           ("signal", "health"),
+    "com.google.android.apps.wellbeing": ("signal", "health"),
+    # commerce (signal) — orders + money
+    "com.amazon.mShop.android.shopping": ("signal", "commerce"),
+    "com.squareup.cash":                 ("signal", "commerce"),
+    # travel / media (signal)
+    "com.google.android.apps.maps":      ("signal", "travel"),
+    "com.google.android.apps.photos":    ("signal", "media"),
+    "com.google.android.apps.recorder":  ("signal", "media"),
+    # ambient (parsed time-series)
+    "com.google.android.apps.weather":   ("ambient", "weather"),  # Google Weather app
     # drop (device / media chatter)
     "com.microsoft.appmanager":          ("drop", "device"),      # Phone Link
     "com.audible.application":           ("drop", "media"),
@@ -42,6 +65,9 @@ APP_TIERS = {
     "com.google.android.deskclock":      ("drop", "device"),
     "com.google.android.projection.gearhead": ("drop", "device"),  # Android Auto
     "com.google.android.apps.wear.companion": ("drop", "device"),
+    "com.android.settings":              ("drop", "device"),
+    "com.google.android.odad":           ("drop", "device"),      # Google system app
+    "com.oculus.twilight":               ("drop", "device"),      # Quest companion
 }
 
 # Unknown apps default to SIGNAL/unknown — keep + flag for review rather
@@ -76,11 +102,12 @@ def classify(app: str, title: str = "", body: str = ""):
     body = body or ""
 
     # Google search app = weather widget + Discover/Assistant. Only the
-    # parseable temp readings are ambient; the rest is review-later signal.
+    # parseable temp readings are ambient; the rest is the Discover news
+    # feed (sports, headlines, "Today in <city>") -> news.
     if app == "com.google.android.googlequicksearchbox":
         if parse_weather(title):
             return ("ambient", "weather")
-        return ("signal", "unknown")
+        return ("signal", "news")
 
     # Google Messages foreground-service blip is not a real text.
     if app == "com.google.android.apps.messaging":
