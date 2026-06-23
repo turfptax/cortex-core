@@ -38,4 +38,4 @@ synthesis covering the project's arc, recent decisions, and open threads.>
 - [[q011-flexgrid-v3-spine-vs-cover-story]] — confidence: med
 
 ### Linked people
-- [[tory-hayes]] — collaborator on EMG sensor selection
+- [[alex-rivera]] — collaborator on sensor selection

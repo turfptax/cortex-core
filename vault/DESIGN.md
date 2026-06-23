@@ -128,7 +128,7 @@ render_at: 2026-05-27T04:30:00-05:00
 - [[q006-can-external-ais-read-the-corpus]] (confidence: high)
 
 ### Linked people
-- [[tory-hayes]] — collaborator on EMG sensor selection
+- [[alex-rivera]] — collaborator on sensor selection
 ```
 
 ### Person (`vault/abstractions/people/<slug>.md`)
