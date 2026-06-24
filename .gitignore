@@ -78,3 +78,8 @@ scripts/classify_backlog_local.py
 tools/phone_extract/
 tools/sms_lab/
 tools/pipeline_lab/backlog_sessions.json
+
+# OSS segmentation (2026-06-23): ship the example config, never the real local one
+!plugins/overseer/data/cortex.example.toml
+cortex.local.toml
+*.local.toml

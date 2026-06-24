@@ -1,0 +1,40 @@
+# Cortex local instance config -- EXAMPLE / TEMPLATE.
+#
+# Copy to ~/.cortex/cortex.local.toml and fill in YOUR values.
+# The .example file is committed (generic); cortex.local.toml is gitignored and
+# must NEVER be committed -- it holds your real, possibly-confidential patterns.
+#
+# Ships fail-CLOSED: with no [[sensitivity]] rules, imports gist-and-drop
+# (structural signal only, never raw content). Add your own rules to keep raw.
+
+[instance]
+# owner_name = "Your Name"        # used in prompts; blank => "the user"
+host = "127.0.0.1"
+# pi_user = "you"
+# pi_host = "10.0.0.x"
+# lmstudio_url = "http://127.0.0.1:1234/v1"
+
+[git_ingest]
+repos = []                        # e.g. ["youruser/your-repo"]
+youtube_channels = []             # e.g. ["handle:CHANNEL_ID:project-tag"]
+
+[tiers]
+# Highest sensitivity tier allowed to leave the machine (sync / export / vault).
+off_box_max = "internal"          # public | internal | confidential | restricted
+
+# --- Sensitivity rules (cwd-pattern -> tier). Uncomment + add YOUR paths. ---
+# Promotes matching working dirs so confidential work is gisted-and-dropped
+# (or never imported), never stored raw. NO rules => everything gist-and-drops.
+# [[sensitivity]]
+# match = "cwd_like"
+# pattern = "%your-confidential-client%"
+# tier = "confidential"           # public | internal | confidential | restricted
+# retention = "gist-and-drop"     # gist-and-drop | no-import
+# priority = 200
+# note = "example: a confidential client / HIPAA-adjacent path"
+
+# --- Category rules (classify sessions by cwd/project). Add YOUR projects. ---
+# [[category]]
+# kind = "cwd_lower_contains"     # cwd_lower_contains | project_lower_contains | sensitivity | source_eq
+# pattern = "your-project"
+# category = "personal"           # work | cortex | personal
