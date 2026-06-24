@@ -1,5 +1,11 @@
 # Cortex Core — AI Agent Guide
 
+> **THIS FILE IS COMMITTED AND PUBLIC.** Never put real personal data, client or
+> employer names, secrets, or private-life details in this file or any tracked
+> file. All instance-specific values live in gitignored config (see `SECURITY.md`
+> and the gitignored `memory/core/*.md`). When you need real context, read those
+> gitignored files; do not bake their contents into tracked code or docs.
+
 If you're an AI agent starting work in this repo, read this first.
 
 ## What this repo is
