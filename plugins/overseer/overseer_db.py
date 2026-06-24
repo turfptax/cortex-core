@@ -1895,21 +1895,37 @@ class OverseerDB(CortexDB):
             "SELECT COUNT(*) FROM sensitivity_rules"
         ).fetchone()[0]
         if existing == 0:
-            # Example placeholders only. Real per-deployment patterns (which
-            # name an employer/clients) are added via the sensitivity admin
-            # path or a gitignored local config and are never committed to the
-            # public repo. The running instance keeps its rules in the DB
-            # (this seed only fires once, when the table is empty).
-            seeds = [
-                # (match_type, pattern, tier, retention, priority, note)
-                ("cwd_like", "%acquisition%", "restricted", "no-import", 300,
-                 "Example: M&A / deal-IP path, never import raw"),
-                ("cwd_like", "%client-confidential%", "confidential",
-                 "gist-and-drop", 200,
-                 "Example: confidential client / HIPAA-adjacent work"),
-                ("cwd_like", "%employer-profile%", "confidential",
-                 "gist-and-drop", 180, "Example: employer doc paths"),
-            ]
+            # Real per-deployment rules load from the gitignored local config
+            # (config_loader.sensitivity_seeds()); the public repo ships only
+            # generic, fail-CLOSED placeholders. Seeds once, when empty.
+            try:
+                from . import config_loader as _cl
+            except Exception:
+                try:
+                    import config_loader as _cl
+                except Exception:
+                    _cl = None
+            seeds = []
+            if _cl is not None:
+                for r in _cl.sensitivity_seeds():
+                    if not r.get("pattern"):
+                        continue
+                    seeds.append((
+                        r.get("match", "cwd_like"), r["pattern"],
+                        r.get("tier", "confidential"),
+                        r.get("retention", "gist-and-drop"),
+                        int(r.get("priority", 100)), r.get("note", ""),
+                    ))
+            if not seeds:
+                # Generic fail-closed example placeholders (no real names).
+                seeds = [
+                    ("cwd_like", "%acquisition%", "restricted", "no-import", 300,
+                     "Example: M&A / deal-IP path, never import raw"),
+                    ("cwd_like", "%client-confidential%", "confidential",
+                     "gist-and-drop", 200, "Example: confidential client work"),
+                    ("cwd_like", "%employer-profile%", "confidential",
+                     "gist-and-drop", 180, "Example: employer doc paths"),
+                ]
             for mt, pat, tier, ret, pri, note in seeds:
                 self._conn.execute(
                     "INSERT INTO sensitivity_rules "
@@ -1918,8 +1934,7 @@ class OverseerDB(CortexDB):
                     (mt, pat, tier, ret, pri, note),
                 )
             self._safe_commit()
-            log.info("_migrate_13_sensitivity: seeded %d rules",
-                     len(seeds))
+            log.info("_migrate_13_sensitivity: seeded %d rules", len(seeds))
         self._migrate_14_7_router_columns()
 
     def _migrate_14_7_router_columns(self):
@@ -7948,35 +7963,30 @@ class OverseerDB(CortexDB):
         # kind ∈ {'sensitivity', 'cwd_lower_contains', 'project_lower_contains', 'source_eq'}
         ("sensitivity",         "confidential",      "work"),
         ("sensitivity",         "restricted",        "work"),
-        # Confidential employer/client cwd patterns are intentionally NOT
-        # hardcoded in the public repo. Confidential/restricted sensitivity
-        # (the two rules above) already routes that work to 'work', and the
-        # LLM classifier is the fallback. Add real patterns via a gitignored
-        # local config if exact cwd matching is needed.
-        # cortex bucket — Cortex itself + its sibling repos
-        ("cwd_lower_contains",  "cortex-pet",        "cortex"),
-        ("cwd_lower_contains",  "cortex-link",       "cortex"),
-        ("cwd_lower_contains",  "cortex-mcp",        "cortex"),
-        ("cwd_lower_contains",  "cortex-desktop",    "cortex"),
-        ("cwd_lower_contains",  "cortex-core",       "cortex"),
-        ("cwd_lower_contains",  "cortex",            "cortex"),
-        # personal — Tory's own ventures and exploration projects
-        ("cwd_lower_contains",  "openmuscle",        "personal"),
-        ("cwd_lower_contains",  "open-muscle",       "personal"),
-        ("cwd_lower_contains",  "flexgrid",          "personal"),
-        ("cwd_lower_contains",  "truthsea",          "personal"),
-        ("cwd_lower_contains",  "uap-gerb",          "personal"),
-        ("cwd_lower_contains",  "uap_gerb",          "personal"),
-        ("cwd_lower_contains",  "ufosint",           "personal"),
-        ("cwd_lower_contains",  "polymarket",        "personal"),
-        ("cwd_lower_contains",  "monofonic",         "personal"),
-        ("cwd_lower_contains",  "smallcode",         "personal"),
-        ("cwd_lower_contains",  "godisgood",         "personal"),
-        ("cwd_lower_contains",  "lemon",             "personal"),
-        # project field also worth checking
-        ("project_lower_contains", "openmuscle",     "personal"),
-        ("project_lower_contains", "cortex",         "cortex"),
+        # Generic fallback ONLY. Real instance rules -- the employer/client
+        # cwd patterns AND the owner's own project names (cortex/personal) --
+        # load from the gitignored local config via config_loader.category_rules()
+        # (see _effective_category_rules). With no local config, only
+        # sensitivity-tagged work is categorized; everything else is
+        # 'unclassified' and falls through to the LLM classifier.
     ]
+
+    def _effective_category_rules(self):
+        """The gitignored local config's category rules if present (real
+        instance + project patterns), else the generic in-code fallback."""
+        try:
+            from . import config_loader as _cl
+        except Exception:
+            try:
+                import config_loader as _cl
+            except Exception:
+                _cl = None
+        if _cl is not None:
+            rules = _cl.category_rules()
+            if rules:
+                return [(r.get("kind"), r.get("pattern"), r.get("category"))
+                        for r in rules]
+        return self._CATEGORY_RULES
 
     def resolve_category(self, *, cwd="", source="", project="",
                           sensitivity="") -> dict:
@@ -7993,7 +8003,7 @@ class OverseerDB(CortexDB):
         cwd_l = (cwd or "").lower()
         proj_l = (project or "").lower()
         sens = (sensitivity or "").lower()
-        for kind, pattern, cat in self._CATEGORY_RULES:
+        for kind, pattern, cat in self._effective_category_rules():
             hit = False
             if kind == "sensitivity":
                 hit = (sens == pattern)
