@@ -1,0 +1,17 @@
+# Cortex leak-prevention guardrails.
+# Install:  pip install pre-commit && pre-commit install
+# The personal-data guardrail pulls your real confidential names from
+# ~/.cortex/cortex.local.toml [linter].deny_names (gitignored), so no real
+# names live in this repo. Without that config it runs in pattern-only mode.
+repos:
+  - repo: local
+    hooks:
+      - id: cortex-guardrail
+        name: cortex personal-data + secret guardrail
+        entry: python scripts/check_no_personal_data.py
+        language: system
+        pass_filenames: true
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks

@@ -1,0 +1,20 @@
+name: guardrails
+
+on: [push, pull_request]
+
+# Public CI runs PATTERN-mode only: the personal-data linter finds no real names
+# here because ~/.cortex/cortex.local.toml does not exist on the runner. The
+# name-aware pass runs in a private mirror (see the privacy policy), never here.
+jobs:
+  leak-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Personal-data + secret guardrail (pattern mode)
+        run: python3 scripts/check_no_personal_data.py $(git ls-files)
+      - name: gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
