@@ -207,7 +207,6 @@ class SyncPlugin(Plugin):
             return {"ok": False, "error": "rows must be a list"}
 
         accepted, dupes, rejected, ids = 0, 0, [], {}
-        touched_chats = set()
         map_con = self._connect(self._sync_db_path)
         tgt_con = self._connect(self._target_db(which))
         try:
@@ -254,21 +253,56 @@ class SyncPlugin(Plugin):
                 map_con.commit()
                 ids[uid] = remote_id
                 accepted += 1
-                if kind == "voice_chat_turns" and values.get("chat_id"):
-                    touched_chats.add(str(values["chat_id"]))
-            # Voice transcripts: fold the accepted turns into gist-able
-            # sessions while the overseer connection is open.
-            for chat_id in touched_chats:
-                try:
-                    self._assemble_voice_session(tgt_con, chat_id)
-                except Exception as e:
-                    log.warning("voice session assembly failed for %s: %s",
-                                chat_id, e)
+                # Voice-created projects reach the core as time entries; make
+                # sure the project row exists so the tag resolves everywhere
+                # (Hub, MCP, credit math). Stub is cheap and idempotent.
+                if kind == "time_entries" and values.get("project_tag"):
+                    try:
+                        self._ensure_project_stub(
+                            tgt_con, str(values["project_tag"]))
+                    except Exception as e:
+                        log.warning("project stub for %s failed: %s",
+                                    values.get("project_tag"), e)
+            # Voice transcripts: reconciliation sweep (2026-07-02 review).
+            # Assemble EVERY chat, not just the ones this push touched: an
+            # assembly that failed on a prior push never retries otherwise,
+            # because the phone marks rows synced on the ack and the retry
+            # push is all-dupes. Unchanged chats short-circuit on file_hash.
+            if kind == "voice_chat_turns":
+                chat_rows = tgt_con.execute(
+                    "SELECT DISTINCT chat_id FROM voice_chat_turns").fetchall()
+                for r in chat_rows:
+                    cid = str(r["chat_id"])
+                    try:
+                        self._assemble_voice_session(tgt_con, cid)
+                    except Exception as e:
+                        log.warning("voice session assembly failed for %s: %s",
+                                    cid, e)
         finally:
             map_con.close()
             tgt_con.close()
         return {"ok": True, "kind": kind, "accepted": accepted,
                 "dupes": dupes, "rejected": rejected, "ids": ids}
+
+    @staticmethod
+    def _ensure_project_stub(core_con, tag):
+        """Create a minimal project row for a tag the phone logs time on but
+        the core has never seen (voice-created projects live phone-side only;
+        this makes them materialize here the moment work lands on them)."""
+        tag = tag.strip()
+        if not tag:
+            return
+        hit = core_con.execute(
+            "SELECT 1 FROM projects WHERE tag = ?", (tag,)).fetchone()
+        if hit:
+            return
+        name = tag.replace("-", " ").replace("_", " ").title()
+        core_con.execute(
+            "INSERT INTO projects (tag, name, status, description) "
+            "VALUES (?,?, 'active', 'Auto-created from a mobile time entry')",
+            (tag, name))
+        core_con.commit()
+        log.info("auto-created project stub %s from mobile time entry", tag)
 
     def _assemble_voice_session(self, ocon, chat_id):
         """Rebuild one voice chat as a Claude-Code-shaped .jsonl + an
@@ -300,13 +334,16 @@ class SyncPlugin(Plugin):
                 "message": {"role": t["role"], "content": t["content"]},
             }, ensure_ascii=False))
         blob = ("\n".join(lines) + "\n").encode("utf-8")
-        dest.write_bytes(blob)
         digest = hashlib.sha256(blob).hexdigest()
 
         imp_id = "mobile-voice:{}".format(chat_id)
         prev = ocon.execute(
             "SELECT file_hash FROM imported_sessions WHERE id = ?",
             (imp_id,)).fetchone()
+        # Reconciliation-sweep fast path: nothing changed, nothing to do.
+        if prev is not None and prev["file_hash"] == digest and dest.exists():
+            return
+        dest.write_bytes(blob)
         user_n = sum(1 for t in turns if t["role"] == "user")
         asst_n = sum(1 for t in turns if t["role"] == "assistant")
         started = str(turns[0]["created_at"] or "").replace(" ", "T")
@@ -457,8 +494,10 @@ class SyncPlugin(Plugin):
         """Virtual pull kind: canonical contacts (overseer_people), LIVE
         rows only (merged/archived dupes excluded server-side). JSON cols
         are parsed to arrays so the phone gets clean aliases/tags. Cursor
-        'person:<id>'. Phone-facing only over LAN/BLE; contacts are NOT in
-        any cloud/Gateway push (Slice 13 PII posture)."""
+        'person:<id>'. Phone-facing over the DIRECT Pi LAN transport only:
+        contacts are NOT in any cloud/Gateway kind, and the BLE bridge
+        terminates at the Gateway, so it never carries them either (Slice 13
+        PII posture; there is deliberately no off-LAN fallback)."""
         def _arr(s):
             try:
                 return json.loads(s or "[]")
