@@ -99,6 +99,13 @@ PUSH_KINDS = {
     "person_notes": ("overseer", ["person_id", "body", "note_kind",
                                   "modality", "provenance", "created_at",
                                   "local_created_at", "created_by_agent"]),
+    # Voice-assistant transcripts (2026-07-02): the phone's Voice tab pushes
+    # each conversation turn as an insert-only row. After accepting rows,
+    # _http_push assembles the touched chats into imported_sessions (.jsonl
+    # in the overseer's imports dir, source='mobile-voice') so the loop
+    # gists them like any AI session.
+    "voice_chat_turns": ("overseer", ["chat_id", "chat_title", "role",
+                                      "content", "model", "created_at"]),
 }
 
 DEVICE_NOTIFICATIONS_DDL = """CREATE TABLE IF NOT EXISTS device_notifications (
@@ -107,6 +114,16 @@ DEVICE_NOTIFICATIONS_DDL = """CREATE TABLE IF NOT EXISTS device_notifications (
   title TEXT DEFAULT '',
   body TEXT DEFAULT '',
   posted_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)"""
+
+VOICE_CHAT_TURNS_DDL = """CREATE TABLE IF NOT EXISTS voice_chat_turns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id TEXT NOT NULL,
+  chat_title TEXT DEFAULT '',
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  model TEXT DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 )"""
 
@@ -135,6 +152,10 @@ class SyncPlugin(Plugin):
         ocon = self._connect(OVERSEER_DB)
         try:
             ocon.execute(DEVICE_NOTIFICATIONS_DDL)
+            ocon.execute(VOICE_CHAT_TURNS_DDL)
+            ocon.execute(
+                "CREATE INDEX IF NOT EXISTS idx_voice_turns_chat "
+                "ON voice_chat_turns(chat_id)")
             ocon.commit()
         finally:
             ocon.close()
@@ -181,6 +202,7 @@ class SyncPlugin(Plugin):
             return {"ok": False, "error": "rows must be a list"}
 
         accepted, dupes, rejected, ids = 0, 0, [], {}
+        touched_chats = set()
         map_con = self._connect(self._sync_db_path)
         tgt_con = self._connect(self._target_db(which))
         try:
@@ -227,11 +249,89 @@ class SyncPlugin(Plugin):
                 map_con.commit()
                 ids[uid] = remote_id
                 accepted += 1
+                if kind == "voice_chat_turns" and values.get("chat_id"):
+                    touched_chats.add(str(values["chat_id"]))
+            # Voice transcripts: fold the accepted turns into gist-able
+            # sessions while the overseer connection is open.
+            for chat_id in touched_chats:
+                try:
+                    self._assemble_voice_session(tgt_con, chat_id)
+                except Exception as e:
+                    log.warning("voice session assembly failed for %s: %s",
+                                chat_id, e)
         finally:
             map_con.close()
             tgt_con.close()
         return {"ok": True, "kind": kind, "accepted": accepted,
                 "dupes": dupes, "rejected": rejected, "ids": ids}
+
+    def _assemble_voice_session(self, ocon, chat_id):
+        """Rebuild one voice chat as a Claude-Code-shaped .jsonl + an
+        imported_sessions row so the overseer loop gists it like any AI
+        session. Re-pushes that grow an already-gisted chat clear its
+        processed mark so the next tick re-gists the fuller transcript.
+        """
+        import hashlib
+
+        turns = ocon.execute(
+            "SELECT chat_title, role, content, model, created_at "
+            "FROM voice_chat_turns WHERE chat_id = ? ORDER BY created_at, id",
+            (chat_id,)).fetchall()
+        if not turns:
+            return
+        title = next((t["chat_title"] for t in turns if t["chat_title"]), "")
+        models = sorted({t["model"] for t in turns if t["model"]})
+
+        imports_dir = OVERSEER_DB.parent / "imports" / "mobile-voice"
+        imports_dir.mkdir(parents=True, exist_ok=True)
+        dest = imports_dir / "{}.jsonl".format(chat_id)
+        lines = []
+        for t in turns:
+            ts = str(t["created_at"] or "").replace(" ", "T")
+            lines.append(json.dumps({
+                "type": t["role"],
+                "sessionId": chat_id,
+                "timestamp": ts,
+                "message": {"role": t["role"], "content": t["content"]},
+            }, ensure_ascii=False))
+        blob = ("\n".join(lines) + "\n").encode("utf-8")
+        dest.write_bytes(blob)
+        digest = hashlib.sha256(blob).hexdigest()
+
+        imp_id = "mobile-voice:{}".format(chat_id)
+        prev = ocon.execute(
+            "SELECT file_hash FROM imported_sessions WHERE id = ?",
+            (imp_id,)).fetchone()
+        user_n = sum(1 for t in turns if t["role"] == "user")
+        asst_n = sum(1 for t in turns if t["role"] == "assistant")
+        started = str(turns[0]["created_at"] or "").replace(" ", "T")
+        ended = str(turns[-1]["created_at"] or "").replace(" ", "T")
+        meta = json.dumps({"title": title, "models": models,
+                           "origin": "cortex-mobile voice tab"})
+        if prev is None:
+            ocon.execute(
+                "INSERT INTO imported_sessions (id, source, source_path, "
+                "project, started_at, ended_at, message_count, "
+                "user_message_count, assistant_message_count, bytes_size, "
+                "file_hash, metadata_json, sensitivity) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (imp_id, "mobile-voice", str(dest), "mobile-voice",
+                 started, ended, len(turns), user_n, asst_n, len(blob),
+                 digest, meta, "internal"))
+        elif prev["file_hash"] != digest:
+            ocon.execute(
+                "UPDATE imported_sessions SET source_path = ?, ended_at = ?, "
+                "message_count = ?, user_message_count = ?, "
+                "assistant_message_count = ?, bytes_size = ?, file_hash = ?, "
+                "metadata_json = ? WHERE id = ?",
+                (str(dest), ended, len(turns), user_n, asst_n, len(blob),
+                 digest, meta, imp_id))
+            # The transcript grew after gisting: clear the processed mark so
+            # the loop re-gists the fuller conversation.
+            ocon.execute(
+                "DELETE FROM processed_imported_sessions WHERE imported_id = ?",
+                (imp_id,))
+        ocon.commit()
 
     def _http_pull(self, payload):
         kind = str(payload.get("kind") or "")
