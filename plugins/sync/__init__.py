@@ -106,6 +106,11 @@ PUSH_KINDS = {
     # gists them like any AI session.
     "voice_chat_turns": ("overseer", ["chat_id", "chat_title", "role",
                                       "content", "model", "created_at"]),
+    # Work-log entries (2026-07-02): the phone voice assistant's log_time
+    # tool. Lands in the core time_entries table (columns match 1:1).
+    "time_entries": ("core", ["project_tag", "org_tag", "activity_type",
+                              "description", "started_at",
+                              "duration_minutes", "created_at"]),
 }
 
 DEVICE_NOTIFICATIONS_DDL = """CREATE TABLE IF NOT EXISTS device_notifications (
@@ -222,7 +227,7 @@ class SyncPlugin(Plugin):
                     ids[uid] = hit["remote_id"]
                     continue
                 values = {c: row.get(c) for c in cols if row.get(c) is not None}
-                if kind == "notes":
+                if kind in ("notes", "time_entries"):
                     values.setdefault("source", "mobile")
                 if kind == "person_notes":
                     # Phone-authored = spoken by Tory unless the row says
