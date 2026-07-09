@@ -894,6 +894,25 @@ CREATE TABLE IF NOT EXISTS notification_classification (
 CREATE INDEX IF NOT EXISTS idx_notif_class_tier
     ON notification_classification(tier, category);
 
+-- The CLEAN query surface for notification data (2026-07-09): per local
+-- day, per app, per tier/category, with drop-tier rows (device chatter +
+-- duplicates) already excluded. Downstream consumers (working memory,
+-- Hub views, the D20 life-pulse layer) read THIS, never the raw table.
+-- A view stays correct by construction; no rebuild step can go stale.
+CREATE VIEW IF NOT EXISTS notification_day_rollups AS
+SELECT COALESCE(substr(d.local_posted_at, 1, 10),
+                date(d.posted_at, 'localtime')) AS day,
+       d.app,
+       c.tier,
+       c.category,
+       COUNT(*)          AS n,
+       MIN(d.posted_at)  AS first_at,
+       MAX(d.posted_at)  AS last_at
+FROM device_notifications d
+JOIN notification_classification c ON c.notification_id = d.id
+WHERE c.tier != 'drop'
+GROUP BY day, d.app, c.tier, c.category;
+
 -- Ambient observations (2026-06-13): structured time-series parsed OUT of
 -- ambient notifications - currently the phone weather widget ("72 deg in
 -- Lincoln"). Tory: "good for ongoing data" - a historical temp/time record
@@ -6342,6 +6361,66 @@ class OverseerDB(CortexDB):
                 "GROUP BY tier")}
         except sqlite3.OperationalError:
             return {}
+
+    def notification_is_recent_duplicate(self, row_id, app, title, body,
+                                         posted_at, *, window_hours=24):
+        """True when an identical (app, title, body) notification was
+        already posted within the last `window_hours`. Media controls,
+        Phone Link heartbeats, and persistent notifications re-post the
+        same content dozens of times a day; the repeats carry no new
+        information. First occurrence stays signal, repeats get tiered
+        drop/duplicate (2026-07-09 cleaning pass). id breaks same-second
+        ties so exactly one of an identical pair survives."""
+        try:
+            row = self._conn.execute(
+                "SELECT 1 FROM device_notifications "
+                "WHERE app = ? AND title = ? AND body = ? "
+                "  AND (posted_at < ? OR (posted_at = ? AND id < ?)) "
+                "  AND posted_at >= datetime(?, ?) "
+                "LIMIT 1",
+                (app or "", title or "", body or "", posted_at, posted_at,
+                 int(row_id), posted_at,
+                 "-{} hours".format(int(window_hours)))).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        return row is not None
+
+    def backfill_notification_duplicates(self, *, window_hours=24):
+        """Full, idempotent recompute of duplicate marks over ALL
+        classified notifications. For each row (posted_at order): if an
+        identical row precedes it inside the window it becomes
+        drop/duplicate; otherwise a row previously marked duplicate is
+        restored to its rule-based tier. Deterministic; safe to re-run.
+        Returns {'marked': n, 'restored': m}."""
+        import notification_classify as _nc
+        marked = restored = 0
+        rows = self._conn.execute(
+            "SELECT d.id, d.app, d.title, d.body, d.posted_at, "
+            "       c.tier, c.category "
+            "FROM device_notifications d "
+            "JOIN notification_classification c "
+            "  ON c.notification_id = d.id "
+            "ORDER BY d.posted_at, d.id").fetchall()
+        for r in rows:
+            is_dup = self.notification_is_recent_duplicate(
+                r["id"], r["app"], r["title"], r["body"], r["posted_at"],
+                window_hours=window_hours)
+            if is_dup and r["category"] != "duplicate":
+                self._conn.execute(
+                    "UPDATE notification_classification "
+                    "SET tier = 'drop', category = 'duplicate' "
+                    "WHERE notification_id = ?", (r["id"],))
+                marked += 1
+            elif not is_dup and r["category"] == "duplicate":
+                tier, category = _nc.classify(
+                    r["app"], r["title"] or "", r["body"] or "")
+                self._conn.execute(
+                    "UPDATE notification_classification "
+                    "SET tier = ?, category = ? WHERE notification_id = ?",
+                    (tier, category, r["id"]))
+                restored += 1
+        self._safe_commit()
+        return {"marked": marked, "restored": restored}
 
     def recent_ambient(self, *, kind="temperature", limit=200):
         try:

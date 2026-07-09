@@ -2462,10 +2462,21 @@ class OverseerLoop:
             local_ts = None
         classified = 0
         ambient = 0
+        dupes = 0
         for n in pending:
             app = n.get("app") or ""
             title = n.get("title") or ""
-            tier, category = _nc.classify(app, title, n.get("body") or "")
+            # Exact repeats within 24h (media controls, persistent
+            # notifications re-posting) carry no new information: the
+            # first occurrence keeps its rule tier, repeats become
+            # drop/duplicate (2026-07-09 cleaning pass).
+            if self._db.notification_is_recent_duplicate(
+                    n["id"], app, title, n.get("body") or "",
+                    n.get("posted_at") or n.get("created_at") or ""):
+                tier, category = "drop", "duplicate"
+                dupes += 1
+            else:
+                tier, category = _nc.classify(app, title, n.get("body") or "")
             self._db.record_notification_classification(
                 n["id"], tier, category, app=app,
                 local_classified_at=local_ts)
@@ -2487,8 +2498,11 @@ class OverseerLoop:
         summary["notifications_classified"] = classified
         if ambient:
             summary["ambient_observations"] = ambient
+        if dupes:
+            summary["notification_duplicates"] = dupes
         self._log.info(
-            "notif classify: %d tiered, %d weather obs", classified, ambient)
+            "notif classify: %d tiered (%d duplicates), %d weather obs",
+            classified, dupes, ambient)
 
     def _run_missions_step(self, summary):
         """Slice 15 CP1 (2026-06-10): the trigger system the missions
