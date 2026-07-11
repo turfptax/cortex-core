@@ -111,6 +111,16 @@ PUSH_KINDS = {
     "time_entries": ("core", ["project_tag", "org_tag", "activity_type",
                               "description", "started_at",
                               "duration_minutes", "created_at"]),
+    # Bell answers from the phone (2026-07-10): responses to overseer
+    # notification action buttons. Same shape the Hub's respond route
+    # writes; the overseer picks them up via its existing
+    # list_pending_notification_responses tool. A post-accept hook in
+    # _http_push archives/dismisses the notification, mirroring the
+    # Hub's also_archive default.
+    "notification_responses": ("overseer", ["notification_id",
+                                            "action_kind", "action_label",
+                                            "response_payload_json",
+                                            "taken_at"]),
 }
 
 DEVICE_NOTIFICATIONS_DDL = """CREATE TABLE IF NOT EXISTS device_notifications (
@@ -263,6 +273,23 @@ class SyncPlugin(Plugin):
                     except Exception as e:
                         log.warning("project stub for %s failed: %s",
                                     values.get("project_tag"), e)
+                # Bell answers: settle the notification the same way the
+                # Hub's respond route does (dismiss for a plain dismiss,
+                # archive for a real answer) so it leaves every surface.
+                if kind == "notification_responses" \
+                        and values.get("notification_id"):
+                    try:
+                        col = ("dismissed_at"
+                               if values.get("action_kind") == "dismiss"
+                               else "archived_at")
+                        tgt_con.execute(
+                            "UPDATE notifications SET {} = datetime('now') "
+                            "WHERE id = ? AND {} IS NULL".format(col, col),
+                            (int(values["notification_id"]),))
+                        tgt_con.commit()
+                    except Exception as e:
+                        log.warning("bell settle for %s failed: %s",
+                                    values.get("notification_id"), e)
             # Voice transcripts: reconciliation sweep (2026-07-02 review).
             # Assemble EVERY chat, not just the ones this push touched: an
             # assembly that failed on a prior push never retries otherwise,
@@ -383,6 +410,8 @@ class SyncPlugin(Plugin):
             return self._pull_gist_vectors(payload)
         if kind == "overseer_people":
             return self._pull_contacts(payload)
+        if kind == "bell_notifications":
+            return self._pull_bell(payload)
         spec = PULL_KINDS.get(kind)
         if spec is None:
             return {"ok": False, "error": "unknown pull kind: {}".format(kind)}
@@ -532,6 +561,38 @@ class SyncPlugin(Plugin):
             else str(payload.get("cursor") or "")
         return {"ok": True, "kind": "overseer_people", "rows": rows,
                 "more": more, "next_cursor": next_cursor}
+
+    def _pull_bell(self, payload):
+        """Virtual pull kind (2026-07-10): the phone-worthy Bell set as a
+        SNAPSHOT, not a cursor feed. Notifications are mutable (dismissed
+        or archived on the Hub, auto-resolved by rules), so the insert-only
+        cursor contract cannot represent them; the phone wipes its local
+        copy and re-inserts each pull. Server-side filter keeps the payload
+        the ANSWERABLE set: undismissed, unarchived, unsnoozed rows that
+        either carry action buttons or are warn/important severity. The
+        mission_proposal info flood stays off the phone by design. Pi-only
+        posture: bodies can quote corpus content verbatim."""
+        limit = self._limit(payload, default=25, cap=50)
+        con = self._connect(OVERSEER_DB)
+        try:
+            raw = con.execute(
+                "SELECT id, severity, title, body, rule_name, "
+                "       actions_json, created_at "
+                "FROM notifications "
+                "WHERE dismissed_at IS NULL AND archived_at IS NULL "
+                "  AND (snoozed_until IS NULL "
+                "       OR snoozed_until <= datetime('now')) "
+                "  AND (COALESCE(actions_json, '[]') != '[]' "
+                "       OR severity IN ('warn', 'important')) "
+                "ORDER BY created_at DESC LIMIT ?",
+                (limit,)).fetchall()
+            rows = [dict(r) for r in raw]
+        finally:
+            con.close()
+        # Snapshot semantics: no cursor movement, never more pages.
+        return {"ok": True, "kind": "bell_notifications", "rows": rows,
+                "more": False,
+                "next_cursor": str(payload.get("cursor") or "")}
 
     def _http_embed(self, payload):
         """Embed query text via the local llama-embed service so the phone
