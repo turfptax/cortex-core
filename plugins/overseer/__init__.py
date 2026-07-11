@@ -406,6 +406,17 @@ class OverseerPlugin(Plugin):
             Route("GET",  "/chat/prompts",          self._http_chat_prompts),
             Route("POST", "/chat/prompts/upsert",   self._http_chat_prompt_upsert),
             Route("POST", "/chat/prompts/delete",   self._http_chat_prompt_delete),
+            # ── Agent harness (2026-07-11): harness map ──────────
+            Route("GET",  "/harness-map",           self._http_harness_map),
+            # ── Agent harness: interaction meta-feedback ─────────
+            Route("GET",  "/feedback",              self._http_feedback_list),
+            Route("POST", "/feedback",              self._http_feedback_add),
+            Route("POST", "/feedback/discuss",      self._http_feedback_discuss),
+            # ── Agent harness: MCP connectors (Pi as MCP client) ─
+            Route("GET",  "/mcp/connectors",        self._http_mcp_connectors),
+            Route("POST", "/mcp/connectors/upsert", self._http_mcp_connector_upsert),
+            Route("POST", "/mcp/connectors/delete", self._http_mcp_connector_delete),
+            Route("POST", "/mcp/connectors/test",   self._http_mcp_connector_test),
             # ── Slice 3e: notifications ─────────────────────────
             Route("GET",  "/notifications",         self._http_notifications),
             Route("POST", "/notifications/dismiss", self._http_notifications_dismiss),
@@ -4554,6 +4565,235 @@ class OverseerPlugin(Plugin):
         if not self.overseer_db.delete_chat_prompt(pid):
             return {"ok": False, "error": f"no such prompt: {pid}"}
         return {"ok": True, "deleted": pid}
+
+    # ── Agent harness (2026-07-11): harness map ──────────────────
+
+    def _http_harness_map(self, payload):
+        """GET /plugins/overseer/harness-map — the single succinct
+        map of every screen/feature. Updated with every feature."""
+        import chat_tools as _ct
+        text = _ct.read_harness_map()
+        if not text:
+            return {"ok": False, "error": "HARNESS_MAP.md not found"}
+        return {"ok": True, "map": text}
+
+    # ── Agent harness (2026-07-11): interaction meta-feedback ────
+    # Note-first by design (Tory: lightweight; "Discuss with
+    # Overseer" is the SECONDARY option). Discuss threads MUST carry
+    # the full context of what was rated (context injection rule).
+
+    FEEDBACK_KINDS = ("chat_turn", "chat_thread", "voice_chat",
+                      "bell_notification", "dispatch", "screen")
+
+    def _http_feedback_list(self, payload):
+        """GET /plugins/overseer/feedback?limit=N&target_kind="""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        limit = _as_int(payload, "limit", 50, max_value=500)
+        kind = (payload.get("target_kind") or "").strip() or None
+        return {"ok": True,
+                "feedback": self.overseer_db.list_interaction_feedback(
+                    limit=max(1, limit), target_kind=kind)}
+
+    def _http_feedback_add(self, payload):
+        """POST /plugins/overseer/feedback
+        {target_kind, target_id?, rating?, note?, context?, source?}
+        rating in (-1, 0, 1); note-only rows use rating 0."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        kind = (payload.get("target_kind") or "").strip()
+        if kind not in self.FEEDBACK_KINDS:
+            return {"ok": False,
+                    "error": "target_kind must be one of: "
+                             + ", ".join(self.FEEDBACK_KINDS)}
+        rating = _as_int(payload, "rating", 0)
+        if rating not in (-1, 0, 1):
+            return {"ok": False, "error": "rating must be -1, 0 or 1"}
+        note = payload.get("note") or ""
+        if not isinstance(note, str):
+            return {"ok": False, "error": "'note' must be a string"}
+        if rating == 0 and not note.strip():
+            return {"ok": False,
+                    "error": "give a rating, a note, or both"}
+        context = payload.get("context")
+        if context is not None and not isinstance(context, dict):
+            return {"ok": False, "error": "'context' must be an object"}
+        source = payload.get("source") or "hub"
+        if not isinstance(source, str):
+            source = "hub"
+        fid = self.overseer_db.add_interaction_feedback(
+            target_kind=kind,
+            target_id=str(payload.get("target_id") or ""),
+            rating=rating,
+            note=note,
+            context=context,
+            source=source)
+        return {"ok": True, "id": fid}
+
+    def _http_feedback_discuss(self, payload):
+        """POST /plugins/overseer/feedback/discuss  {feedback_id}
+
+        The SECONDARY escalation: opens (or re-opens) a chat thread
+        seeded with the full context of the rated interaction, per
+        Tory's context-injection rule. Returns thread_id; the client
+        navigates to chat."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        fid = _as_int(payload, "feedback_id", 0)
+        if not fid:
+            return {"ok": False, "error": "missing 'feedback_id'"}
+        fb = self.overseer_db.get_interaction_feedback(fid)
+        if not fb:
+            return {"ok": False, "error": f"no such feedback: {fid}"}
+
+        # Idempotent re-open: if a discuss thread already exists,
+        # select it instead of minting another. If /chat/clear wiped
+        # it, re-seed the context so the reopened thread is never
+        # context-less (the context-injection rule is hard).
+        context_block = self._feedback_context_block(fb)
+        if fb.get("meta_thread_id"):
+            if self.overseer_db.select_chat_thread(
+                    fb["meta_thread_id"]):
+                if self.overseer_db.chat_message_count(
+                        fb["meta_thread_id"]) == 0:
+                    self.overseer_db.append_chat_message(
+                        role="system", content=context_block,
+                        backend="feedback-discuss",
+                        thread_id=fb["meta_thread_id"])
+                return {"ok": True, "thread_id": fb["meta_thread_id"],
+                        "reopened": True}
+
+        title = "Feedback: " + (
+            (fb.get("note") or "").strip().split("\n")[0][:40]
+            or f"{fb['target_kind']} #{fb['target_id']}")
+        tid = self.overseer_db.create_chat_thread(title)
+        self.overseer_db.append_chat_message(
+            role="system", content=context_block,
+            backend="feedback-discuss", thread_id=tid)
+        if not self.overseer_db.set_feedback_thread(fid, tid):
+            # Lost a concurrent-discuss race: another request already
+            # linked a thread. Drop ours and join the winner's.
+            winner = self.overseer_db.get_interaction_feedback(fid)
+            winner_tid = (winner or {}).get("meta_thread_id")
+            if winner_tid and winner_tid != tid:
+                self.overseer_db.delete_chat_thread(tid)
+                self.overseer_db.select_chat_thread(winner_tid)
+                return {"ok": True, "thread_id": winner_tid,
+                        "reopened": True}
+        return {"ok": True, "thread_id": tid, "reopened": False}
+
+    def _feedback_context_block(self, fb) -> str:
+        """Context injection for a discuss thread: everything the
+        overseer needs to know what Tory was looking at and what he
+        said about it. Includes the rated exchange for chat turns."""
+        rating_word = {1: "GOOD (thumbs up)",
+                       -1: "BAD (thumbs down)"}.get(
+            fb.get("rating") or 0, "note only (no rating)")
+        lines = [
+            "**[Meta-feedback discussion]**",
+            "",
+            "Tory left feedback on an AI interaction and chose to "
+            "discuss it with you. Be direct about what went wrong or "
+            "right and what to change; this feeds Cortex development. "
+            "Call get_harness_map if you need to place the surface he "
+            "was using.",
+            "",
+            f"- Target: {fb.get('target_kind')} #{fb.get('target_id')}",
+            f"- Rating: {rating_word}",
+            f"- Source: {fb.get('source')} at {fb.get('created_at')}",
+        ]
+        note = (fb.get("note") or "").strip()
+        if note:
+            lines += ["", "His note:", "> " + note.replace("\n", "\n> ")]
+        ctx = _safe_json_loads(fb.get("context_json"), {})
+        if ctx:
+            lines += ["", "Screen context (from the client):",
+                      "```json",
+                      json.dumps(ctx, indent=2, default=str)[:2000],
+                      "```"]
+        # For chat turns, inject the rated exchange itself.
+        if fb.get("target_kind") == "chat_turn":
+            try:
+                row = self.overseer_db._conn.execute(
+                    "SELECT * FROM chat_messages WHERE id = ?",
+                    (int(fb.get("target_id") or 0),)).fetchone()
+            except (TypeError, ValueError):
+                row = None
+            if row:
+                row = dict(row)
+                user_row = self.overseer_db._conn.execute(
+                    "SELECT content FROM chat_messages "
+                    "WHERE role = 'user' AND thread_id = ? AND id < ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (row.get("thread_id") or 0, row["id"])).fetchone()
+                lines += ["", "The rated exchange:"]
+                if user_row:
+                    lines += ["", "USER:",
+                              (user_row["content"] or "")[:1500]]
+                lines += ["", f"ASSISTANT ({row.get('model') or '?'}, "
+                              f"answered_by={row.get('answered_by') or '?'}):",
+                          (row.get("content") or "")[:2500]]
+        return "\n".join(lines)
+
+    # ── Agent harness (2026-07-11): MCP connectors ───────────────
+
+    def _http_mcp_connectors(self, payload):
+        """GET /plugins/overseer/mcp/connectors — auth values are
+        never echoed back, only whether one is set."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        rows = self.overseer_db.list_mcp_connectors()
+        for r in rows:
+            r["has_auth"] = bool(r.pop("auth_header", ""))
+        return {"ok": True, "connectors": rows}
+
+    def _http_mcp_connector_upsert(self, payload):
+        """POST /plugins/overseer/mcp/connectors/upsert
+        {name, base_url, auth_header?, enabled?}"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        import mcp_client as _mcp
+        name = payload.get("name") or ""
+        base_url = payload.get("base_url") or ""
+        if not isinstance(name, str) or not isinstance(base_url, str):
+            return {"ok": False,
+                    "error": "'name' and 'base_url' must be strings"}
+        if not _mcp.validate_slug(name):
+            return {"ok": False,
+                    "error": "name must be a short slug: "
+                             "[a-z0-9][a-z0-9-]{0,31}"}
+        if not base_url.strip().startswith(("http://", "https://")):
+            return {"ok": False,
+                    "error": "base_url must be http(s)"}
+        # Absent key = PRESERVE the stored secret (the list route
+        # masks it, so a UI edit can't round-trip it); '' = clear.
+        auth = payload.get("auth_header", None)
+        if auth is not None and not isinstance(auth, str):
+            return {"ok": False,
+                    "error": "'auth_header' must be a string"}
+        cid = self.overseer_db.upsert_mcp_connector(
+            name=name, base_url=base_url, auth_header=auth,
+            enabled=bool(payload.get("enabled", True)))
+        return {"ok": True, "id": cid,
+                "name": name.strip().lower()}
+
+    def _http_mcp_connector_delete(self, payload):
+        """POST /plugins/overseer/mcp/connectors/delete  {name}"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        name = payload.get("name") or ""
+        if not self.overseer_db.delete_mcp_connector(name):
+            return {"ok": False, "error": f"no such connector: {name}"}
+        return {"ok": True, "deleted": name}
+
+    def _http_mcp_connector_test(self, payload):
+        """POST /plugins/overseer/mcp/connectors/test  {name} —
+        forces a fresh handshake + tools/list."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        import mcp_client as _mcp
+        return _mcp.test_connector(self.overseer_db,
+                                   payload.get("name") or "")
 
     def _http_notifications(self, payload):
         """GET /plugins/overseer/notifications

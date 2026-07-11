@@ -180,6 +180,16 @@ ssh turfptax@10.0.0.25 "sudo mv /tmp/*.py /home/turfptax/cortex-core/src/ && sud
 
 Plugin updates: replace `src/` with `plugins/overseer/`.
 
+## Harness map (update with every feature)
+
+`memory/HARNESS_MAP.md` is the single succinct map of every screen and
+feature across the whole harness (Hub, phone, Pi). The overseer reads
+it via the `get_harness_map` chat tool and `GET /plugins/overseer/harness-map`,
+and it grounds "Discuss with Overseer" escalations from any surface.
+**When you ship a user-facing feature in ANY Cortex repo, update this
+file and redeploy it to the Pi.** Keep entries to 1-2 lines; no
+personal data (this repo is public).
+
 ## Git hygiene
 
 - Always stage explicit files. Don't `git add -A` from the repo root.

@@ -45,8 +45,27 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 log = logging.getLogger("plugin.overseer.chat_tools")
+
+# Agent harness (2026-07-11): the single succinct map of every screen
+# and feature. Lives at the repo root so it is tracked + deployed with
+# the code; served via the get_harness_map tool and the /harness-map
+# route, and injected into Discuss-with-Overseer thread seeds.
+HARNESS_MAP_PATH = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..",
+    "memory", "HARNESS_MAP.md"))
+
+
+def read_harness_map() -> str:
+    try:
+        with open(HARNESS_MAP_PATH, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        log.warning("harness map unreadable at %s: %s",
+                    HARNESS_MAP_PATH, e)
+        return ""
 
 
 # ── Tool definitions (OpenAI function-calling schema) ────────────
@@ -1350,6 +1369,54 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
+    # ── Agent harness (2026-07-11): self-development tools ─────────
+    {
+        "type": "function",
+        "function": {
+            "name": "get_harness_map",
+            "description": (
+                "The single succinct map of every screen and feature "
+                "in the Cortex harness (Hub pages, phone screens, Pi "
+                "subsystems). Call this when Tory references a screen "
+                "or feature you need to place, and ALWAYS when a "
+                "conversation was escalated from another surface via "
+                "'Discuss with Overseer' and you need to understand "
+                "what he was looking at."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_recent_feedback",
+            "description": (
+                "Tory's meta-feedback on AI interactions: ratings "
+                "(+1/-1), notes, and what they targeted (chat turns, "
+                "voice chats, Bell conversations, dispatches). This is "
+                "YOUR report card - read it when discussing how an "
+                "interaction went, when he asks what feedback he has "
+                "given, or when reflecting on your own performance."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max rows, default 20.",
+                    },
+                    "target_kind": {
+                        "type": "string",
+                        "description": (
+                            "Optional filter: chat_turn | chat_thread "
+                            "| voice_chat | bell_notification | "
+                            "dispatch | screen"
+                        ),
+                    },
+                },
+            },
+        },
+    },
 ]
 
 # ── Slice 10 (2026-05-20): Category B agent tools ────────────────
@@ -1393,7 +1460,8 @@ def _row_to_dict(row) -> dict:
 
 
 def dispatch_tool(name: str, args: dict, *, db, core_memory,
-                  sibling_daily_cap: int = 20, llm=None) -> str:
+                  sibling_daily_cap: int = 20, llm=None,
+                  allow_mcp: bool = False) -> str:
     """Execute a tool call. Returns a JSON-serialized result string
     bounded to MAX_TOOL_RESULT_CHARS. Errors are returned as JSON
     `{"error": "..."}` so the model can react rather than crash.
@@ -1406,7 +1474,8 @@ def dispatch_tool(name: str, args: dict, *, db, core_memory,
     tool only — other tools work without it."""
     try:
         result = _dispatch(name, args or {}, db=db, core_memory=core_memory,
-                           sibling_daily_cap=sibling_daily_cap, llm=llm)
+                           sibling_daily_cap=sibling_daily_cap, llm=llm,
+                           allow_mcp=allow_mcp)
         text = json.dumps(result, default=str, ensure_ascii=False)
         return _truncate(text)
     except Exception as e:
@@ -1415,7 +1484,44 @@ def dispatch_tool(name: str, args: dict, *, db, core_memory,
 
 
 def _dispatch(name: str, args: dict, *, db, core_memory,
-              sibling_daily_cap: int = 20, llm=None):
+              sibling_daily_cap: int = 20, llm=None,
+              allow_mcp: bool = False):
+    # ── Agent harness (2026-07-11): external MCP connector tools ──
+    # mcp_<connector>_<tool> names route to the Pi's MCP client
+    # (Option B: the overseer is the single brain; connectors just
+    # extend its toolbelt). call_tool never raises. Gated: only the
+    # chat loop that ADVERTISED the MCP tools may execute them - a
+    # journal/loop model hallucinating an mcp_ name gets an error,
+    # not a network call.
+    if name.startswith("mcp_"):
+        if not allow_mcp:
+            return {"error": "external MCP tools are not available "
+                             "in this context"}
+        try:
+            import mcp_client
+        except Exception as e:
+            return {"error": f"mcp_client unavailable: {e}"[:200]}
+        return mcp_client.call_tool(db, name, args or {})
+
+    # ── Agent harness (2026-07-11): self-development tools ────────
+    if name == "get_harness_map":
+        text = read_harness_map()
+        if not text:
+            return {"error": "HARNESS_MAP.md not found on this install"}
+        return {"map": text}
+
+    if name == "get_recent_feedback":
+        limit = max(1, min(100, int(args.get("limit", 20))))
+        kind = (args.get("target_kind") or "").strip() or None
+        rows = db.list_interaction_feedback(limit=limit,
+                                            target_kind=kind)
+        # Trim context blobs; the note + rating are the signal.
+        for r in rows:
+            ctx = r.pop("context_json", "")
+            if ctx and ctx != "{}":
+                r["context_excerpt"] = ctx[:300]
+        return {"feedback": rows, "count": len(rows)}
+
     # ── Slice 10: Category B agent dispatch ──────────────────────
     # Any tool name starting with 'dispatch_b_' routes to the B-agent
     # dispatcher. Distinguished from dispatch_sibling (A) by the

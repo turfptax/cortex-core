@@ -460,6 +460,41 @@ CREATE TABLE IF NOT EXISTS chat_prompts (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- ─ Agent harness (2026-07-11): interaction meta-feedback ───────
+-- Tory's directive: every human-AI interaction can carry a rating +
+-- note. Note-first, lightweight; meta_thread_id links an OPTIONAL
+-- "Discuss with Overseer" chat thread seeded with the interaction's
+-- context (context injection is mandatory for discuss threads).
+-- Feeds Squeeze/Lemon-style development of the overseer itself.
+
+CREATE TABLE IF NOT EXISTS interaction_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_kind TEXT NOT NULL,                -- chat_turn | chat_thread | voice_chat | bell_notification | dispatch | screen
+    target_id TEXT NOT NULL DEFAULT '',       -- id in the target's own table (TEXT to allow uuids)
+    rating INTEGER NOT NULL DEFAULT 0,        -- +1 good / -1 bad / 0 note-only
+    note TEXT NOT NULL DEFAULT '',
+    context_json TEXT NOT NULL DEFAULT '{}',  -- screen/feature context snapshot from the client
+    meta_thread_id INTEGER,                   -- chat_threads.id when discussed
+    source TEXT NOT NULL DEFAULT 'hub',       -- hub | phone
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_target
+    ON interaction_feedback(target_kind, target_id);
+
+-- ─ Agent harness (2026-07-11): MCP connectors (Option B) ───────
+-- The Pi is the MCP client: registered HTTP MCP servers contribute
+-- tools to the overseer's own chat tool loop as
+-- mcp_<connector>_<tool>. The overseer stays the single brain.
+
+CREATE TABLE IF NOT EXISTS mcp_connectors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,                -- short slug, used in tool names
+    base_url TEXT NOT NULL,                   -- streamable-HTTP MCP endpoint
+    auth_header TEXT NOT NULL DEFAULT '',     -- full Authorization header value ('' = none)
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- ─ Slice 3e: notifications ─────────────────────────────────────
 -- Append-only per locked design. dismissed_at = hidden in UI but
 -- still queryable. UNIQUE(rule_name, rule_key) prevents the rules
@@ -4750,6 +4785,106 @@ class OverseerDB(CortexDB):
     def delete_chat_prompt(self, prompt_id):
         cur = self._conn.execute(
             "DELETE FROM chat_prompts WHERE id = ?", (int(prompt_id),))
+        self._safe_commit()
+        return cur.rowcount > 0
+
+    # ── Agent harness (2026-07-11): interaction feedback ────────
+
+    def add_interaction_feedback(self, *, target_kind, target_id="",
+                                 rating=0, note="", context=None,
+                                 source="hub"):
+        # A hard string-slice would truncate mid-JSON and the discuss
+        # seed would then silently drop the screen context. Fall back
+        # to a minimal valid object instead.
+        ctx_json = json.dumps(context or {}, ensure_ascii=False,
+                              default=str)
+        if len(ctx_json) > 8000:
+            ctx_json = json.dumps({
+                "truncated": True,
+                "screen": str((context or {}).get("screen", ""))[:200],
+            })
+        cur = self._conn.execute(
+            "INSERT INTO interaction_feedback (target_kind, target_id, "
+            "rating, note, context_json, source) VALUES (?,?,?,?,?,?)",
+            (target_kind, str(target_id or ""), int(rating),
+             (note or "").strip()[:4000],
+             ctx_json,
+             str(source or "hub")[:20]))
+        self._safe_commit()
+        return cur.lastrowid
+
+    def get_interaction_feedback(self, fid):
+        row = self._conn.execute(
+            "SELECT * FROM interaction_feedback WHERE id = ?",
+            (int(fid),)).fetchone()
+        return dict(row) if row else None
+
+    def list_interaction_feedback(self, limit=50, target_kind=None):
+        if target_kind:
+            rows = self._conn.execute(
+                "SELECT * FROM interaction_feedback "
+                "WHERE target_kind = ? ORDER BY id DESC LIMIT ?",
+                (target_kind, int(limit))).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM interaction_feedback "
+                "ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_feedback_thread(self, fid, thread_id):
+        """Links the discuss thread. Conditional on meta_thread_id
+        still being NULL so two concurrent discuss clicks can't both
+        claim it; the loser sees rowcount 0 and cleans up its thread."""
+        cur = self._conn.execute(
+            "UPDATE interaction_feedback SET meta_thread_id = ? "
+            "WHERE id = ? AND meta_thread_id IS NULL",
+            (int(thread_id), int(fid)))
+        self._safe_commit()
+        return cur.rowcount > 0
+
+    # ── Agent harness (2026-07-11): MCP connectors ──────────────
+
+    def list_mcp_connectors(self, enabled_only=False):
+        q = "SELECT * FROM mcp_connectors"
+        if enabled_only:
+            q += " WHERE enabled = 1"
+        rows = self._conn.execute(q + " ORDER BY name").fetchall()
+        return [dict(r) for r in rows]
+
+    def upsert_mcp_connector(self, *, name, base_url, auth_header=None,
+                             enabled=True):
+        """auth_header semantics: None = PRESERVE the stored secret
+        (the list route masks it, so clients cannot round-trip it);
+        '' = explicitly clear; any other string = replace."""
+        name = (name or "").strip().lower()
+        if auth_header is None:
+            self._conn.execute(
+                "INSERT INTO mcp_connectors (name, base_url, "
+                "auth_header, enabled) VALUES (?,?,'',?) "
+                "ON CONFLICT(name) DO UPDATE SET "
+                "base_url=excluded.base_url, "
+                "enabled=excluded.enabled",
+                (name, (base_url or "").strip(), 1 if enabled else 0))
+        else:
+            self._conn.execute(
+                "INSERT INTO mcp_connectors (name, base_url, "
+                "auth_header, enabled) VALUES (?,?,?,?) "
+                "ON CONFLICT(name) DO UPDATE SET "
+                "base_url=excluded.base_url, "
+                "auth_header=excluded.auth_header, "
+                "enabled=excluded.enabled",
+                (name, (base_url or "").strip(), auth_header,
+                 1 if enabled else 0))
+        self._safe_commit()
+        row = self._conn.execute(
+            "SELECT id FROM mcp_connectors WHERE name = ?",
+            (name,)).fetchone()
+        return row["id"] if row else 0
+
+    def delete_mcp_connector(self, name):
+        cur = self._conn.execute(
+            "DELETE FROM mcp_connectors WHERE name = ?",
+            ((name or "").strip().lower(),))
         self._safe_commit()
         return cur.rowcount > 0
 

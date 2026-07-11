@@ -1066,16 +1066,24 @@ def assemble_messages(*, persona: str, context_block: str,
     sys_content = persona + "\n\n" + context_block
     msgs: list[dict] = [{"role": "system", "content": sys_content}]
 
-    # Take tail of history
+    # Take tail of history. system rows are INCLUDED (as user-role
+    # context notes): compress writes its summary as role='system'
+    # and feedback-discuss seeds its context block as role='system';
+    # dropping them meant neither ever reached the model. Re-tagged
+    # to 'user' with a marker because some providers reject mid-
+    # thread system messages.
     tail = history[-max_history_turns:] if max_history_turns > 0 else history
     for h in tail:
         role = h.get("role")
         content = h.get("content") or ""
-        if role not in ("user", "assistant"):
-            continue
         if not content.strip():
             continue
-        msgs.append({"role": role, "content": content})
+        if role == "system":
+            msgs.append({"role": "user",
+                         "content": "[context note, not from Tory]\n"
+                                    + content})
+        elif role in ("user", "assistant"):
+            msgs.append({"role": role, "content": content})
     return msgs
 
 
@@ -1389,6 +1397,18 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
     tool_call_audit: list[dict] = []
     last_result: dict = {}
 
+    # Agent harness (2026-07-11): external MCP connector tools ride in
+    # the same tools array as the internal ones (Option B: single
+    # brain). tool_definitions caches per connector and never raises;
+    # a down connector costs one slow attempt per cache TTL, not per
+    # turn.
+    turn_tools = list(chat_tools.TOOL_DEFINITIONS)
+    try:
+        import mcp_client
+        turn_tools += mcp_client.tool_definitions(db)
+    except Exception as _mcp_e:
+        log.warning("mcp tools unavailable this turn: %s", _mcp_e)
+
     for iter_num in range(chat_tools.MAX_TOOL_ITER + 1):
         last_result = llm.complete_messages(
             tool_messages,
@@ -1397,7 +1417,7 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
             max_tokens=max_tokens,
             temperature=temperature,
             purpose="overseer-chat",
-            tools=chat_tools.TOOL_DEFINITIONS,
+            tools=turn_tools,
         )
         if not last_result.get("ok"):
             break
@@ -1435,6 +1455,7 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
                 fn_name, fn_args, db=db, core_memory=core_memory,
                 sibling_daily_cap=sibling_daily_cap,
                 llm=llm,  # Slice 9.5 CP3: compress_chat needs LLMRouter
+                allow_mcp=True,  # this loop advertised the MCP tools
             )
             tool_call_audit.append({
                 "iter": iter_num,
