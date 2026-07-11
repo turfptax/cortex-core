@@ -396,6 +396,16 @@ class OverseerPlugin(Plugin):
             Route("GET",  "/chat/history",          self._http_chat_history),
             Route("POST", "/chat/clear",            self._http_chat_clear),
             Route("POST", "/chat/compress",         self._http_chat_compress),
+            # ── Agent harness (2026-07-10): chat threads ─────────
+            Route("GET",  "/chat/threads",          self._http_chat_threads),
+            Route("POST", "/chat/threads/new",      self._http_chat_thread_new),
+            Route("POST", "/chat/threads/select",   self._http_chat_thread_select),
+            Route("POST", "/chat/threads/rename",   self._http_chat_thread_rename),
+            Route("POST", "/chat/threads/delete",   self._http_chat_thread_delete),
+            # ── Agent harness: prompt library ────────────────────
+            Route("GET",  "/chat/prompts",          self._http_chat_prompts),
+            Route("POST", "/chat/prompts/upsert",   self._http_chat_prompt_upsert),
+            Route("POST", "/chat/prompts/delete",   self._http_chat_prompt_delete),
             # ── Slice 3e: notifications ─────────────────────────
             Route("GET",  "/notifications",         self._http_notifications),
             Route("POST", "/notifications/dismiss", self._http_notifications_dismiss),
@@ -4307,6 +4317,10 @@ class OverseerPlugin(Plugin):
                 sibling_daily_cap=self._sibling_daily_cap(),
                 # Slice 14: voice-mode succinctness directive
                 voice_mode=bool(payload.get("voice_mode", False)),
+                # Agent harness: the Hub pins the thread it rendered
+                # so a pointer move mid-request can't redirect the
+                # turn. 0/absent = active thread.
+                thread_id=_as_int(payload, "thread_id", 0) or None,
             )
         except Exception as e:
             self.api.log.exception("chat failed: %s", e)
@@ -4340,35 +4354,58 @@ class OverseerPlugin(Plugin):
                 user_message=message,
                 direct_override=direct_override,
                 sibling_daily_cap=self._sibling_daily_cap(),
+                thread_id=_as_int(payload, "thread_id", 0) or None,
             )
         except Exception as e:
             self.api.log.exception("quick-chat failed: %s", e)
             return {"ok": False, "error": str(e)}
 
     def _http_chat_history(self, payload):
-        """GET /plugins/overseer/chat/history?limit=N
+        """GET /plugins/overseer/chat/history?limit=N&thread_id=N
 
         Slice 8: each message dict carries an `attachments` list (empty
         if no files were attached) so the frontend can re-render
-        thumbnails after a reload."""
+        thumbnails after a reload.
+
+        Agent harness: thread_id is optional — omitted means the
+        active thread. Passing it lets the Hub browse any thread
+        read-only without moving the active pointer; sends always
+        target the active thread (switch via /chat/threads/select)."""
         if self.overseer_db is None:
             return {"ok": False, "error": "overseer not initialized"}
         limit = _as_int(payload, "limit", 50, max_value=500)
+        if limit < 1:
+            # A negative LIMIT means 'no limit' to SQLite — don't let
+            # a crafted request bypass the 500-row cap.
+            limit = 50
+        thread_id = _as_int(payload, "thread_id", 0) or None
+        active_id = self.overseer_db.active_chat_thread_id()
         return {
             "ok": True,
-            "messages": self.overseer_db.recent_chat_messages(limit),
-            "total": self.overseer_db.chat_message_count(),
+            "messages": self.overseer_db.recent_chat_messages(
+                limit, thread_id=thread_id),
+            "total": self.overseer_db.chat_message_count(thread_id),
+            "thread_id": thread_id or active_id,
+            "active_thread_id": active_id,
         }
 
     def _http_chat_clear(self, payload):
-        """POST /plugins/overseer/chat/clear — wipe the chat thread.
-        Per locked design, append-only is for future_overseer_notes;
-        chat is a working thread the user can reset."""
+        """POST /plugins/overseer/chat/clear — wipe one chat thread's
+        messages (thread row survives). Per locked design, append-only
+        is for future_overseer_notes; chat is a working thread the
+        user can reset.
+
+        Agent harness: the Hub pins thread_id to the thread it is
+        RENDERING; resolving the active pointer at request time could
+        wipe a different thread if the pointer moved while the confirm
+        dialog was open."""
         if self.overseer_db is None:
             return {"ok": False, "error": "overseer not initialized"}
-        n = self.overseer_db.chat_message_count()
-        self.overseer_db.clear_chat()
-        return {"ok": True, "cleared": n}
+        tid = (_as_int(payload, "thread_id", 0)
+               or self.overseer_db.active_chat_thread_id())
+        n = self.overseer_db.chat_message_count(tid)
+        self.overseer_db.clear_chat(tid)
+        return {"ok": True, "cleared": n, "thread_id": tid}
 
     def _http_chat_compress(self, payload):
         """POST /plugins/overseer/chat/compress
@@ -4390,10 +4427,133 @@ class OverseerPlugin(Plugin):
                 db=self.overseer_db,
                 llm=self.llm,
                 keep_recent=keep_recent,
+                thread_id=_as_int(payload, "thread_id", 0) or None,
             )
         except Exception as e:
             log.exception("chat/compress failed")
             return {"ok": False, "error": str(e)[:500]}
+
+    # ── Agent harness (2026-07-10): chat threads ─────────────────
+    # Sends (/chat, /quick-chat) always target the ACTIVE thread;
+    # the Hub switches threads via /chat/threads/select first. This
+    # keeps every pre-thread consumer (voice mode, MCP overseer_chat,
+    # the compress_chat tool, the router streak) coherent for free.
+
+    def _http_chat_threads(self, payload):
+        """GET /plugins/overseer/chat/threads"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        return {
+            "ok": True,
+            "threads": self.overseer_db.list_chat_threads(),
+            "active_thread_id":
+                self.overseer_db.active_chat_thread_id(),
+        }
+
+    def _http_chat_thread_new(self, payload):
+        """POST /plugins/overseer/chat/threads/new  {title?}
+        Creates + selects the new thread."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        title = payload.get("title") or ""
+        if not isinstance(title, str):
+            return {"ok": False, "error": "'title' must be a string"}
+        tid = self.overseer_db.create_chat_thread(title)
+        return {"ok": True, "thread_id": tid}
+
+    def _http_chat_thread_select(self, payload):
+        """POST /plugins/overseer/chat/threads/select  {thread_id}"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        tid = _as_int(payload, "thread_id", 0)
+        if not tid:
+            return {"ok": False, "error": "missing 'thread_id'"}
+        if not self.overseer_db.select_chat_thread(tid):
+            return {"ok": False, "error": f"no such thread: {tid}"}
+        return {"ok": True, "thread_id": tid}
+
+    def _http_chat_thread_rename(self, payload):
+        """POST /plugins/overseer/chat/threads/rename
+        {thread_id, title}"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        tid = _as_int(payload, "thread_id", 0)
+        title = payload.get("title") or ""
+        if not isinstance(title, str):
+            return {"ok": False, "error": "'title' must be a string"}
+        title = title.strip()
+        if not tid or not title:
+            return {"ok": False, "error": "need 'thread_id' + 'title'"}
+        if not self.overseer_db.rename_chat_thread(tid, title):
+            return {"ok": False, "error": f"no such thread: {tid}"}
+        return {"ok": True, "thread_id": tid, "title": title[:120]}
+
+    def _http_chat_thread_delete(self, payload):
+        """POST /plugins/overseer/chat/threads/delete  {thread_id}
+        Deletes the thread + its messages. The active pointer heals
+        to the most recent remaining thread on next use."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        tid = _as_int(payload, "thread_id", 0)
+        if not tid:
+            return {"ok": False, "error": "missing 'thread_id'"}
+        if not self.overseer_db.delete_chat_thread(tid):
+            return {"ok": False, "error": f"no such thread: {tid}"}
+        return {"ok": True, "deleted": tid,
+                "active_thread_id":
+                    self.overseer_db.active_chat_thread_id()}
+
+    # ── Agent harness: prompt library ────────────────────────────
+
+    def _http_chat_prompts(self, payload):
+        """GET /plugins/overseer/chat/prompts"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        return {"ok": True,
+                "prompts": self.overseer_db.list_chat_prompts()}
+
+    def _http_chat_prompt_upsert(self, payload):
+        """POST /plugins/overseer/chat/prompts/upsert
+        {id?, title, body} — id present = update, absent = create."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        title = payload.get("title") or ""
+        body = payload.get("body") or ""
+        if not isinstance(title, str) or not isinstance(body, str):
+            return {"ok": False,
+                    "error": "'title' and 'body' must be strings"}
+        # An id that was SENT but doesn't parse must error, not
+        # silently fall through to create-a-duplicate.
+        raw_id = payload.get("id")
+        if raw_id in (None, "", 0):
+            prompt_id = None
+        else:
+            try:
+                prompt_id = int(raw_id)
+            except (TypeError, ValueError):
+                return {"ok": False,
+                        "error": f"invalid 'id': {raw_id!r}"}
+        pid = self.overseer_db.upsert_chat_prompt(
+            prompt_id=prompt_id,
+            title=title,
+            body=body,
+        )
+        if not pid:
+            return {"ok": False,
+                    "error": "need non-empty 'title' + 'body' "
+                             "(or id not found)"}
+        return {"ok": True, "id": pid}
+
+    def _http_chat_prompt_delete(self, payload):
+        """POST /plugins/overseer/chat/prompts/delete  {id}"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        pid = _as_int(payload, "id", 0)
+        if not pid:
+            return {"ok": False, "error": "missing 'id'"}
+        if not self.overseer_db.delete_chat_prompt(pid):
+            return {"ok": False, "error": f"no such prompt: {pid}"}
+        return {"ok": True, "deleted": pid}
 
     def _http_notifications(self, payload):
         """GET /plugins/overseer/notifications

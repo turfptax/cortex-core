@@ -1099,7 +1099,19 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
                        # writes. Defaults to 'overseer' since this
                        # function IS the full Opus overseer path.
                        answered_by: str = "overseer",
-                       escalation_reason: str = "") -> dict:
+                       escalation_reason: str = "",
+                       # Agent harness (2026-07-10): pin the whole
+                       # turn to one thread. None resolves the active
+                       # thread ONCE here; without this, each DB call
+                       # re-reads the pointer and a mid-turn thread
+                       # switch/delete from another surface splits
+                       # the user/assistant pair across threads.
+                       thread_id: int | None = None,
+                       # With skip_user_persist, the router already
+                       # knows the persisted user row id; passing it
+                       # avoids re-deriving 'latest user row' which
+                       # can pick the wrong message under concurrency.
+                       known_user_id: int | None = None) -> dict:
     """End-to-end: append user msg to chat_messages, build prompt,
     call LLM, persist assistant response, return result dict.
 
@@ -1133,6 +1145,11 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
         else:
             return {"ok": False, "error": "empty message"}
 
+    # 0. Pin the turn's thread once. Every read/write below passes
+    # this tid explicitly so a concurrent thread switch/new/delete
+    # cannot redirect part of the turn.
+    tid = int(thread_id) if thread_id else db.active_chat_thread_id()
+
     # 1. Persist the user turn
     # 1.0 BEFORE persisting: if this user message reads as a correction
     # of the immediately-prior assistant turn, log a correction. The
@@ -1141,7 +1158,8 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
     # the search is correct). 3i CP2.
     chat_correction_id = None
     try:
-        recent_for_correction = db.recent_chat_messages(limit=8)
+        recent_for_correction = db.recent_chat_messages(
+            limit=8, thread_id=tid)
         prior_asst = next(
             (m for m in reversed(recent_for_correction)
              if m.get("role") == "assistant"),
@@ -1157,16 +1175,22 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
         )
 
     # Slice 14.7: when escalating from the router, the user message
-    # was already persisted by respond_via_router. Re-use that id.
+    # was already persisted by respond_via_router. Re-use that id —
+    # preferring the id the router hands us directly over re-deriving
+    # 'latest user row', which can race a concurrent send.
     if skip_user_persist:
-        recent = db.recent_chat_messages(limit=4)
-        existing_user = next(
-            (m for m in reversed(recent) if m.get("role") == "user"),
-            None,
-        )
-        user_id = existing_user["id"] if existing_user else None
+        if known_user_id:
+            user_id = known_user_id
+        else:
+            recent = db.recent_chat_messages(limit=4, thread_id=tid)
+            existing_user = next(
+                (m for m in reversed(recent) if m.get("role") == "user"),
+                None,
+            )
+            user_id = existing_user["id"] if existing_user else None
     else:
-        user_id = db.append_chat_message(role="user", content=user_message)
+        user_id = db.append_chat_message(
+            role="user", content=user_message, thread_id=tid)
 
     # 1.5: Slice 8 — read attachments off disk and persist refs FK'd to
     # the user turn we just created. Records are read independently of
@@ -1225,7 +1249,7 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
     except Exception as _e:
         log.warning("could not load human_journal_entries: %s", _e)
         recent_human_journal = []
-    chat_count_so_far = db.chat_message_count() - 1  # excluding the just-added
+    chat_count_so_far = db.chat_message_count(tid) - 1  # excluding the just-added
     core_stats = core_memory.get_stats() if core_memory else {}
 
     context_block = build_context_block(
@@ -1242,7 +1266,8 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
     )
 
     # 3. Build history including the just-added user turn
-    history = db.recent_chat_messages(limit=max_history_turns + 4)
+    history = db.recent_chat_messages(
+        limit=max_history_turns + 4, thread_id=tid)
     messages = assemble_messages(
         persona=OVERSEER_PERSONA,
         context_block=context_block,
@@ -1439,6 +1464,7 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
             metadata={"ok": False,
                       "error": result.get("error", "")[:500],
                       "tool_calls": tool_call_audit},
+            thread_id=tid,
         )
         return {"ok": False,
                 "error": result.get("error", "unknown"),
@@ -1469,6 +1495,7 @@ def respond_to_message(*, db, llm, core_memory, user_message: str,
         # Slice 14.7: layer attribution
         answered_by=answered_by,
         escalation_reason=escalation_reason,
+        thread_id=tid,
     )
 
     # Now strip insight markers and queue candidates. The user-visible
@@ -1664,7 +1691,8 @@ def _check_trigger_words(message: str) -> str | None:
 
 def respond_via_router(*, db, llm, core_memory, user_message: str,
                        direct_override: bool = False,
-                       sibling_daily_cap: int = 20) -> dict:
+                       sibling_daily_cap: int = 20,
+                       thread_id: int | None = None) -> dict:
     """Slice 14.7: the router-tier chat handler. Persists the user
     turn once, decides whether to answer with Flash (cheap) or
     escalate to respond_to_message (Opus), and tags the assistant
@@ -1680,9 +1708,13 @@ def respond_via_router(*, db, llm, core_memory, user_message: str,
     if not user_message:
         return {"ok": False, "error": "empty message"}
 
+    # 0. Pin the turn's thread once (see respond_to_message).
+    tid = int(thread_id) if thread_id else db.active_chat_thread_id()
+
     # 1. Persist user turn once. The downstream escalation path is
     # told not to re-persist (skip_user_persist=True).
-    user_id = db.append_chat_message(role="user", content=user_message)
+    user_id = db.append_chat_message(
+        role="user", content=user_message, thread_id=tid)
 
     # 2. Escalation checks BEFORE spending any LLM call.
     if direct_override:
@@ -1690,7 +1722,7 @@ def respond_via_router(*, db, llm, core_memory, user_message: str,
             db=db, llm=llm, core_memory=core_memory,
             user_message=user_message, user_id=user_id,
             sibling_daily_cap=sibling_daily_cap,
-            reason="direct_override")
+            reason="direct_override", thread_id=tid)
 
     trigger = _check_trigger_words(user_message)
     if trigger:
@@ -1698,10 +1730,10 @@ def respond_via_router(*, db, llm, core_memory, user_message: str,
             db=db, llm=llm, core_memory=core_memory,
             user_message=user_message, user_id=user_id,
             sibling_daily_cap=sibling_daily_cap,
-            reason=f"trigger_word:{trigger}")
+            reason=f"trigger_word:{trigger}", thread_id=tid)
 
     try:
-        consec = db.count_consecutive_router_turns()
+        consec = db.count_consecutive_router_turns(thread_id=tid)
     except Exception:
         consec = 0
     if consec >= ROUTER_MAX_CONSECUTIVE:
@@ -1709,7 +1741,7 @@ def respond_via_router(*, db, llm, core_memory, user_message: str,
             db=db, llm=llm, core_memory=core_memory,
             user_message=user_message, user_id=user_id,
             sibling_daily_cap=sibling_daily_cap,
-            reason=f"consecutive_router_turns:{consec}")
+            reason=f"consecutive_router_turns:{consec}", thread_id=tid)
 
     # 3. Build thin context + call Flash.
     ctx = build_router_context_block(db=db, core_memory=core_memory)
@@ -1735,7 +1767,7 @@ def respond_via_router(*, db, llm, core_memory, user_message: str,
             db=db, llm=llm, core_memory=core_memory,
             user_message=user_message, user_id=user_id,
             sibling_daily_cap=sibling_daily_cap,
-            reason="router_unavailable")
+            reason="router_unavailable", thread_id=tid)
 
     reply = (result.get("text") or "").strip()
 
@@ -1746,7 +1778,7 @@ def respond_via_router(*, db, llm, core_memory, user_message: str,
             db=db, llm=llm, core_memory=core_memory,
             user_message=user_message, user_id=user_id,
             sibling_daily_cap=sibling_daily_cap,
-            reason=f"flash_self_escalate:{flash_reason}")
+            reason=f"flash_self_escalate:{flash_reason}", thread_id=tid)
 
     # 5. Router answered. Persist + return.
     asst_id = db.append_chat_message(
@@ -1760,6 +1792,7 @@ def respond_via_router(*, db, llm, core_memory, user_message: str,
         metadata={"router": True, "context_chars": len(ctx)},
         answered_by="router",
         escalation_reason="",
+        thread_id=tid,
     )
     return {
         "ok": True,
@@ -1779,10 +1812,12 @@ def respond_via_router(*, db, llm, core_memory, user_message: str,
 
 
 def _escalate_to_overseer(*, db, llm, core_memory, user_message,
-                           user_id, sibling_daily_cap, reason) -> dict:
+                           user_id, sibling_daily_cap, reason,
+                           thread_id=None) -> dict:
     """Hand off to respond_to_message with the user message already
     persisted. Tags the resulting assistant message as answered_by=
-    'overseer' with the escalation reason."""
+    'overseer' with the escalation reason. thread_id + known_user_id
+    pin the escalated turn to the router's thread and user row."""
     out = respond_to_message(
         db=db, llm=llm, core_memory=core_memory,
         user_message=user_message,
@@ -1790,6 +1825,8 @@ def _escalate_to_overseer(*, db, llm, core_memory, user_message,
         skip_user_persist=True,
         answered_by="overseer",
         escalation_reason=reason,
+        thread_id=thread_id,
+        known_user_id=user_id,
     )
     if isinstance(out, dict):
         out.setdefault("user_message_id", user_id)
@@ -1848,8 +1885,9 @@ Thread to compress:
 """
 
 
-def compress_chat_history(*, db, llm, keep_recent: int = COMPRESS_KEEP_RECENT_DEFAULT
-                          ) -> dict:
+def compress_chat_history(*, db, llm,
+                          keep_recent: int = COMPRESS_KEEP_RECENT_DEFAULT,
+                          thread_id: int | None = None) -> dict:
     """Fold older chat messages into one synthesized prefix message.
 
     Returns {"ok": bool, "messages_before": int, "messages_after": int,
@@ -1863,7 +1901,11 @@ def compress_chat_history(*, db, llm, keep_recent: int = COMPRESS_KEEP_RECENT_DE
         as raw context.
     """
     keep_recent = max(2, int(keep_recent))
-    total = db.chat_message_count()
+    # Pin the thread ONCE. Fetch, the multi-second Sonnet call, and
+    # the delete+insert must all target the same thread even if the
+    # active pointer moves mid-compress.
+    tid = int(thread_id) if thread_id else db.active_chat_thread_id()
+    total = db.chat_message_count(tid)
     if total <= keep_recent + 1:
         # Nothing meaningful to compress
         return {
@@ -1876,7 +1918,8 @@ def compress_chat_history(*, db, llm, keep_recent: int = COMPRESS_KEEP_RECENT_DE
 
     # Pull all messages oldest-first. recent_chat_messages returns
     # chronological order despite the SELECT being DESC internally.
-    all_msgs = db.recent_chat_messages(limit=max(total, 1000))
+    all_msgs = db.recent_chat_messages(
+        limit=max(total, 1000), thread_id=tid)
     if len(all_msgs) <= keep_recent + 1:
         return {
             "ok": True, "messages_before": len(all_msgs),
@@ -1978,6 +2021,7 @@ def compress_chat_history(*, db, llm, keep_recent: int = COMPRESS_KEEP_RECENT_DE
                 "compress_cost_usd": cost,
                 "compress_model": result.get("model", ""),
             },
+            thread_id=tid,
         )
     except Exception as e:
         log.exception("compress_chat_history: DB write failed: %s", e)

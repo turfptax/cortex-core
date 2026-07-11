@@ -402,12 +402,25 @@ CREATE INDEX IF NOT EXISTS idx_rollup_project ON automation_rollups(project);
 CREATE INDEX IF NOT EXISTS idx_rollup_date ON automation_rollups(rollup_date);
 
 -- ─ Slice 3e: chat with overseer ────────────────────────────────
--- Single ongoing thread for v1 (no conversation/thread separation).
+-- Agent-harness update (2026-07-10): messages now belong to a
+-- thread (chat_threads). The ACTIVE thread id lives in
+-- overseer_state key 'chat_active_thread_id'; every chat consumer
+-- that predates threads (voice mode, MCP overseer_chat, router
+-- streak counter, compress tool) keeps working because the DB
+-- helpers default to the active thread when thread_id is None.
 -- All messages stored append-only. The chat handler builds context
 -- from working_memory + recent gists + last N chat_messages.
 
+CREATE TABLE IF NOT EXISTS chat_threads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL DEFAULT '',            -- auto-titled from first user line
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS chat_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL DEFAULT 0,      -- chat_threads.id (0 = pre-migration)
     role TEXT NOT NULL,                        -- user | assistant | system
     content TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -429,6 +442,23 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     escalation_reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_chat_created ON chat_messages(created_at);
+-- idx_chat_thread is created in _migrate_chat_threads, NOT here: on
+-- an existing install chat_messages predates thread_id (CREATE TABLE
+-- IF NOT EXISTS is a no-op), so an index on thread_id in this script
+-- would fail before the migration adds the column.
+
+-- ─ Agent harness (2026-07-10): prompt library ──────────────────
+-- Reusable prompt snippets pickable from the Hub chat composer.
+-- Stored Pi-side so they survive Hub reinstalls and other surfaces
+-- (phone, MCP) can read them later.
+
+CREATE TABLE IF NOT EXISTS chat_prompts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
 -- ─ Slice 3e: notifications ─────────────────────────────────────
 -- Append-only per locked design. dismissed_at = hidden in UI but
@@ -1283,6 +1313,9 @@ class OverseerDB(CortexDB):
         self._conn.executescript(OVERSEER_SCHEMA_SQL)
         self._safe_commit()
         self._migrate_3f5()
+        # Agent harness (2026-07-10): runs unconditionally — see the
+        # note above _migrate_chat_threads about the fragile chain.
+        self._migrate_chat_threads()
         # Slice 9.4.1 (2026-05-16): every _at column gets a paired
         # local_<col>_at populated by trigger. Auto-discovers any new
         # tables added by future slices so the "time always shows
@@ -2365,6 +2398,72 @@ class OverseerDB(CortexDB):
                     "ALTER TABLE summaries_gist ADD COLUMN {} {}".format(
                         col, decl))
                 log.info("_migrate_taxonomy_gist_axes: added %s column", col)
+        self._safe_commit()
+
+    # Called directly from __init__, NOT chained off the taxonomy
+    # migration: _migrate_vector_index early-returns when sqlite-vec
+    # is unavailable, which would silently break every later link.
+    def _migrate_chat_threads(self):
+        """Agent harness (2026-07-10): chat gains threads.
+
+        1. chat_threads + chat_prompts tables exist via CREATE TABLE
+           IF NOT EXISTS in the schema (fresh installs get thread_id
+           in the CREATE TABLE too).
+        2. Existing installs (.25) need the thread_id column ALTERed
+           onto chat_messages.
+        3. Any pre-thread rows (thread_id=0) are adopted into a
+           single legacy thread so history is preserved verbatim.
+        4. The active-thread pointer is seeded if missing.
+        Idempotent: reruns no-op once rows are adopted.
+        """
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(chat_messages)").fetchall()}
+        if "thread_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE chat_messages ADD COLUMN "
+                "thread_id INTEGER NOT NULL DEFAULT 0")
+            log.info("_migrate_chat_threads: added thread_id column")
+        # Unconditional: fresh installs get the column via CREATE
+        # TABLE (skipping the ALTER above) but still need the index.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_thread "
+            "ON chat_messages(thread_id, id)")
+        orphans = self._conn.execute(
+            "SELECT COUNT(*) FROM chat_messages WHERE thread_id = 0"
+        ).fetchone()[0]
+        if orphans:
+            # thread_id=0 is also the column DEFAULT, so 0-rows can
+            # reappear after a rollback/re-deploy or from an external
+            # writer that omits the column. Adopt into the OLDEST
+            # existing thread instead of minting a duplicate 'Main
+            # thread', and never hijack a valid active pointer.
+            row = self._conn.execute(
+                "SELECT id FROM chat_threads ORDER BY id LIMIT 1"
+            ).fetchone()
+            if row:
+                legacy_id = row["id"]
+            else:
+                cur = self._conn.execute(
+                    "INSERT INTO chat_threads (title) VALUES (?)",
+                    ("Main thread",))
+                legacy_id = cur.lastrowid
+            self._conn.execute(
+                "UPDATE chat_messages SET thread_id = ? "
+                "WHERE thread_id = 0", (legacy_id,))
+            ptr = self.get_overseer_state("chat_active_thread_id")
+            ptr_valid = False
+            if ptr is not None:
+                try:
+                    ptr_valid = self._conn.execute(
+                        "SELECT 1 FROM chat_threads WHERE id = ?",
+                        (int(ptr),)).fetchone() is not None
+                except (TypeError, ValueError):
+                    ptr_valid = False
+            if not ptr_valid:
+                self.set_overseer_state(
+                    "chat_active_thread_id", legacy_id)
+            log.info("_migrate_chat_threads: adopted %d messages into "
+                     "thread %d", orphans, legacy_id)
         self._safe_commit()
 
     # ── Slice 15: mission events ─────────────────────────────────
@@ -4338,37 +4437,180 @@ class OverseerDB(CortexDB):
         return [r[0] for r in rows if r[0]]
 
     # ── Slice 3e: chat ──────────────────────────────────────────
+    # Agent harness (2026-07-10): every helper takes an optional
+    # thread_id. None means "the active thread" (overseer_state key
+    # chat_active_thread_id) so pre-thread consumers — voice mode,
+    # the MCP overseer_chat tool, the router streak counter, the
+    # compress_chat tool — stay coherent without code changes.
+
+    def active_chat_thread_id(self):
+        """Resolve the active thread id, healing a stale or missing
+        pointer. Creates a fresh thread if none exist."""
+        raw = self.get_overseer_state("chat_active_thread_id")
+        try:
+            tid = int(raw) if raw is not None else 0
+        except (TypeError, ValueError):
+            tid = 0
+        if tid:
+            row = self._conn.execute(
+                "SELECT id FROM chat_threads WHERE id = ?", (tid,)
+            ).fetchone()
+            if row:
+                return tid
+        # Pointer missing or dangling — fall back to the most recently
+        # touched thread, else create one.
+        row = self._conn.execute(
+            "SELECT id FROM chat_threads "
+            "ORDER BY updated_at DESC, id DESC LIMIT 1").fetchone()
+        if row:
+            tid = row["id"]
+        else:
+            cur = self._conn.execute(
+                "INSERT INTO chat_threads (title) VALUES ('')")
+            tid = cur.lastrowid
+        self.set_overseer_state("chat_active_thread_id", tid)
+        self._safe_commit()
+        return tid
+
+    def _resolve_thread_id(self, thread_id):
+        if thread_id is None:
+            return self.active_chat_thread_id()
+        return int(thread_id)
+
+    def list_chat_threads(self):
+        """All threads newest-touched first, with message counts and
+        summed cost so the sidebar can show weight at a glance."""
+        rows = self._conn.execute(
+            "SELECT t.id, t.title, t.created_at, t.updated_at, "
+            "COUNT(m.id) AS message_count, "
+            "COALESCE(SUM(m.cost_usd), 0) AS cost_usd "
+            "FROM chat_threads t "
+            "LEFT JOIN chat_messages m ON m.thread_id = t.id "
+            "GROUP BY t.id "
+            "ORDER BY t.updated_at DESC, t.id DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    def create_chat_thread(self, title=""):
+        """New thread becomes the active one (matches the UI flow:
+        'New chat' switches you into it)."""
+        cur = self._conn.execute(
+            "INSERT INTO chat_threads (title) VALUES (?)",
+            ((title or "").strip()[:120],))
+        tid = cur.lastrowid
+        self.set_overseer_state("chat_active_thread_id", tid)
+        self._safe_commit()
+        return tid
+
+    def select_chat_thread(self, thread_id):
+        row = self._conn.execute(
+            "SELECT id FROM chat_threads WHERE id = ?",
+            (int(thread_id),)).fetchone()
+        if not row:
+            return False
+        self.set_overseer_state("chat_active_thread_id", int(thread_id))
+        self._safe_commit()
+        return True
+
+    def rename_chat_thread(self, thread_id, title):
+        cur = self._conn.execute(
+            "UPDATE chat_threads SET title = ?, "
+            "updated_at = datetime('now') WHERE id = ?",
+            ((title or "").strip()[:120], int(thread_id)))
+        self._safe_commit()
+        return cur.rowcount > 0
+
+    def delete_chat_thread(self, thread_id):
+        """Delete a thread + its messages + their attachment rows.
+        If it was the active thread, the pointer heals to the most
+        recent remaining thread (or a fresh one) on next resolve.
+        try/rollback mirrors compress_chat_replace: a mid-sequence
+        failure must not leave partial deletes pending for the next
+        unrelated commit to silently persist."""
+        tid = int(thread_id)
+        with self._write_lock:
+            try:
+                self._conn.execute(
+                    "DELETE FROM chat_message_files "
+                    "WHERE chat_message_id IN "
+                    "(SELECT id FROM chat_messages WHERE thread_id = ?)",
+                    (tid,))
+                self._conn.execute(
+                    "DELETE FROM chat_messages WHERE thread_id = ?",
+                    (tid,))
+                cur = self._conn.execute(
+                    "DELETE FROM chat_threads WHERE id = ?", (tid,))
+                raw = self.get_overseer_state("chat_active_thread_id")
+                if raw is not None and str(raw) == str(tid):
+                    self._conn.execute(
+                        "DELETE FROM overseer_state "
+                        "WHERE key = 'chat_active_thread_id'")
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return cur.rowcount > 0
+
+    def _touch_chat_thread(self, thread_id, *, role=None, content=None):
+        """Bump updated_at; auto-title an untitled thread from the
+        first user line (voice_chats pattern on the phone)."""
+        self._conn.execute(
+            "UPDATE chat_threads SET updated_at = datetime('now') "
+            "WHERE id = ?", (int(thread_id),))
+        if role == "user" and content:
+            snippet = " ".join((content or "").split())[:60]
+            if snippet:
+                self._conn.execute(
+                    "UPDATE chat_threads SET title = ? "
+                    "WHERE id = ? AND title = ''",
+                    (snippet, int(thread_id)))
 
     def append_chat_message(self, *, role, content, backend="", model="",
                             latency_ms=0, cost_usd=0.0,
                             prompt_tokens=0, response_tokens=0,
                             metadata=None,
                             answered_by="",
-                            escalation_reason=""):
-        cur = self._conn.execute(
-            "INSERT INTO chat_messages (role, content, backend, model, "
-            "latency_ms, cost_usd, prompt_tokens, response_tokens, "
-            "metadata_json, answered_by, escalation_reason) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (role, content, backend, model, int(latency_ms),
-             float(cost_usd), int(prompt_tokens), int(response_tokens),
-             json.dumps(metadata or {}),
-             answered_by, escalation_reason),
-        )
-        self._safe_commit()
-        return cur.lastrowid
+                            escalation_reason="",
+                            thread_id=None):
+        # Resolve + validate + insert under the write lock so a
+        # concurrent delete_chat_thread can't leave this row pointing
+        # at a dead thread (invisible orphan). If the requested thread
+        # died mid-turn, heal to a live thread rather than orphaning.
+        with self._write_lock:
+            tid = self._resolve_thread_id(thread_id)
+            alive = self._conn.execute(
+                "SELECT 1 FROM chat_threads WHERE id = ?", (tid,)
+            ).fetchone()
+            if not alive:
+                tid = self.active_chat_thread_id()
+            cur = self._conn.execute(
+                "INSERT INTO chat_messages (thread_id, role, content, "
+                "backend, model, "
+                "latency_ms, cost_usd, prompt_tokens, response_tokens, "
+                "metadata_json, answered_by, escalation_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (tid, role, content, backend, model, int(latency_ms),
+                 float(cost_usd), int(prompt_tokens),
+                 int(response_tokens),
+                 json.dumps(metadata or {}),
+                 answered_by, escalation_reason),
+            )
+            self._touch_chat_thread(tid, role=role, content=content)
+            self._safe_commit()
+            return cur.lastrowid
 
-    def count_consecutive_router_turns(self, limit=8) -> int:
+    def count_consecutive_router_turns(self, limit=8, *,
+                                       thread_id=None) -> int:
         """Slice 14.7: count assistant turns at the end of the chat
         thread that were answered by the router (answered_by='router')
         without an overseer escalation breaking the streak. Used by
         the router to escalate when it's been answering on the same
-        thread for too long without resolution."""
+        thread for too long without resolution. Per-thread: a fresh
+        thread resets the streak."""
         rows = self._conn.execute(
             "SELECT role, answered_by FROM chat_messages "
-            "WHERE role = 'assistant' "
+            "WHERE role = 'assistant' AND thread_id = ? "
             "ORDER BY id DESC LIMIT ?",
-            (int(limit),),
+            (self._resolve_thread_id(thread_id), int(limit)),
         ).fetchall()
         n = 0
         for r in rows:
@@ -4378,13 +4620,16 @@ class OverseerDB(CortexDB):
                 break
         return n
 
-    def recent_chat_messages(self, limit=40, *, include_files=True):
-        """Most-recent N rows in chronological order. When include_files
-        is True (default), each row gets an `attachments` list populated
-        from chat_message_files. Slice 8."""
+    def recent_chat_messages(self, limit=40, *, include_files=True,
+                             thread_id=None):
+        """Most-recent N rows of one thread in chronological order
+        (None = active thread). When include_files is True (default),
+        each row gets an `attachments` list populated from
+        chat_message_files. Slice 8."""
         rows = self._conn.execute(
-            "SELECT * FROM chat_messages ORDER BY id DESC LIMIT ?",
-            (int(limit),),
+            "SELECT * FROM chat_messages WHERE thread_id = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (self._resolve_thread_id(thread_id), int(limit)),
         ).fetchall()
         msgs = list(reversed([dict(r) for r in rows]))
         if not include_files or not msgs:
@@ -4397,22 +4642,29 @@ class OverseerDB(CortexDB):
             m["attachments"] = files_by_msg.get(m["id"], [])
         return msgs
 
-    def chat_message_count(self):
+    def chat_message_count(self, thread_id=None):
         return self._conn.execute(
-            "SELECT COUNT(*) FROM chat_messages"
+            "SELECT COUNT(*) FROM chat_messages WHERE thread_id = ?",
+            (self._resolve_thread_id(thread_id),),
         ).fetchone()[0]
 
-    def clear_chat(self):
+    def clear_chat(self, thread_id=None):
         # FK ON DELETE CASCADE only fires when foreign_keys pragma is
         # ON. SQLite defaults it OFF. Delete files explicitly first so
         # a 'Clear thread' on an existing install doesn't leave orphan
-        # chat_message_files rows.
-        self._conn.execute("DELETE FROM chat_message_files")
-        self._conn.execute("DELETE FROM chat_messages")
+        # chat_message_files rows. Scoped to one thread (None=active);
+        # the thread row survives so its title/identity persist.
+        tid = self._resolve_thread_id(thread_id)
+        self._conn.execute(
+            "DELETE FROM chat_message_files WHERE chat_message_id IN "
+            "(SELECT id FROM chat_messages WHERE thread_id = ?)", (tid,))
+        self._conn.execute(
+            "DELETE FROM chat_messages WHERE thread_id = ?", (tid,))
         self._safe_commit()
 
     def compress_chat_replace(self, *, old_ids, summary_content,
-                              created_at=None, metadata=None):
+                              created_at=None, metadata=None,
+                              thread_id=None):
         """Slice 9.5 CP3: atomically replace a set of older chat messages
         with one synthetic 'system' role message containing their
         compressed summary.
@@ -4426,6 +4678,11 @@ class OverseerDB(CortexDB):
         old_ids = [int(i) for i in (old_ids or []) if i is not None]
         meta_json = json.dumps(metadata or {}, ensure_ascii=False)
         with self._write_lock:
+            # Resolve INSIDE the lock. Callers should pass the tid
+            # they captured when they read the messages; a None here
+            # falls back to the active pointer, which may have moved
+            # during the caller's LLM call.
+            tid = self._resolve_thread_id(thread_id)
             try:
                 # 1. Clean up any chat_message_files belonging to the
                 # messages being compressed (FK CASCADE is OFF; manual).
@@ -4446,11 +4703,12 @@ class OverseerDB(CortexDB):
                 # so the prefix sorts to the HEAD of the thread.
                 cur = self._conn.execute(
                     "INSERT INTO chat_messages "
-                    "(role, content, backend, model, latency_ms, "
+                    "(thread_id, role, content, backend, model, "
+                    "latency_ms, "
                     "cost_usd, prompt_tokens, response_tokens, "
                     "metadata_json, created_at) VALUES "
-                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    ("system", summary_content, "compress-internal",
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (tid, "system", summary_content, "compress-internal",
                      "anthropic/claude-sonnet-4.6", 0, 0.0, 0, 0,
                      meta_json,
                      created_at or datetime.now(timezone.utc).strftime(
@@ -4461,6 +4719,39 @@ class OverseerDB(CortexDB):
             except Exception:
                 self._conn.rollback()
                 raise
+
+    # ── Agent harness (2026-07-10): prompt library ──────────────
+
+    def list_chat_prompts(self):
+        rows = self._conn.execute(
+            "SELECT id, title, body, created_at, updated_at "
+            "FROM chat_prompts ORDER BY title COLLATE NOCASE"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def upsert_chat_prompt(self, *, prompt_id=None, title, body):
+        title = (title or "").strip()[:120]
+        body = (body or "").strip()
+        if not title or not body:
+            return 0
+        if prompt_id:
+            cur = self._conn.execute(
+                "UPDATE chat_prompts SET title = ?, body = ?, "
+                "updated_at = datetime('now') WHERE id = ?",
+                (title, body, int(prompt_id)))
+            self._safe_commit()
+            return int(prompt_id) if cur.rowcount else 0
+        cur = self._conn.execute(
+            "INSERT INTO chat_prompts (title, body) VALUES (?, ?)",
+            (title, body))
+        self._safe_commit()
+        return cur.lastrowid
+
+    def delete_chat_prompt(self, prompt_id):
+        cur = self._conn.execute(
+            "DELETE FROM chat_prompts WHERE id = ?", (int(prompt_id),))
+        self._safe_commit()
+        return cur.rowcount > 0
 
     # ── Slice 8: chat file attachments ──────────────────────────
 
@@ -7716,11 +8007,14 @@ class OverseerDB(CortexDB):
         if not row:
             return {"ok": False, "error": "chat message not found"}
         row = dict(row)
+        # Agent harness: scope to the row's own thread and use id
+        # ordering — a created_at-only scan can pick another thread's
+        # (or a same-second later) user message as the trigger.
         user_row = self._conn.execute(
             "SELECT id, content, created_at FROM chat_messages "
-            "WHERE role = 'user' AND created_at <= ? "
-            "ORDER BY created_at DESC LIMIT 1",
-            (row.get("created_at"),),
+            "WHERE role = 'user' AND thread_id = ? AND id < ? "
+            "ORDER BY id DESC LIMIT 1",
+            (row.get("thread_id") or 0, int(msg_id)),
         ).fetchone()
         meta = {}
         try:
