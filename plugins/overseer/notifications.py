@@ -363,6 +363,19 @@ def evaluate_rules(*, db, core_memory, config) -> dict:
     except Exception as e:
         log.exception("auto_archive_stale_notifications failed: %s", e)
 
+    # Mission proposals are ephemeral suggestions (Slice 15 CP1 emits one
+    # per semantic match, ~30/day): unacted-on after a week they are
+    # noise, and by 2026-07 they had buried the Bell under 650+ unread
+    # info rows. Short TTL; the underlying mission match data survives.
+    try:
+        days = int(config.get(
+            "notification_mission_proposal_archive_days", 7))
+        auto_archived_stale += db.auto_archive_stale_notifications(
+            rule_name="mission_proposal", older_than_days=days,
+        )
+    except Exception as e:
+        log.exception("mission_proposal auto-archive failed: %s", e)
+
     return {
         "emitted": emitted, "errors": errors, "by_rule": by_rule,
         "auto_resolved": auto_resolved,
