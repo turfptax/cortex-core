@@ -412,6 +412,10 @@ class OverseerPlugin(Plugin):
             Route("GET",  "/feedback",              self._http_feedback_list),
             Route("POST", "/feedback",              self._http_feedback_add),
             Route("POST", "/feedback/discuss",      self._http_feedback_discuss),
+            Route("GET",  "/feedback/summary",      self._http_feedback_summary),
+            # ── Simples mirror (2026-07-11): phone plan snapshot ─
+            Route("GET",  "/simples/snapshot",      self._http_simples_snapshot_get),
+            Route("POST", "/simples/snapshot",      self._http_simples_snapshot_post),
             # ── Agent harness: MCP connectors (Pi as MCP client) ─
             Route("GET",  "/mcp/connectors",        self._http_mcp_connectors),
             Route("POST", "/mcp/connectors/upsert", self._http_mcp_connector_upsert),
@@ -4734,6 +4738,127 @@ class OverseerPlugin(Plugin):
                               f"answered_by={row.get('answered_by') or '?'}):",
                           (row.get("content") or "")[:2500]]
         return "\n".join(lines)
+
+    def _http_feedback_summary(self, payload):
+        """GET /plugins/overseer/feedback/summary — the Squeeze report
+        card's conversations section: totals, by target kind, by model
+        (chat turns join chat_messages; voice chats carry the model in
+        their context), and the most recent notes (note-first: the
+        text is the signal)."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        rows = self.overseer_db.list_interaction_feedback(limit=500)
+        up = down = notes = 0
+        by_kind: dict = {}
+        by_model: dict = {}
+        # Batch-resolve models for chat_turn targets in one query.
+        turn_ids = []
+        for r in rows:
+            if r.get("target_kind") == "chat_turn":
+                try:
+                    turn_ids.append(int(r.get("target_id") or 0))
+                except (TypeError, ValueError):
+                    pass
+        turn_models: dict = {}
+        if turn_ids:
+            marks = ",".join("?" * len(turn_ids))
+            for mrow in self.overseer_db._conn.execute(
+                    f"SELECT id, model FROM chat_messages "
+                    f"WHERE id IN ({marks})", turn_ids).fetchall():
+                turn_models[mrow["id"]] = mrow["model"] or ""
+        recent = []
+        for r in rows:
+            rating = int(r.get("rating") or 0)
+            if rating > 0:
+                up += 1
+            elif rating < 0:
+                down += 1
+            if (r.get("note") or "").strip():
+                notes += 1
+            kind = r.get("target_kind") or "?"
+            k = by_kind.setdefault(kind, {"up": 0, "down": 0, "n": 0})
+            k["n"] += 1
+            if rating > 0:
+                k["up"] += 1
+            elif rating < 0:
+                k["down"] += 1
+            # Model attribution
+            model = ""
+            if kind == "chat_turn":
+                try:
+                    model = turn_models.get(int(r.get("target_id")), "")
+                except (TypeError, ValueError):
+                    model = ""
+            else:
+                ctx = _safe_json_loads(r.get("context_json"), {})
+                model = str(ctx.get("model") or "")
+            if model:
+                m = by_model.setdefault(
+                    model, {"up": 0, "down": 0, "n": 0})
+                m["n"] += 1
+                if rating > 0:
+                    m["up"] += 1
+                elif rating < 0:
+                    m["down"] += 1
+            if len(recent) < 30:
+                recent.append({
+                    "id": r.get("id"),
+                    "target_kind": kind,
+                    "target_id": r.get("target_id"),
+                    "rating": rating,
+                    "note": (r.get("note") or "")[:280],
+                    "model": model,
+                    "source": r.get("source"),
+                    "meta_thread_id": r.get("meta_thread_id"),
+                    "created_at": r.get("created_at"),
+                })
+        return {"ok": True,
+                "totals": {"count": len(rows), "up": up, "down": down,
+                           "with_notes": notes},
+                "by_kind": by_kind,
+                "by_model": by_model,
+                "recent": recent}
+
+    # ── Simples mirror (2026-07-11) ──────────────────────────────
+    # The phone's liquid planner, mirrored for the desktop's read-only
+    # Simples page. Display state, NOT corpus content (the planner's
+    # no-corpus decision from 2026-07-02 stands): one replaceable blob
+    # in overseer_state, phone authoritative, last write wins.
+
+    def _http_simples_snapshot_post(self, payload):
+        """POST /plugins/overseer/simples/snapshot
+        {goals: [...], blocks: [...], from, to}"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        goals = payload.get("goals")
+        blocks = payload.get("blocks")
+        if not isinstance(goals, list) or not isinstance(blocks, list):
+            return {"ok": False,
+                    "error": "'goals' and 'blocks' must be lists"}
+        if len(goals) > 500 or len(blocks) > 5000:
+            return {"ok": False, "error": "snapshot too large"}
+        from datetime import datetime, timezone
+        snap = {
+            "goals": goals,
+            "blocks": blocks,
+            "from": str(payload.get("from") or "")[:10],
+            "to": str(payload.get("to") or "")[:10],
+            "received_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"),
+        }
+        self.overseer_db.set_overseer_state(
+            "simples_snapshot_json",
+            json.dumps(snap, ensure_ascii=False, default=str))
+        self.overseer_db._safe_commit()
+        return {"ok": True, "goals": len(goals), "blocks": len(blocks)}
+
+    def _http_simples_snapshot_get(self, payload):
+        """GET /plugins/overseer/simples/snapshot"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        raw = self.overseer_db.get_overseer_state("simples_snapshot_json")
+        return {"ok": True,
+                "snapshot": _safe_json_loads(raw, None) if raw else None}
 
     # ── Agent harness (2026-07-11): MCP connectors ───────────────
 

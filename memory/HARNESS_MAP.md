@@ -22,7 +22,8 @@ get_harness_map chat tool.
   - Projects: per-project cards with narrative + stats; contains the
     collapsed Classification section (human/automation/ignore).
   - Squeeze: AI report card; model + task leaderboards from graded
-    dispatches (Lemon Squeezer direction).
+    dispatches (Lemon Squeezer direction) + the conversations section
+    (interaction feedback totals by surface/model + recent notes).
   - Ecosystem: map of AI actions (inspector).
   - Explorer: force-directed graph of questions/projects/patterns/
     themes/gists.
@@ -37,6 +38,9 @@ get_harness_map chat tool.
   /compress /cost /tick /whoami /insights), tool-call audit under
   replies, per-turn feedback (rate + note; Discuss with Overseer
   opens a context-seeded thread).
+- **Simples**: read-only mirror of the phone's liquid planner (goals
+  with progress + upcoming day blocks). The phone pushes a snapshot on
+  every home sync; editing stays on the phone.
 - **Journal**: human journal (with voice transcription) + temporal
   narratives (D/W/M/Y) + overseer tick reflections.
 - **System**: Activity (all AI runs, GitHub-style; rate dispatches
@@ -46,8 +50,8 @@ get_harness_map chat tool.
 ## Phone app (cortex-mobile, Expo/Android)
 
 - **Today**: daily brief, agenda, active projects, open question with
-  answer-by-voice, "The overseer asks" Bell card (answer/dismiss),
-  Talk button into voice.
+  answer-by-voice, "The overseer asks" Bell card (answer/dismiss +
+  rate-this feedback row), Talk button into voice.
 - **Simples**: liquid planner; goals -> auto-placed blocks around
   calendar anchors; Day/Week/Month/Year views; block tap sheet.
 - **Projects**: project list + detail from the synced corpus.
