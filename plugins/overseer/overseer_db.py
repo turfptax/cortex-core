@@ -2339,24 +2339,34 @@ class OverseerDB(CortexDB):
         embedding_meta pins the model: vectors from different models
         are not comparable, so a model change requires a full re-embed
         (drop + backfill). ensure_embedding_model() enforces this.
+
+        Only the vec_gists virtual table + embedding_meta are gated on
+        vec_available: a vec0 table cannot be created without sqlite-vec.
+        The rest of the migration chain (_migrate_15_missions and its
+        tail _migrate_taxonomy_gist_axes) is vec-independent schema and
+        MUST still run when vec is absent - it is called unconditionally
+        below. Early-returning here used to silently skip every later
+        link, so fresh installs without sqlite-vec (Windows dev, CI) came
+        up missing the missions + taxonomy schema, and a future Pi break
+        of sqlite-vec (e.g. a piwheels upgrade) would silently stall the
+        chain tail. Guard the vec DDL only, never the chain.
         """
-        if not self.vec_available:
-            return
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS embedding_meta ("
-            "  id INTEGER PRIMARY KEY CHECK (id = 1),"
-            "  model TEXT NOT NULL,"
-            "  dim INTEGER NOT NULL,"
-            "  created_at TEXT NOT NULL DEFAULT (datetime('now'))"
-            ")"
-        )
-        self._conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_gists USING vec0("
-            "  gist_id INTEGER PRIMARY KEY,"
-            "  embedding float[384] distance_metric=cosine"
-            ")"
-        )
-        self._safe_commit()
+        if self.vec_available:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS embedding_meta ("
+                "  id INTEGER PRIMARY KEY CHECK (id = 1),"
+                "  model TEXT NOT NULL,"
+                "  dim INTEGER NOT NULL,"
+                "  created_at TEXT NOT NULL DEFAULT (datetime('now'))"
+                ")"
+            )
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS vec_gists USING vec0("
+                "  gist_id INTEGER PRIMARY KEY,"
+                "  embedding float[384] distance_metric=cosine"
+                ")"
+            )
+            self._safe_commit()
         self._migrate_15_missions()
 
     def _migrate_15_missions(self):
