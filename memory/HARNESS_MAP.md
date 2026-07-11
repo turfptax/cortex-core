@@ -79,6 +79,9 @@ get_harness_map chat tool.
   search), sensitivity gating.
 - **Feedback layer**: interaction_feedback table; any rated/noted
   interaction; "discuss" seeds a chat thread with injected context.
+- **Health data**: health_daily table (day x metric daily rollups:
+  steps, sleep, scores, resting HR). Backfilled from Fitbit Takeout
+  via scripts/fitbit_takeout_ingest.py; feeds D20 STR/CON + Simples.
 - **MCP connectors**: the Pi is the MCP client (Option B, locked
   2026-07-11). Registered HTTP MCP servers contribute tools to the
   overseer's own tool loop as mcp_<connector>_<tool>.
