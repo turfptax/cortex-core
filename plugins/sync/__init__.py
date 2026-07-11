@@ -121,6 +121,14 @@ PUSH_KINDS = {
                                             "action_kind", "action_label",
                                             "response_payload_json",
                                             "taken_at"]),
+    # Interaction meta-feedback from the phone (2026-07-11): ratings +
+    # notes on AI interactions (voice chats, bell conversations). Same
+    # table the Hub's /feedback route writes; note-first per Tory's
+    # directive. The overseer reads it via get_recent_feedback.
+    "interaction_feedback": ("overseer", ["target_kind", "target_id",
+                                          "rating", "note",
+                                          "context_json", "source",
+                                          "created_at"]),
 }
 
 DEVICE_NOTIFICATIONS_DDL = """CREATE TABLE IF NOT EXISTS device_notifications (
