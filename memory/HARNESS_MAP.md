@@ -64,7 +64,9 @@ get_harness_map chat tool.
 - **Memory**: browse the synced interpretive corpus (gists, journal,
   questions, people).
 - **Settings**: local data stats, work-log reminders, sync (pending
-  review + sync now), notification capture toggle, Pi config.
+  review + sync now), notification capture toggle, Pi config, Gateway
+  cloud link (paste token; shows a reconnect banner when the token
+  expires or is revoked).
 - **Capture**: quick journal/note entry with type + project tag.
 - **Pending upload**: pre-sync review; tap any item to omit it from
   the corpus.
