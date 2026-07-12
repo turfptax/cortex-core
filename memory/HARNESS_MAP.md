@@ -38,9 +38,11 @@ get_harness_map chat tool.
   /compress /cost /tick /whoami /insights), tool-call audit under
   replies, per-turn feedback (rate + note; Discuss with Overseer
   opens a context-seeded thread).
-- **Simples**: read-only mirror of the phone's liquid planner (goals
-  with progress + upcoming day blocks). The phone pushes a snapshot on
-  every home sync; editing stays on the phone.
+- **Simples**: read-only mirror of the phone's liquid planner. Day
+  (hour timeline, now-line, laned blocks over a downtime wash), Week
+  (7 mini timelines), Month (planned-hours heat calendar) + goal
+  progress. The phone pushes a snapshot on every home sync; editing
+  stays on the phone.
 - **Journal**: human journal (with voice transcription) + temporal
   narratives (D/W/M/Y) + overseer tick reflections.
 - **System**: Activity (all AI runs, GitHub-style; rate dispatches
