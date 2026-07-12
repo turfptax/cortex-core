@@ -89,6 +89,13 @@ get_harness_map chat tool.
 - **MCP connectors**: the Pi is the MCP client (Option B, locked
   2026-07-11). Registered HTTP MCP servers contribute tools to the
   overseer's own tool loop as mcp_<connector>_<tool>.
+- **Tech skills + rules** (2026-07-12): living skills portfolio
+  (tech_skills + tech_skill_log) and tech-decisions rules log
+  (tech_rules). AI sessions log lessons via cortex_skill_log /
+  cortex_rule_add MCP tools; every connecting AI gets the active
+  rules digest in /intro; overseer chat reads them via
+  get_tech_rules. Routes: /skills, /skills/get, /skills/log,
+  /rules, /rules/add.
 - **Sync plugin**: phone push/pull contract v2 + Gateway forward.
 - **Weather plugin**: NWS polling + alerts into the Bell.
 - **MCP server surface**: cortex_* tools for external AIs (search,

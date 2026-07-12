@@ -1417,6 +1417,32 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_tech_rules",
+            "description": (
+                "Tory's standing tech rules - hard-won defaults from "
+                "things that went wrong in his stacks (each carries "
+                "the story: what broke, what changed, why it is now "
+                "the default). Read these before advising on tooling "
+                "or debugging in a stack he uses; they apply to every "
+                "AI conversation connected to Cortex."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stack": {
+                        "type": "string",
+                        "description": (
+                            "Optional substring filter on the stack "
+                            "tags, e.g. 'expo' or 'powershell'."
+                        ),
+                    },
+                },
+            },
+        },
+    },
 ]
 
 # ── Slice 10 (2026-05-20): Category B agent tools ────────────────
@@ -1521,6 +1547,11 @@ def _dispatch(name: str, args: dict, *, db, core_memory,
             if ctx and ctx != "{}":
                 r["context_excerpt"] = ctx[:300]
         return {"feedback": rows, "count": len(rows)}
+
+    if name == "get_tech_rules":
+        stack = (args.get("stack") or "").strip() or None
+        rules = db.list_rules(status="active", stack=stack, limit=50)
+        return {"rules": rules, "count": len(rules)}
 
     # ── Slice 10: Category B agent dispatch ──────────────────────
     # Any tool name starting with 'dispatch_b_' routes to the B-agent

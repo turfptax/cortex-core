@@ -943,6 +943,63 @@ CREATE INDEX IF NOT EXISTS idx_person_notes_person
 CREATE INDEX IF NOT EXISTS idx_person_notes_live
     ON person_notes(person_id, superseded_by);
 
+-- ── Tech skills + rules (2026-07-12) ─────────────────────────────
+-- A living portfolio of the user's technical skills and a decisions
+-- log of hard-won default rules. PRIMARY writers are AI agents via
+-- the cortex_skill_log / cortex_rule_add MCP tools; every connecting
+-- AI reads the active rules through /intro. Tech stacks, tools,
+-- lessons only; no personal-life data (this repo is public).
+--
+-- tech_skills is the portfolio header (one row per core skill:
+-- "PCB design", "React Native", "LLM agent architecture").
+-- tech_skill_log is the append-only history under a skill: lessons
+-- learned, wins/breakthroughs, key projects, tooling notes.
+CREATE TABLE IF NOT EXISTS tech_skills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,      -- canonical skill name; the constraint enforces case-insensitive dedup
+    proficiency TEXT NOT NULL DEFAULT '',          -- freeform: 'expert', 'working', 'learning'
+    summary TEXT NOT NULL DEFAULT '',              -- living one-paragraph portfolio blurb
+    tools TEXT NOT NULL DEFAULT '',                -- comma list with versions: 'KiCad 8, JLCPCB'
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_tech_skills_name_lower
+    ON tech_skills(LOWER(name));
+
+CREATE TABLE IF NOT EXISTS tech_skill_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    skill_id INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'note',             -- lesson | win | project | tooling | note
+    content TEXT NOT NULL,
+    project TEXT NOT NULL DEFAULT '',              -- project tag where it happened
+    source TEXT NOT NULL DEFAULT '',               -- which agent/session logged it
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (skill_id) REFERENCES tech_skills(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_tech_skill_log_skill
+    ON tech_skill_log(skill_id, created_at);
+
+-- tech_rules is the decisions log: "stack X in situation Y" plus the
+-- story (what went wrong, what changed, why it is now the default).
+-- `rule` is the imperative one-liner served to every connecting AI;
+-- the story fields are the evidence trail behind it.
+CREATE TABLE IF NOT EXISTS tech_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL UNIQUE COLLATE NOCASE,     -- 'Expo SDK 51 permission prompts'
+    rule TEXT NOT NULL,                            -- the imperative default, one or two sentences
+    stack TEXT NOT NULL DEFAULT '',                -- comma tags: 'expo,react-native,android'
+    situation TEXT NOT NULL DEFAULT '',            -- when the rule applies
+    went_wrong TEXT NOT NULL DEFAULT '',           -- what failed, concretely
+    what_changed TEXT NOT NULL DEFAULT '',         -- the fix/approach adopted
+    rationale TEXT NOT NULL DEFAULT '',            -- why it is now the default
+    status TEXT NOT NULL DEFAULT 'active',         -- active | retired
+    source TEXT NOT NULL DEFAULT '',               -- which agent/session added it
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_tech_rules_status
+    ON tech_rules(status, updated_at);
+
 -- Notification classification (2026-06-13): a sidecar over the sync
 -- plugin's device_notifications, like processed_imported_sessions over
 -- imported_sessions. 3 tiers: signal (keep as corpus context), ambient
@@ -1351,6 +1408,8 @@ class OverseerDB(CortexDB):
         # Agent harness (2026-07-10): runs unconditionally — see the
         # note above _migrate_chat_threads about the fragile chain.
         self._migrate_chat_threads()
+        # Tech skills/rules (2026-07-12): same direct-call rule.
+        self._migrate_tech_nocase()
         # Slice 9.4.1 (2026-05-16): every _at column gets a paired
         # local_<col>_at populated by trigger. Auto-discovers any new
         # tables added by future slices so the "time always shows
@@ -2444,6 +2503,86 @@ class OverseerDB(CortexDB):
                         col, decl))
                 log.info("_migrate_taxonomy_gist_axes: added %s column", col)
         self._safe_commit()
+
+    def _migrate_tech_nocase(self):
+        """Tech skills/rules (2026-07-12): the first deploy shipped
+        tech_skills.name / tech_rules.title UNIQUE with BINARY
+        collation while dedup is case-insensitive in code, so the
+        constraint did not enforce the natural key and concurrent
+        writers could create case-variant duplicates. Rebuild both
+        tables with UNIQUE COLLATE NOCASE, preserving rows AND ids
+        (tech_skill_log FKs stay valid). CREATE TABLE IF NOT EXISTS
+        never retrofits, hence this migration
+        (memory/feedback_create_table_if_not_exists_drift.md).
+        Called directly from __init__; idempotent (no-ops once the
+        table SQL carries NOCASE)."""
+        specs = {
+            "tech_skills": (
+                ("id", "name", "proficiency", "summary", "tools",
+                 "created_at", "updated_at"),
+                "CREATE TABLE tech_skills ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " name TEXT NOT NULL UNIQUE COLLATE NOCASE,"
+                " proficiency TEXT NOT NULL DEFAULT '',"
+                " summary TEXT NOT NULL DEFAULT '',"
+                " tools TEXT NOT NULL DEFAULT '',"
+                " created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+                " updated_at TEXT NOT NULL DEFAULT (datetime('now')))",
+                "CREATE INDEX IF NOT EXISTS idx_tech_skills_name_lower"
+                " ON tech_skills(LOWER(name))"),
+            "tech_rules": (
+                ("id", "title", "rule", "stack", "situation",
+                 "went_wrong", "what_changed", "rationale", "status",
+                 "source", "created_at", "updated_at"),
+                "CREATE TABLE tech_rules ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " title TEXT NOT NULL UNIQUE COLLATE NOCASE,"
+                " rule TEXT NOT NULL,"
+                " stack TEXT NOT NULL DEFAULT '',"
+                " situation TEXT NOT NULL DEFAULT '',"
+                " went_wrong TEXT NOT NULL DEFAULT '',"
+                " what_changed TEXT NOT NULL DEFAULT '',"
+                " rationale TEXT NOT NULL DEFAULT '',"
+                " status TEXT NOT NULL DEFAULT 'active',"
+                " source TEXT NOT NULL DEFAULT '',"
+                " created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+                " updated_at TEXT NOT NULL DEFAULT (datetime('now')))",
+                "CREATE INDEX IF NOT EXISTS idx_tech_rules_status"
+                " ON tech_rules(status, updated_at)"),
+        }
+        for table, (cols, create_sql, index_sql) in specs.items():
+            row = self._conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name=?", (table,)).fetchone()
+            if not row or "NOCASE" in (row[0] or "").upper():
+                continue
+            col_list = ", ".join(cols)
+            with self._write_lock:
+                rows = self._conn.execute(
+                    "SELECT {} FROM {}".format(col_list, table)
+                ).fetchall()
+                # FKs OFF so dropping tech_skills cannot cascade-
+                # delete tech_skill_log rows; restored right after.
+                # (PRAGMA is a no-op inside a transaction, so it runs
+                # before the DROP opens one.)
+                self._conn.execute("PRAGMA foreign_keys=OFF")
+                try:
+                    self._conn.execute("DROP TABLE {}".format(table))
+                    self._conn.execute(create_sql)
+                    marks = ", ".join("?" for _ in cols)
+                    for r in rows:
+                        # OR IGNORE: a case-variant duplicate pair
+                        # from the pre-NOCASE window keeps only the
+                        # first (lower-id) row.
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO {} ({}) VALUES ({})"
+                            .format(table, col_list, marks), tuple(r))
+                    self._conn.execute(index_sql)
+                    self._safe_commit()
+                finally:
+                    self._conn.execute("PRAGMA foreign_keys=ON")
+            log.info("_migrate_tech_nocase: rebuilt %s with NOCASE"
+                     " (%d rows)", table, len(rows))
 
     # Called directly from __init__, NOT chained off the taxonomy
     # migration: _migrate_vector_index early-returns when sqlite-vec
@@ -6747,6 +6886,210 @@ class OverseerDB(CortexDB):
             "DELETE FROM person_notes WHERE id = ?", (int(note_id),))
         self._safe_commit()
         return cur.rowcount
+
+    # ── Tech skills + rules (2026-07-12) ────────────────────────
+    # Living skills portfolio + tech-decisions rules log. Written by
+    # connected AI agents (MCP), read by every AI at session start
+    # via /intro. Mirrors the people-entity patterns: idempotent
+    # upserts on case-insensitive natural keys, audit source fields.
+
+    SKILL_LOG_KINDS = ("lesson", "win", "project", "tooling", "note")
+
+    def _get_skill_by_name(self, name):
+        row = self._conn.execute(
+            "SELECT * FROM tech_skills WHERE LOWER(name) = LOWER(?)",
+            (name.strip(),)).fetchone()
+        return dict(row) if row else None
+
+    def upsert_skill(self, *, name, proficiency=None, summary=None,
+                     tools=None):
+        """Idempotent on case-insensitive name. Creates the skill or
+        refines it: only non-empty provided fields overwrite (refine
+        rule; an explicit "" cannot blank a living portfolio field).
+        Serialized under the write lock; a concurrent same-name
+        insert converges via the NOCASE UNIQUE constraint.
+        Returns {skill, created}."""
+        if not name or not name.strip():
+            raise ValueError("name required")
+        with self._write_lock:
+            existing = self._get_skill_by_name(name)
+            if existing:
+                sets, params = ["updated_at = datetime('now')"], []
+                for col, val in (("proficiency", proficiency),
+                                 ("summary", summary), ("tools", tools)):
+                    if val is not None and str(val).strip():
+                        sets.append(f"{col} = ?")
+                        params.append(str(val).strip())
+                if len(sets) > 1:
+                    params.append(existing["id"])
+                    self._conn.execute(
+                        "UPDATE tech_skills SET " + ", ".join(sets)
+                        + " WHERE id = ?", params)
+                    self._safe_commit()
+                    existing = self._get_skill_by_name(name)
+                return {"skill": existing, "created": False}
+            try:
+                self._conn.execute(
+                    "INSERT INTO tech_skills (name, proficiency, summary, tools) "
+                    "VALUES (?, ?, ?, ?)",
+                    (name.strip(), (proficiency or "").strip(),
+                     (summary or "").strip(), (tools or "").strip()))
+                self._safe_commit()
+                return {"skill": self._get_skill_by_name(name),
+                        "created": True}
+            except sqlite3.IntegrityError:
+                # Lost a cross-process race; the row exists now.
+                return {"skill": self._get_skill_by_name(name),
+                        "created": False}
+
+    def log_skill_entry(self, *, skill, kind="note", content,
+                        project="", source="", proficiency=None):
+        """Append a log entry under a skill (created if new). kind is
+        case-normalized; anything outside SKILL_LOG_KINDS is coerced
+        to 'note'. proficiency, if given, also updates the skill
+        header. Returns {skill, entry, skill_created}."""
+        if not content or not content.strip():
+            raise ValueError("content required")
+        r = self.upsert_skill(name=skill, proficiency=proficiency)
+        kind = (kind or "note").strip().lower()
+        kind = kind if kind in self.SKILL_LOG_KINDS else "note"
+        cur = self._conn.execute(
+            "INSERT INTO tech_skill_log (skill_id, kind, content, "
+            " project, source) VALUES (?, ?, ?, ?, ?)",
+            (r["skill"]["id"], kind, content.strip(),
+             (project or "").strip(), (source or "").strip()))
+        self._conn.execute(
+            "UPDATE tech_skills SET updated_at = datetime('now') "
+            "WHERE id = ?", (r["skill"]["id"],))
+        self._safe_commit()
+        entry = dict(self._conn.execute(
+            "SELECT * FROM tech_skill_log WHERE id = ?",
+            (cur.lastrowid,)).fetchone())
+        return {"skill": self._get_skill_by_name(skill),
+                "entry": entry, "skill_created": r["created"]}
+
+    def list_skills(self, *, limit=100):
+        """Portfolio index: headers + entry counts + last activity."""
+        rows = self._conn.execute(
+            "SELECT s.*, "
+            " (SELECT COUNT(*) FROM tech_skill_log l "
+            "   WHERE l.skill_id = s.id) AS entry_count, "
+            " (SELECT MAX(created_at) FROM tech_skill_log l "
+            "   WHERE l.skill_id = s.id) AS last_entry_at "
+            "FROM tech_skills s ORDER BY s.updated_at DESC LIMIT ?",
+            (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_skill(self, name, *, log_limit=50):
+        """Full portfolio entry: header + recent log, newest first."""
+        skill = self._get_skill_by_name(name)
+        if not skill:
+            return None
+        rows = self._conn.execute(
+            "SELECT * FROM tech_skill_log WHERE skill_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (skill["id"], int(log_limit))).fetchall()
+        skill["log"] = [dict(r) for r in rows]
+        return skill
+
+    def add_rule(self, *, title, rule, stack="", situation="",
+                 went_wrong="", what_changed="", rationale="",
+                 status=None, source=""):
+        """Upsert on case-insensitive title so agents can refine or
+        retire a rule under its natural key. On update, only non-empty
+        fields overwrite (status only when explicitly given). An
+        invalid status raises rather than silently keeping the rule
+        active. Returns {rule, created}."""
+        if not title or not title.strip():
+            raise ValueError("title required")
+        if status is not None and str(status).strip():
+            status = str(status).strip().lower()
+            if status not in ("active", "retired"):
+                raise ValueError(
+                    "status must be 'active' or 'retired', got "
+                    f"'{status}'")
+        else:
+            status = None
+        with self._write_lock:
+            existing = self._conn.execute(
+                "SELECT * FROM tech_rules WHERE LOWER(title) = LOWER(?)",
+                (title.strip(),)).fetchone()
+            if existing:
+                sets, params = ["updated_at = datetime('now')"], []
+                for col, val in (("rule", rule), ("stack", stack),
+                                 ("situation", situation),
+                                 ("went_wrong", went_wrong),
+                                 ("what_changed", what_changed),
+                                 ("rationale", rationale),
+                                 ("source", source)):
+                    if val and str(val).strip():
+                        sets.append(f"{col} = ?")
+                        params.append(str(val).strip())
+                if status is not None:
+                    sets.append("status = ?")
+                    params.append(status)
+                params.append(existing["id"])
+                self._conn.execute(
+                    "UPDATE tech_rules SET " + ", ".join(sets)
+                    + " WHERE id = ?", params)
+                self._safe_commit()
+                row = self._conn.execute(
+                    "SELECT * FROM tech_rules WHERE id = ?",
+                    (existing["id"],)).fetchone()
+                return {"rule": dict(row), "created": False}
+            if not rule or not rule.strip():
+                raise ValueError("rule required")
+            try:
+                cur = self._conn.execute(
+                    "INSERT INTO tech_rules (title, rule, stack, situation, "
+                    " went_wrong, what_changed, rationale, status, source) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (title.strip(), rule.strip(), (stack or "").strip(),
+                     (situation or "").strip(), (went_wrong or "").strip(),
+                     (what_changed or "").strip(), (rationale or "").strip(),
+                     status or "active", (source or "").strip()))
+                self._safe_commit()
+            except sqlite3.IntegrityError:
+                # Lost a cross-process race; refine the winner instead.
+                return self.add_rule(
+                    title=title, rule=rule, stack=stack,
+                    situation=situation, went_wrong=went_wrong,
+                    what_changed=what_changed, rationale=rationale,
+                    status=status, source=source)
+            row = self._conn.execute(
+                "SELECT * FROM tech_rules WHERE id = ?",
+                (cur.lastrowid,)).fetchone()
+            return {"rule": dict(row), "created": True}
+
+    def list_rules(self, *, status="active", stack=None, limit=200):
+        """Rules log, most recently touched first. status=None or
+        'all' returns everything; stack substring-filters the tag."""
+        sql = "SELECT * FROM tech_rules WHERE 1=1"
+        params: list = []
+        if status and status != "all":
+            sql += " AND status = ?"
+            params.append(status)
+        if stack:
+            sql += " AND LOWER(stack) LIKE ?"
+            params.append(f"%{stack.strip().lower()}%")
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def rules_digest(self, *, limit=30):
+        """Compact active-rules list for /intro and chat injection:
+        [{title, rule, stack}], most recently affirmed first. Fields
+        are clamped like every other intro section so an over-long
+        (or abusive) agent-written rule cannot flood the brief served
+        to every connecting AI; full text stays behind list_rules."""
+        rows = self._conn.execute(
+            "SELECT title, rule, stack FROM tech_rules "
+            "WHERE status = 'active' "
+            "ORDER BY updated_at DESC LIMIT ?", (int(limit),)).fetchall()
+        return [{"title": (r["title"] or "")[:120],
+                 "rule": (r["rule"] or "")[:280],
+                 "stack": (r["stack"] or "")[:60]} for r in rows]
 
     # ── notification classification + ambient observations (2026-06-13) ──
 

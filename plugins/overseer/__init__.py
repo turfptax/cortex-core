@@ -253,6 +253,19 @@ def _render_intro_markdown(brief: dict) -> str:
             parts.append(f"- {b['calibration_note']}")
         parts.append("")
 
+    rules = brief.get("standing_tech_rules") or []
+    if rules:
+        parts.append("## Standing tech rules (apply these)")
+        parts.append("")
+        parts.append("*Hard-won defaults from things that actually "
+                      "went wrong in his stacks. Full stories via the "
+                      "cortex_rules tool.*")
+        parts.append("")
+        for r in rules:
+            stack = f" `[{r['stack']}]`" if r.get("stack") else ""
+            parts.append(f"- **{r['title']}**{stack}: {r['rule']}")
+        parts.append("")
+
     notes = brief.get("recent_future_notes") or []
     if notes:
         parts.append("## Institutional memory (from prior instances)")
@@ -518,6 +531,17 @@ class OverseerPlugin(Plugin):
                   self._http_add_person_note),
             Route("POST", "/people/notes/delete",
                   self._http_delete_person_note),
+            # ── Tech skills + rules (2026-07-12) ─────────────────
+            Route("GET",  "/skills",
+                  self._http_skills_list),
+            Route("GET",  "/skills/get",
+                  self._http_skills_get),
+            Route("POST", "/skills/log",
+                  self._http_skills_log),
+            Route("GET",  "/rules",
+                  self._http_rules_list),
+            Route("POST", "/rules/add",
+                  self._http_rules_add),
             # ── Slice 9.3: sibling task dispatch ─────────────────
             Route("POST", "/sibling/dispatch",
                   self._http_sibling_dispatch),
@@ -3377,6 +3401,103 @@ class OverseerPlugin(Plugin):
         return {"ok": True, "q": q, "count": len(results),
                 "knn_ms": knn_ms, "results": results}
 
+    # ── Tech skills + rules handlers (2026-07-12) ────────────────
+
+    def _http_skills_list(self, payload):
+        """GET /plugins/overseer/skills, the portfolio index."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        try:
+            limit = max(1, min(int(payload.get("limit") or 100), 500))
+        except (TypeError, ValueError):
+            limit = 100
+        return {"ok": True,
+                "skills": self.overseer_db.list_skills(limit=limit)}
+
+    def _http_skills_get(self, payload):
+        """GET /plugins/overseer/skills/get?name=... full entry."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        name = (payload.get("name") or "").strip()
+        if not name:
+            return {"ok": False, "error": "name required"}
+        skill = self.overseer_db.get_skill(name)
+        if not skill:
+            return {"ok": False, "error": f"no skill named '{name}'"}
+        return {"ok": True, "skill": skill}
+
+    def _http_skills_log(self, payload):
+        """POST /plugins/overseer/skills/log: append a portfolio
+        entry (lesson/win/project/tooling/note); creates the skill
+        header on first mention. {skill, content, kind?, project?,
+        source?, proficiency?, summary?, tools?}"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        skill = (payload.get("skill") or "").strip()
+        content = (payload.get("content") or "").strip()
+        if not skill or not content:
+            return {"ok": False, "error": "skill + content required"}
+        try:
+            r = self.overseer_db.log_skill_entry(
+                skill=skill,
+                kind=(payload.get("kind") or "note").strip(),
+                content=content,
+                project=(payload.get("project") or "").strip(),
+                source=(payload.get("source") or "").strip(),
+                proficiency=payload.get("proficiency"),
+            )
+            # summary/tools ride the same call when provided.
+            if payload.get("summary") is not None or payload.get("tools") is not None:
+                self.overseer_db.upsert_skill(
+                    name=skill,
+                    summary=payload.get("summary"),
+                    tools=payload.get("tools"))
+                r["skill"] = self.overseer_db.get_skill(skill, log_limit=0)
+        except Exception as e:
+            log.exception("skills/log failed")
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, **r}
+
+    def _http_rules_list(self, payload):
+        """GET /plugins/overseer/rules?status=&stack=, the decisions log."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        try:
+            limit = max(1, min(int(payload.get("limit") or 200), 500))
+        except (TypeError, ValueError):
+            limit = 200
+        rules = self.overseer_db.list_rules(
+            status=(payload.get("status") or "active").strip(),
+            stack=(payload.get("stack") or "").strip() or None,
+            limit=limit)
+        return {"ok": True, "rules": rules}
+
+    def _http_rules_add(self, payload):
+        """POST /plugins/overseer/rules/add: upsert on title.
+        {title, rule, stack?, situation?, went_wrong?, what_changed?,
+        rationale?, status?, source?}"""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        title = (payload.get("title") or "").strip()
+        if not title:
+            return {"ok": False, "error": "title required"}
+        try:
+            r = self.overseer_db.add_rule(
+                title=title,
+                rule=(payload.get("rule") or "").strip(),
+                stack=(payload.get("stack") or "").strip(),
+                situation=(payload.get("situation") or "").strip(),
+                went_wrong=(payload.get("went_wrong") or "").strip(),
+                what_changed=(payload.get("what_changed") or "").strip(),
+                rationale=(payload.get("rationale") or "").strip(),
+                status=(payload.get("status") or "").strip() or None,
+                source=(payload.get("source") or "").strip(),
+            )
+        except Exception as e:
+            log.exception("rules/add failed")
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, **r}
+
     def _http_intro(self, payload):
         """GET /plugins/overseer/intro
 
@@ -3559,6 +3680,15 @@ class OverseerPlugin(Plugin):
             except Exception as e:
                 log.warning("intro: blindspots failed: %s", e)
                 brief["blindspots"] = []
+
+            # STANDING TECH RULES: hard-won defaults every connecting
+            # AI should apply. Full stories via GET /rules or the
+            # cortex_rules MCP tool.
+            try:
+                brief["standing_tech_rules"] = db.rules_digest(limit=15)
+            except Exception as e:
+                log.warning("intro: tech rules failed: %s", e)
+                brief["standing_tech_rules"] = []
 
             # INSTITUTIONAL MEMORY: most recent future_overseer_notes
             try:
