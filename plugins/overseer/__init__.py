@@ -531,6 +531,11 @@ class OverseerPlugin(Plugin):
                   self._http_add_person_note),
             Route("POST", "/people/notes/delete",
                   self._http_delete_person_note),
+            # ── Day-in-Cortex (2026-07-12): permanent memory ─────
+            Route("GET",  "/day",
+                  self._http_day_detail),
+            Route("GET",  "/day/heat",
+                  self._http_day_heat),
             # ── Tech skills + rules (2026-07-12) ─────────────────
             Route("GET",  "/skills",
                   self._http_skills_list),
@@ -3400,6 +3405,192 @@ class OverseerPlugin(Plugin):
             })
         return {"ok": True, "q": q, "count": len(results),
                 "knn_ms": knn_ms, "results": results}
+
+    # ── Day-in-Cortex handlers (2026-07-12) ──────────────────────
+    # Permanent memory: everything the corpus holds about one local
+    # day, for any date across all years. Backs the Hub's Simples
+    # Day panel and the Year heat. Read-only aggregation; the Hub is
+    # the user's own private surface, so nothing is sensitivity-
+    # filtered here (the gateway connector path has its own gate).
+
+    # Local-day expression: prefer the structural local-with-offset
+    # twin column, fall back to the raw timestamp's date prefix.
+    @staticmethod
+    def _local_day_expr(col):
+        return ("substr(COALESCE(NULLIF(local_{c},''), {c}), 1, 10)"
+                .format(c=col))
+
+    def _http_day_detail(self, payload):
+        """GET /plugins/overseer/day?date=YYYY-MM-DD
+
+        One local day across the corpus: AI sessions (with their gist
+        one-liners), logged time entries, health metrics (steps,
+        sleep, scores), human journal entries, and the daily
+        narrative if one was generated."""
+        import re as _re
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        raw = payload.get("date")
+        if isinstance(raw, list):  # repeated query param arrives as a list
+            raw = raw[-1] if raw else ""
+        date = (raw or "").strip() if isinstance(raw, str) else ""
+        if not _re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+            return {"ok": False, "error": "date must be YYYY-MM-DD"}
+        conn = self.overseer_db._conn
+        out = {"ok": True, "date": date}
+
+        day_started = self._local_day_expr("started_at")
+        try:
+            rows = conn.execute(
+                "SELECT id, source, project, started_at, "
+                "       local_started_at, duration_minutes, "
+                "       message_count, tool_use_count, sensitivity, "
+                "       redacted_at "
+                "FROM imported_sessions "
+                "WHERE {} = ? "
+                "ORDER BY COALESCE(NULLIF(local_started_at,''), started_at)"
+                .format(day_started), (date,)).fetchall()
+            sessions = [dict(r) for r in rows]
+            ids = [s["id"] for s in sessions]
+            gists = {}
+            if ids:
+                # Canonical session-to-gist link is
+                # processed_imported_sessions.imported_id -> gist_id
+                # (raw_pointers is the jsonl-file provenance channel,
+                # not the session link).
+                marks = ",".join("?" * len(ids))
+                for g in conn.execute(
+                        "SELECT p.imported_id AS sid, g.body "
+                        "FROM processed_imported_sessions p "
+                        "JOIN summaries_gist g ON g.id = p.gist_id "
+                        "WHERE p.imported_id IN ({}) "
+                        "ORDER BY g.id".format(marks),
+                        ids):
+                    gists[g["sid"]] = g["body"]  # newest gist id wins
+            for s in sessions:
+                s["gist"] = (gists.get(s["id"]) or "")[:400]
+                s["redacted"] = bool(s.pop("redacted_at", None))
+            out["sessions"] = sessions
+            # Same 16h/session clamp as /day/heat so the Year tooltip
+            # and this header can never disagree about a day.
+            out["session_minutes"] = sum(
+                min(s["duration_minutes"] or 0, 960) for s in sessions)
+        except Exception as e:
+            log.warning("day: sessions failed: %s", e)
+            out["sessions"] = []
+            out["session_minutes"] = 0
+
+        try:
+            cm = getattr(self.core_memory, "_conn", None)
+            if cm is not None:
+                rows = cm.execute(
+                    "SELECT project_tag, activity_type, description, "
+                    "       started_at, local_started_at, duration_minutes "
+                    "FROM time_entries WHERE {} = ? "
+                    "ORDER BY COALESCE(NULLIF(local_started_at,''), started_at)"
+                    .format(day_started), (date,)).fetchall()
+                out["time_entries"] = [dict(r) for r in rows]
+            else:
+                out["time_entries"] = []
+        except Exception as e:
+            log.warning("day: time_entries failed: %s", e)
+            out["time_entries"] = []
+        out["logged_minutes"] = sum(
+            t.get("duration_minutes") or 0 for t in out["time_entries"])
+
+        try:
+            out["health"] = {
+                r["metric"]: r["value"] for r in conn.execute(
+                    "SELECT metric, MAX(value) AS value FROM health_daily "
+                    "WHERE day = ? GROUP BY metric", (date,))}
+        except Exception:
+            out["health"] = {}  # table absent on installs without the backfill
+
+        try:
+            day_created = self._local_day_expr("created_at")
+            rows = conn.execute(
+                "SELECT text, entry_type, created_at, local_created_at "
+                "FROM human_journal_entries WHERE {} = ? "
+                "ORDER BY created_at".format(day_created), (date,)).fetchall()
+            out["journal"] = [dict(r) for r in rows]
+        except Exception as e:
+            log.warning("day: journal failed: %s", e)
+            out["journal"] = []
+
+        try:
+            row = conn.execute(
+                "SELECT narrative FROM temporal_narratives "
+                "WHERE kind = 'daily' AND period_label = ? "
+                "ORDER BY id DESC LIMIT 1", (date,)).fetchone()
+            out["narrative"] = row["narrative"] if row else ""
+        except Exception:
+            out["narrative"] = ""
+        return out
+
+    def _http_day_heat(self, payload):
+        """GET /plugins/overseer/day/heat?year=YYYY
+
+        Per-day aggregates for a whole year, keyed by local day:
+        s = AI-session minutes, sc = session count, t = logged
+        time-entry minutes, z = hours slept, p = steps. Feeds the
+        Hub's Year view for any year the corpus covers."""
+        if self.overseer_db is None:
+            return {"ok": False, "error": "overseer not initialized"}
+        try:
+            year = int(payload.get("year") or 0)
+        except (TypeError, ValueError):
+            year = 0
+        if not (1990 <= year <= 2100):
+            return {"ok": False, "error": "year must be 1990-2100"}
+        conn = self.overseer_db._conn
+        like = "{}-%".format(year)
+        days = {}
+
+        def bucket(d):
+            return days.setdefault(d, {})
+
+        day_started = self._local_day_expr("started_at")
+        try:
+            # Per-session contribution clamped to 16h: a session row
+            # whose timestamps straddle a long gap must not turn one
+            # day into "250h of AI work" in the texture.
+            for r in conn.execute(
+                    "SELECT {expr} AS d, "
+                    "       SUM(MIN(duration_minutes, 960)) AS m, "
+                    "       COUNT(*) AS c "
+                    "FROM imported_sessions WHERE {expr} LIKE ? "
+                    "GROUP BY d".format(expr=day_started), (like,)):
+                b = bucket(r["d"])
+                b["s"] = r["m"] or 0
+                b["sc"] = r["c"] or 0
+        except Exception as e:
+            log.warning("day/heat: sessions failed: %s", e)
+
+        try:
+            cm = getattr(self.core_memory, "_conn", None)
+            if cm is not None:
+                for r in cm.execute(
+                        "SELECT {expr} AS d, SUM(duration_minutes) AS m "
+                        "FROM time_entries WHERE {expr} LIKE ? "
+                        "GROUP BY d".format(expr=day_started), (like,)):
+                    bucket(r["d"])["t"] = r["m"] or 0
+        except Exception as e:
+            log.warning("day/heat: time_entries failed: %s", e)
+
+        try:
+            for r in conn.execute(
+                    "SELECT day, metric, MAX(value) AS value "
+                    "FROM health_daily WHERE day LIKE ? "
+                    "  AND metric IN ('sleep_minutes', 'steps') "
+                    "GROUP BY day, metric", (like,)):
+                b = bucket(r["day"])
+                if r["metric"] == "sleep_minutes":
+                    b["z"] = round((r["value"] or 0) / 60.0, 1)
+                else:
+                    b["p"] = int(r["value"] or 0)
+        except Exception:
+            pass  # health_daily absent on installs without the backfill
+        return {"ok": True, "year": year, "days": days}
 
     # ── Tech skills + rules handlers (2026-07-12) ────────────────
 

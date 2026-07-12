@@ -38,12 +38,16 @@ get_harness_map chat tool.
   /compress /cost /tick /whoami /insights), tool-call audit under
   replies, per-turn feedback (rate + note; Discuss with Overseer
   opens a context-seeded thread).
-- **Simples**: read-only mirror of the phone's liquid planner. Day
-  (hour timeline, now-line, laned blocks over a downtime wash), Week
-  (7 mini timelines), Month (planned-hours heat calendar), Year (the
-  year as texture: day slivers shaded by credited hours from the
-  logged time_entries) + goal progress. The phone pushes a snapshot
-  on every home sync; editing stays on the phone.
+- **Simples**: the planner mirror + permanent memory. Day (hour
+  timeline of the phone's plan + a "This day in Cortex" panel: AI
+  sessions with gists, logged time, health, journal, daily
+  narrative, for ANY date), Week (7 mini timelines), Month
+  (planned-hours heat), Year (the year as texture for any year the
+  corpus covers: day slivers shaded by AI-session + logged hours,
+  hover for sleep/steps, click into the day) + goal progress. The
+  phone pushes a plan snapshot on home sync; editing stays on the
+  phone; the corpus layers come from Pi routes /plugins/overseer/day
+  and /day/heat.
 - **Journal**: human journal (with voice transcription) + temporal
   narratives (D/W/M/Y) + overseer tick reflections.
 - **System**: Activity (all AI runs, GitHub-style; rate dispatches
