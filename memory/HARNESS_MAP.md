@@ -40,9 +40,10 @@ get_harness_map chat tool.
   opens a context-seeded thread).
 - **Simples**: read-only mirror of the phone's liquid planner. Day
   (hour timeline, now-line, laned blocks over a downtime wash), Week
-  (7 mini timelines), Month (planned-hours heat calendar) + goal
-  progress. The phone pushes a snapshot on every home sync; editing
-  stays on the phone.
+  (7 mini timelines), Month (planned-hours heat calendar), Year (the
+  year as texture: day slivers shaded by credited hours from the
+  logged time_entries) + goal progress. The phone pushes a snapshot
+  on every home sync; editing stays on the phone.
 - **Journal**: human journal (with voice transcription) + temporal
   narratives (D/W/M/Y) + overseer tick reflections.
 - **System**: Activity (all AI runs, GitHub-style; rate dispatches
