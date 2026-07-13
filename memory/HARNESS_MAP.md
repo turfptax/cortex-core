@@ -39,15 +39,18 @@ get_harness_map chat tool.
   replies, per-turn feedback (rate + note; Discuss with Overseer
   opens a context-seeded thread).
 - **Simples**: the planner mirror + permanent memory. Day (hour
-  timeline of the phone's plan + a "This day in Cortex" panel: AI
-  sessions with gists, logged time, health, journal, daily
-  narrative, for ANY date), Week (7 mini timelines), Month
-  (planned-hours heat), Year (the year as texture for any year the
-  corpus covers: day slivers shaded by AI-session + logged hours,
-  hover for sleep/steps, click into the day) + goal progress. The
-  phone pushes a plan snapshot on home sync; editing stays on the
-  phone; the corpus layers come from Pi routes /plugins/overseer/day
-  and /day/heat.
+  timeline of the phone's plan + a "This day in Cortex" panel: 24h
+  ribbon of actual AI sessions and logged time, sessions with gists,
+  health, journal, daily narrative, for ANY date), Week (7 mini
+  timelines + teal sleep bars + weekend seam), Month (lived-activity
+  heat from the corpus, plan as left-edge shape, sleep strips), Year
+  (day-of-week aligned week columns with a detached Sat/Sun band,
+  purple activity cells + teal sleep underlines, any year), plus a
+  Weekly rhythm card (median + middle-half per weekday for activity/
+  sleep/steps) and an "In the corpus" coverage barcode. Quiet layer
+  rules: descriptive only, no scores or streaks; sleep teal #35a99b
+  is the one second hue, length-encoded. Corpus data via Pi routes
+  /plugins/overseer/day and /day/heat (s/sc/t/z/p/a).
 - **Journal**: human journal (with voice transcription) + temporal
   narratives (D/W/M/Y) + overseer tick reflections.
 - **System**: Activity (all AI runs, GitHub-style; rate dispatches

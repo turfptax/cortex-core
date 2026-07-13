@@ -3532,8 +3532,9 @@ class OverseerPlugin(Plugin):
 
         Per-day aggregates for a whole year, keyed by local day:
         s = AI-session minutes, sc = session count, t = logged
-        time-entry minutes, z = hours slept, p = steps. Feeds the
-        Hub's Year view for any year the corpus covers."""
+        time-entry minutes, z = hours slept, p = steps, a =
+        active-zone minutes. Feeds the Hub's Year view for any year
+        the corpus covers."""
         if self.overseer_db is None:
             return {"ok": False, "error": "overseer not initialized"}
         try:
@@ -3581,11 +3582,14 @@ class OverseerPlugin(Plugin):
             for r in conn.execute(
                     "SELECT day, metric, MAX(value) AS value "
                     "FROM health_daily WHERE day LIKE ? "
-                    "  AND metric IN ('sleep_minutes', 'steps') "
+                    "  AND metric IN ('sleep_minutes', 'steps', "
+                    "                 'azm_minutes') "
                     "GROUP BY day, metric", (like,)):
                 b = bucket(r["day"])
                 if r["metric"] == "sleep_minutes":
                     b["z"] = round((r["value"] or 0) / 60.0, 1)
+                elif r["metric"] == "azm_minutes":
+                    b["a"] = int(r["value"] or 0)
                 else:
                     b["p"] = int(r["value"] or 0)
         except Exception:
