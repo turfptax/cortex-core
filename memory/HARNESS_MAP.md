@@ -73,8 +73,14 @@ get_harness_map chat tool.
   questions, people).
 - **Settings**: local data stats, work-log reminders, sync (pending
   review + sync now), notification capture toggle, Pi config, Gateway
-  cloud link (paste token; shows a reconnect banner when the token
-  expires or is revoked).
+  cloud link. Sign in with Microsoft (OAuth 2.1 + PKCE, trusted-device
+  hub scope, 30-day token, reconnect banner + re-auth on 401) or the
+  advanced paste-a-token path; a badge shows pending AI-connection
+  approvals.
+- **AI Connections**: the owner's approval surface for external AIs
+  (Grok, Claude, ChatGPT) connecting through the gateway. New ones
+  land default-deny (pending); approve with a level (metadata / full),
+  toggle ask-vs-always on reconnect, revoke (cuts tokens immediately).
 - **Capture**: quick journal/note entry with type + project tag.
 - **Pending upload**: pre-sync review; tap any item to omit it from
   the corpus.
