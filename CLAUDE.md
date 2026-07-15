@@ -126,6 +126,14 @@ cortex-core/
 
 ## Current state (2026-05-27)
 
+> **STALE SNAPSHOT (kept for history).** This section is from 2026-05-27 and
+> most of it is obsolete: MCP corpus access was fixed long ago, the vault
+> shipped, sqlite-vec semantic recall is live, and the Phase 1-3 items below
+> are done. For the real current state read the memory index at
+> `C:\Users\User\.claude\projects\C--dev-ttx-Cortex\memory\MEMORY.md` (or ask
+> the overseer). Corpus is now ~3,800+ gists and the interpretive layer is
+> served to external AIs over MCP + the gateway.
+
 - **3,450 gists** + **374 overseer journal entries** + **214 temporal narratives** + ~90 patterns/drift/blindspots
 - **Backlog**: 5 sessions left to summarize (down from 1,129 this morning)
 - **MCP corpus access**: BROKEN. The notes_search tool reads only the `notes` table which has 0 rows. The interpretive layer is sealed off from external AIs. Phase 1 fix (substring search tool) is the priority next move.
