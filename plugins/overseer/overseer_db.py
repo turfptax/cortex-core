@@ -27,6 +27,7 @@ cortex.db + the bundled Session 0 seed is supported.
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -1427,6 +1428,113 @@ class OverseerDB(CortexDB):
         except Exception as e:
             log.warning(
                 "overseer_db: timestamp_localizer init failed: %s", e)
+        # Cloud P2 (docs/CLOUD_MIGRATION.md): pull_events is split by
+        # writer. The core keeps writing ITS rows here; the co-located
+        # gateway writes ITS rows (connector reads) into its own
+        # gateway.db. When GATEWAY_DB_PATH points at that file, attach
+        # it read-only so the F1 readers can union both sources. Runs
+        # AFTER the migration chain on purpose: every unqualified
+        # pull_events statement above resolves before the attach can
+        # add a second table of the same name to the search path.
+        self.gateway_db_attached = False
+        self._pull_ro_conn = None
+        self._pull_has_local = False
+        self._attach_gateway_db()
+
+    def _attach_gateway_db(self):
+        """Best-effort read-only union connection over local + gateway
+        pull_events. No env / missing file / attach failure all degrade
+        to local-only reads (the Pi today has no gateway.db and must
+        not care).
+
+        Why a SEPARATE connection: ATTACHing with a file:?mode=ro URI
+        only works when the connection's MAIN database was opened with
+        SQLITE_OPEN_URI, and self._conn (CortexDB._connect) is opened
+        as a plain path. Rather than change the shared connect path,
+        open a dedicated all-read-only connection: main = this
+        overseer.db (mode=ro) + gw = gateway.db (mode=ro). Every write
+        through it is impossible at the SQLite level, which also
+        enforces 'core never writes gateway.db'."""
+        gw_path = os.environ.get("GATEWAY_DB_PATH", "").strip()
+        if not gw_path or not os.path.exists(gw_path):
+            # Not an error: on a FIRST co-located boot the core starts
+            # before the gateway has ever created gateway.db (the
+            # gateway needs the core's files to exist first). _pull_conn
+            # retries this attach on every read until it succeeds, so
+            # the union switches on as soon as gateway.db appears
+            # instead of staying off until a core restart.
+            return
+        conn = None
+        try:
+            conn = sqlite3.connect(
+                "file:{}?mode=ro".format(
+                    str(self._db_path).replace("\\", "/")),
+                uri=True, timeout=5.0, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute(
+                "ATTACH DATABASE ? AS gw",
+                ("file:{}?mode=ro".format(gw_path.replace("\\", "/")),))
+            # Sanity: the attached file must actually carry pull_events
+            # (a fresh gateway.db does after the gateway's first boot).
+            conn.execute("SELECT 1 FROM gw.pull_events LIMIT 1")
+            # Do the local timestamp columns (timestamp_localizer) exist
+            # on the LOCAL table? They always should (localizer runs at
+            # init), but probe so the union projection never guesses.
+            local_cols = {r[1] for r in conn.execute(
+                "PRAGMA main.table_info(pull_events)").fetchall()}
+            self._pull_has_local = ("local_pulled_at" in local_cols
+                                    and "local_created_at" in local_cols)
+            self._pull_ro_conn = conn
+            self.gateway_db_attached = True
+            log.info("gateway.db attached read-only: %s", gw_path)
+        except Exception as e:
+            log.warning("gateway.db attach skipped (%s): %s", gw_path, e)
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _pull_conn(self):
+        """Connection for pull_events reads: the union connection when
+        the gateway DB is attached, else the primary connection.
+
+        Retries the attach lazily (cheap: one env lookup, one stat when
+        the env is set) so a gateway.db created AFTER core boot — the
+        guaranteed first-deploy ordering — starts counting on the next
+        read, not the next core restart."""
+        if not self.gateway_db_attached:
+            self._attach_gateway_db()
+        return self._pull_ro_conn if self.gateway_db_attached else self._conn
+
+    # Columns shared by both pull_events copies; the union projects
+    # exactly these so the gateway's extra columns (source_ip) never
+    # leak into shapes downstream consumers already parse.
+    _PULL_COLS = ("id, artifact_table, artifact_id, surface, "
+                  "parent_artifact_table, parent_artifact_id, "
+                  "query_text, caller_id, caller_class, pulled_at, "
+                  "created_at")
+
+    def _pull_events_source(self):
+        """FROM-clause source for pull_events reads.
+
+        Unattached (the Pi, and any boot before gateway.db exists): the
+        PLAIN table, so SELECT * keeps its exact legacy shape including
+        the timestamp_localizer local_*_at columns and no extra keys.
+        Attached: a UNION ALL of local + gateway rows tagged by origin;
+        local_* project from the local arm (NULL for gateway rows, whose
+        DB never runs the localizer). Union `id`s are NOT unique across
+        the two arms — key rows by (source, id) downstream."""
+        if not self.gateway_db_attached:
+            return "pull_events"
+        local = ", local_pulled_at, local_created_at" \
+            if self._pull_has_local else ""
+        gw_null = ", NULL AS local_pulled_at, NULL AS local_created_at" \
+            if self._pull_has_local else ""
+        return ("(SELECT {c}{l}, 'core' AS source FROM main.pull_events "
+                "UNION ALL "
+                "SELECT {c}{g}, 'gateway' AS source FROM gw.pull_events)"
+                .format(c=self._PULL_COLS, l=local, g=gw_null))
 
     def _safe_commit(self):
         """Lock-protected commit. Use this instead of self._conn.commit()
@@ -6443,7 +6551,11 @@ class OverseerDB(CortexDB):
         """List recent pull events. Optional filters narrow by surface
         ('mcp:cortex_search'), artifact_table ('summaries_gist'), or
         time window (days back from now)."""
-        sql = "SELECT * FROM pull_events WHERE 1=1"
+        # _pull_conn() first: it may lazily attach gateway.db, and the
+        # source expression must match the connection's attach state.
+        conn = self._pull_conn()
+        sql = ("SELECT * FROM {} pe WHERE 1=1"
+               .format(self._pull_events_source()))
         params: list = []
         if surface:
             sql += " AND surface = ?"
@@ -6456,7 +6568,7 @@ class OverseerDB(CortexDB):
             params.append(f"-{int(days)} days")
         sql += " ORDER BY pulled_at DESC LIMIT ?"
         params.append(int(limit))
-        rows = self._conn.execute(sql, params).fetchall()
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     def pull_event_stats(self, *, days=7):
@@ -6478,27 +6590,46 @@ class OverseerDB(CortexDB):
         """
         window_clause = "WHERE pulled_at >= datetime('now', ?)"
         window_param = f"-{int(days)} days"
-        total = self._conn.execute(
-            f"SELECT COUNT(*) FROM pull_events {window_clause}",
+        # Cloud P2: read over the local+gateway union so connector pulls
+        # recorded in the co-located gateway.db count toward F1.
+        # ORDER MATTERS: _pull_conn() first — it may lazily attach
+        # gateway.db, and _pull_events_source() must see the SAME
+        # attached/unattached state the connection has.
+        conn = self._pull_conn()
+        src = self._pull_events_source()
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM {src} pe {window_clause}",
             (window_param,),
         ).fetchone()[0]
+        if self.gateway_db_attached:
+            by_source = {
+                r[0]: r[1] for r in conn.execute(
+                    f"SELECT source, COUNT(*) FROM {src} pe "
+                    f"{window_clause} GROUP BY source",
+                    (window_param,),
+                ).fetchall()
+            }
+        else:
+            # Unattached reads use the plain table (no source column,
+            # keeping the legacy row shape); everything local is core.
+            by_source = {"core": int(total)} if total else {}
         by_surface = {
-            r[0]: r[1] for r in self._conn.execute(
-                f"SELECT surface, COUNT(*) FROM pull_events "
+            r[0]: r[1] for r in conn.execute(
+                f"SELECT surface, COUNT(*) FROM {src} pe "
                 f"{window_clause} GROUP BY surface",
                 (window_param,),
             ).fetchall()
         }
         by_table = {
-            r[0]: r[1] for r in self._conn.execute(
-                f"SELECT artifact_table, COUNT(*) FROM pull_events "
+            r[0]: r[1] for r in conn.execute(
+                f"SELECT artifact_table, COUNT(*) FROM {src} pe "
                 f"{window_clause} GROUP BY artifact_table",
                 (window_param,),
             ).fetchall()
         }
         by_caller_class = {
-            r[0]: r[1] for r in self._conn.execute(
-                f"SELECT caller_class, COUNT(*) FROM pull_events "
+            r[0]: r[1] for r in conn.execute(
+                f"SELECT caller_class, COUNT(*) FROM {src} pe "
                 f"{window_clause} GROUP BY caller_class",
                 (window_param,),
             ).fetchall()
@@ -6509,9 +6640,9 @@ class OverseerDB(CortexDB):
             if k.startswith("automation:")
         )
         top = [
-            (r[0], r[1], r[2]) for r in self._conn.execute(
+            (r[0], r[1], r[2]) for r in conn.execute(
                 f"SELECT artifact_table, artifact_id, COUNT(*) AS c "
-                f"FROM pull_events {window_clause} "
+                f"FROM {src} pe {window_clause} "
                 f"GROUP BY artifact_table, artifact_id "
                 f"ORDER BY c DESC LIMIT 20",
                 (window_param,),
@@ -6520,9 +6651,9 @@ class OverseerDB(CortexDB):
         # Top pulled BY ORGANIC EXTERNAL only — answers "what are
         # real users actually drilling into?" cleanly.
         top_organic = [
-            (r[0], r[1], r[2]) for r in self._conn.execute(
+            (r[0], r[1], r[2]) for r in conn.execute(
                 f"SELECT artifact_table, artifact_id, COUNT(*) AS c "
-                f"FROM pull_events {window_clause} "
+                f"FROM {src} pe {window_clause} "
                 f"  AND caller_class = 'organic-external' "
                 f"GROUP BY artifact_table, artifact_id "
                 f"ORDER BY c DESC LIMIT 20",
@@ -6541,6 +6672,10 @@ class OverseerDB(CortexDB):
             "top_pulled": top,
             "top_pulled_organic": top_organic,
             "window_days": int(days),
+            # Cloud P2 additions (keys only ADDED, never renamed —
+            # deterministic_loop.py parses this shape field-by-field).
+            "by_source": by_source,
+            "gateway_attached": bool(self.gateway_db_attached),
         }
 
     # ── Phase 1 (2026-05-27): gist_prompts ──────────────────────
