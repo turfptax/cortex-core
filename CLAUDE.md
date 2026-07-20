@@ -8,6 +8,13 @@
 
 If you're an AI agent starting work in this repo, read this first.
 
+> **ACTIVE DIRECTION (2026-07-14): cloud migration.** Cortex is moving off the
+> home Pi into Azure (one Container App per person; this core becomes the cloud
+> engine, co-deployed with the gateway, single writer of the SQLite files). Read
+> `docs/CLOUD_MIGRATION.md` before any core/deploy work. Near-term core tasks are
+> P0 (env-externalize) and P1 (gateway reads the core SQLite), both local, no
+> Azure needed.
+
 ## What this repo is
 
 Cortex Core is the Pi-side of [Cortex](https://github.com/turfptax/cortex-core), Tory Moghadam's personal AI memory system. The Python runtime lives in `src/`. The interpretive memory layer (overseer plugin) lives in `plugins/overseer/`.
