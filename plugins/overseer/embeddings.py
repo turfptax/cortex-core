@@ -14,11 +14,18 @@ backfill pass; nothing in the write path blocks on this service.
 
 import json
 import logging
+import os
 import urllib.request
 
 log = logging.getLogger("overseer.embeddings")
 
-EMBED_URL = "http://127.0.0.1:8082/v1/embeddings"
+# Cloud migration P0 (2026-07-20): env-overridable so the cloud container
+# can point at an embed sidecar. Default is the Pi's local llama-embed
+# service, unchanged. The privacy posture holds either way: the URL must
+# stay inside the deployment boundary (localhost or an in-app sidecar),
+# never a third-party embedding API.
+EMBED_URL = os.environ.get(
+    "CORTEX_EMBED_URL", "http://127.0.0.1:8082/v1/embeddings")
 MODEL_NAME = "bge-small-en-v1.5-q8_0"
 DIM = 384
 

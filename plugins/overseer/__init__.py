@@ -21,6 +21,7 @@ and the cortex_get_context working_memory injection.
 from __future__ import annotations
 
 import logging
+import os
 import time
 import tomllib
 
@@ -652,7 +653,12 @@ class OverseerPlugin(Plugin):
         # Step 1: open OverseerDB FIRST so the overseer schema exists on
         # the plugin's DB before anything else touches it. Same pattern
         # as the pet plugin (proven by 2c2d).
-        overseer_db_path = self.api.plugin_data / "overseer.db"
+        # Cloud migration P0 (2026-07-20): OVERSEER_DB_PATH env overrides
+        # the in-tree default so the cloud container can point at its
+        # volume. Unset = plugins/overseer/data/overseer.db, unchanged.
+        _env_db = os.environ.get("OVERSEER_DB_PATH", "").strip()
+        overseer_db_path = Path(_env_db) if _env_db \
+            else self.api.plugin_data / "overseer.db"
         if self.api.db is not None:
             try:
                 self.api.db.close()
@@ -677,7 +683,11 @@ class OverseerPlugin(Plugin):
         # Step 3: real LLMRouter — three backends with fallback chain.
         # Reads [llm] section from this plugin's own plugin.toml; secrets
         # (OpenRouter API key) come from ~/.cortex/secrets.toml on Pi.
-        plugin_folder = self.api.plugin_data.parent
+        # Cloud migration P0 fix (2026-07-20): plugin.toml lives with the
+        # CODE, not the data dir. plugin_data.parent only worked because
+        # data/ used to sit inside the plugin folder; CORTEX_PLUGIN_DATA_DIR
+        # relocates data, so resolve from this file's location instead.
+        plugin_folder = Path(__file__).resolve().parent
         try:
             with open(plugin_folder / "plugin.toml", "rb") as f:
                 manifest = tomllib.load(f)
@@ -724,7 +734,8 @@ class OverseerPlugin(Plugin):
             started = self.loop.start()
             if not started:
                 self.api.log.info(
-                    "loop not started (loop_enabled=false in config)")
+                    "loop not started (CORTEX_LOOP_MODE=external or "
+                    "loop_enabled=false; see loop log line above)")
         except Exception as e:
             self.api.log.exception("loop init failed: %s", e)
 

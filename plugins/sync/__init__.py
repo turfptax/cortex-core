@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -38,7 +39,13 @@ from plugin_api import Plugin, Route  # noqa: E402
 
 log = logging.getLogger("plugin.sync")
 
-OVERSEER_DB = _HERE.parent / "overseer" / "data" / "overseer.db"
+# Cloud migration P0 (2026-07-20): OVERSEER_DB_PATH env overrides the
+# in-tree default, matching the overseer plugin's own resolution, so
+# both plugins agree on which overseer.db is live when the cloud
+# relocates it. Unset = plugins/overseer/data/overseer.db, unchanged.
+_env_overseer_db = os.environ.get("OVERSEER_DB_PATH", "").strip()
+OVERSEER_DB = Path(_env_overseer_db) if _env_overseer_db \
+    else _HERE.parent / "overseer" / "data" / "overseer.db"
 
 # kind -> (cursor prefix, pull columns). Extended 2026-06-12: the phone
 # mirrors the WHOLE interpretive layer, not just gists + narratives.

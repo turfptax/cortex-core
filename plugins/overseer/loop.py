@@ -38,11 +38,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from claude_jsonl import (
     build_transcript_for_summary,
@@ -111,6 +113,35 @@ class TickBudget:
         if self._daily is not None:
             out["daily"] = self._daily.snapshot()
         return out
+
+
+# Cloud migration P0 (2026-07-20): tenant timezone resolution.
+# Cached at first use; the env var does not change mid-process.
+# None means "no tenant TZ configured, use host local" (Pi behavior).
+_TENANT_TZ_UNSET = object()
+_tenant_tz_cached = _TENANT_TZ_UNSET
+
+
+def _tenant_tz():
+    """ZoneInfo for CORTEX_TENANT_TZ, or None for host-local time.
+
+    A bad TZ name logs one warning and falls back to host-local
+    rather than raising: a typo'd env var must not stop the loop.
+    """
+    global _tenant_tz_cached
+    if _tenant_tz_cached is not _TENANT_TZ_UNSET:
+        return _tenant_tz_cached
+    name = os.environ.get("CORTEX_TENANT_TZ", "").strip()
+    tz = None
+    if name:
+        try:
+            tz = ZoneInfo(name)
+        except Exception as e:
+            logging.getLogger("plugin.overseer.loop").warning(
+                "CORTEX_TENANT_TZ=%r is not a valid IANA zone (%s); "
+                "falling back to host-local time", name, e)
+    _tenant_tz_cached = tz
+    return tz
 
 
 class DailyBudget:
@@ -188,9 +219,16 @@ class DailyBudget:
             self._calls_overridden = False
 
     def _today(self) -> str:
-        # Local date — uses host's TZ. Matches temporal_narratives
-        # period_label semantics so budget rolls with the user's
-        # calendar, not UTC's.
+        # Owner's calendar date. Cloud migration P0 (2026-07-20): the
+        # cloud container runs UTC, so "host local" would silently
+        # regress to the UTC-day bug that Slice 5.5 fixed. The budget
+        # day rolls on CORTEX_TENANT_TZ when set; unset falls back to
+        # host-local time, which is correct on the Pi (host TZ = owner
+        # TZ there). Matches temporal_narratives period_label semantics
+        # so budget rolls with the user's calendar, not UTC's.
+        tz = _tenant_tz()
+        if tz is not None:
+            return datetime.now(tz).strftime("%Y-%m-%d")
         return datetime.now().astimezone().strftime("%Y-%m-%d")
 
     def _load(self) -> tuple[str, float, int]:
@@ -339,7 +377,19 @@ class OverseerLoop:
     # ── Lifecycle ────────────────────────────────────────────────
 
     def start(self) -> bool:
-        """Start the background thread. Returns False if disabled in config."""
+        """Start the background thread. Returns False if disabled in config.
+
+        Cloud migration P0 (2026-07-20): CORTEX_LOOP_MODE=external skips
+        the in-process daemon entirely. In the cloud the app scales to
+        zero and an external cron wakes it with POST /tick-now, which
+        calls tick_now() directly and does not need this thread. Unset
+        or any other value keeps the always-on Pi loop unchanged.
+        """
+        if os.environ.get("CORTEX_LOOP_MODE", "").strip().lower() == "external":
+            self._log.info(
+                "loop mode=external; in-process daemon not started "
+                "(ticks come from POST /tick-now)")
+            return False
         if not self._cfg.get("loop_enabled", True):
             self._log.info("loop disabled in config; not starting")
             return False

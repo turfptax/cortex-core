@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import os
 import sys
 import tomllib
 from pathlib import Path
@@ -151,8 +152,16 @@ class PluginRegistry:
         """
         from cortex_db import CortexDB
 
-        plugin_data_dir = manifest.folder / "data"
-        plugin_data_dir.mkdir(exist_ok=True)
+        # Cloud migration P0 (2026-07-20): CORTEX_PLUGIN_DATA_DIR relocates
+        # ALL plugin data dirs to <base>/<plugin-name> (cloud volume).
+        # Unset = the in-tree plugins/<name>/data/ path, unchanged on Pi.
+        data_base = os.environ.get("CORTEX_PLUGIN_DATA_DIR", "").strip()
+        if data_base:
+            plugin_data_dir = Path(data_base) / manifest.name
+            plugin_data_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            plugin_data_dir = manifest.folder / "data"
+            plugin_data_dir.mkdir(exist_ok=True)
         plugin_db_path = plugin_data_dir / f"{manifest.name}.db"
 
         return PluginAPI(

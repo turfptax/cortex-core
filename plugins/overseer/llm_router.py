@@ -144,6 +144,26 @@ class LLMRouter:
         secrets_paths: explicit override for the candidate list (for testing).
         """
         self._llm = dict(manifest_llm or {})
+
+        # Cloud migration P0 (2026-07-20): env overrides so the cloud
+        # deployment can force a cloud-only chain without editing
+        # plugin.toml. CORTEX_LLM_BACKEND replaces the default backend;
+        # CORTEX_LLM_FALLBACK is a comma-separated backend list, where
+        # empty or "none" means NO fallback (cloud has no LAN hosts to
+        # fall back to; failing fast beats 60s of dead-host timeouts).
+        # Unset envs leave plugin.toml behavior untouched (Pi default).
+        _env_backend = os.environ.get("CORTEX_LLM_BACKEND", "").strip()
+        if _env_backend:
+            self._llm["backend"] = _env_backend
+        _env_fb = os.environ.get("CORTEX_LLM_FALLBACK")
+        if _env_fb is not None:
+            _env_fb = _env_fb.strip()
+            if _env_fb.lower() in ("", "none"):
+                self._llm["fallback"] = []
+            else:
+                self._llm["fallback"] = [
+                    b.strip() for b in _env_fb.split(",") if b.strip()]
+
         self._db = db
         candidates = secrets_paths or self._llm.get("secrets_paths")
         self._secrets, self._secrets_path = _load_secrets(candidates)

@@ -93,15 +93,29 @@ BLE_RECONNECT_INTERVAL_S = 5
 BLE_MAX_MESSAGE_LEN = 512
 
 # Cortex Database
-CORTEX_DB_PATH = os.path.join(HOME, "cortex.db")
+# Cloud migration P0 (2026-07-20): env-overridable so the cloud container
+# can point at its own volume. Default is the existing Pi path, unchanged.
+CORTEX_DB_PATH = os.environ.get(
+    "CORTEX_DB_PATH", os.path.join(HOME, "cortex.db"))
 CORTEX_CHUNK_TIMEOUT_S = 30.0
 
 # HTTP API Server (WiFi transport)
+# Cloud migration P0 (2026-07-20): the Basic-auth pair moves to a single
+# CORTEX_SERVICE_TOKEN env var (used as the password; username stays
+# "cortex" unless CORTEX_HTTP_USERNAME overrides it). Unset envs keep the
+# original Pi defaults so the LAN transport is unaffected.
 HTTP_ENABLED = True
-HTTP_PORT = 8420
-HTTP_USERNAME = "cortex"
-HTTP_PASSWORD = "cortex"
+HTTP_PORT = int(os.environ.get("CORTEX_HTTP_PORT", "8420"))
+HTTP_USERNAME = os.environ.get("CORTEX_HTTP_USERNAME", "cortex")
+HTTP_PASSWORD = os.environ.get("CORTEX_SERVICE_TOKEN", "") or "cortex"
 UPLOADS_DIR = os.path.join(HOME, "uploads")
+
+# Tenant timezone (cloud migration P0, 2026-07-20). The cloud container
+# runs UTC; the owner's calendar day must not. IANA name, e.g.
+# "America/Chicago". Empty/unset = host local time (current Pi behavior).
+# Consumed by the overseer daily budget (loop.py) and anything else that
+# needs the owner's calendar day rather than the host's.
+TENANT_TZ = os.environ.get("CORTEX_TENANT_TZ", "").strip()
 
 # Pet plugin source was extracted to the cortex-pet sister repo
 # (Slice 11, 2026-05-09). The plugin is still loaded at runtime on
