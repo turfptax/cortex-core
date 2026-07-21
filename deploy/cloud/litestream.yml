@@ -1,0 +1,24 @@
+# Litestream replication config for the three solo-cloud SQLite files.
+# Azure Blob credentials come from env:
+#   LITESTREAM_AZURE_ACCOUNT_KEY   (ACA secret)
+#   LITESTREAM_ACCOUNT             storage account name
+#   LITESTREAM_CONTAINER           blob container for replicas
+dbs:
+  - path: /data/cortex.db
+    replicas:
+      - type: abs
+        account-name: ${LITESTREAM_ACCOUNT}
+        bucket: ${LITESTREAM_CONTAINER}
+        path: cortex.db
+  - path: /data/plugins/overseer/overseer.db
+    replicas:
+      - type: abs
+        account-name: ${LITESTREAM_ACCOUNT}
+        bucket: ${LITESTREAM_CONTAINER}
+        path: overseer.db
+  - path: /data/gateway.db
+    replicas:
+      - type: abs
+        account-name: ${LITESTREAM_ACCOUNT}
+        bucket: ${LITESTREAM_CONTAINER}
+        path: gateway.db
