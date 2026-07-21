@@ -46,11 +46,58 @@ logging.basicConfig(
 _app_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _app_dir)
 
+# Tenant-TZ pass (cloud P2, 2026-07-20): align the PROCESS timezone
+# with the owner before anything touches the DBs. SQLite's 'localtime'
+# modifier (the timestamp_localizer triggers, notification_day_rollups)
+# and every argless astimezone() resolve through the C library, so this
+# one assignment keys the whole SQL-side local_*_at machinery on the
+# tenant instead of the container's UTC. Python-side "owner time" is
+# additionally explicit via temporal.tenant_tz(); this covers the paths
+# that cannot read an env var. tzset() is POSIX-only; the cloud
+# container is Linux, and on other hosts the explicit Python paths
+# still apply.
+_tenant_tz_name = os.environ.get("CORTEX_TENANT_TZ", "").strip()
+if _tenant_tz_name and hasattr(time, "tzset"):
+    # Validate BEFORE exporting: an invalid TZ value makes the C
+    # library fall back to UTC, which would corrupt the "host-local
+    # fallback" temporal.tenant_tz() promises on a bad name (review
+    # finding). Windows has no tzset(); exporting TZ there is at best
+    # inert and at worst splits CRT behavior, so the export is gated
+    # on tzset existing (the cloud container is Linux).
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(_tenant_tz_name)
+    except Exception:
+        logging.getLogger("headless").warning(
+            "CORTEX_TENANT_TZ=%r is not a valid IANA zone; NOT "
+            "exporting TZ (SQL 'localtime' stays on the container "
+            "zone)", _tenant_tz_name)
+    else:
+        os.environ["TZ"] = _tenant_tz_name
+        time.tzset()
+
 from config import CORTEX_DB_PATH, HTTP_ENABLED, PLUGINS_ENABLED  # noqa: E402
 from cortex_db import CortexDB  # noqa: E402
 from cortex_protocol import CortexProtocol  # noqa: E402
 
 log = logging.getLogger("headless")
+
+# Fail closed on default credentials (public-repo scan, 2026-07-20):
+# this entry point fronts the corpus in the CLOUD, where silently
+# degrading to the cortex:cortex default pair would leave the API open
+# to anyone who reads the (public) source. The Pi's main.py keeps its
+# LAN-only defaults; here a real token is mandatory unless explicitly
+# waived for local testing.
+if not os.environ.get("CORTEX_SERVICE_TOKEN", "").strip():
+    if os.environ.get("CORTEX_ALLOW_DEFAULT_AUTH", "").strip() != "1":
+        log.error(
+            "CORTEX_SERVICE_TOKEN is not set. The headless entry point "
+            "refuses to boot with the default Basic-auth pair; set a "
+            "real token, or CORTEX_ALLOW_DEFAULT_AUTH=1 for local "
+            "testing only.")
+        sys.exit(2)
+    log.warning("CORTEX_ALLOW_DEFAULT_AUTH=1: booting with the DEFAULT "
+                "Basic-auth pair; never do this on a public network")
 
 
 def main():

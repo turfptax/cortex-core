@@ -44,7 +44,6 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from claude_jsonl import (
     build_transcript_for_summary,
@@ -116,32 +115,13 @@ class TickBudget:
 
 
 # Cloud migration P0 (2026-07-20): tenant timezone resolution.
-# Cached at first use; the env var does not change mid-process.
-# None means "no tenant TZ configured, use host local" (Pi behavior).
-_TENANT_TZ_UNSET = object()
-_tenant_tz_cached = _TENANT_TZ_UNSET
-
-
+# P2 moved the resolver into temporal.py (loop imports temporal; the
+# reverse would be circular) so now_local()/format_local_iso and every
+# period-bounds helper share ONE tenant clock. This thin delegate
+# keeps the budget-day fix and existing call sites working unchanged.
 def _tenant_tz():
-    """ZoneInfo for CORTEX_TENANT_TZ, or None for host-local time.
-
-    A bad TZ name logs one warning and falls back to host-local
-    rather than raising: a typo'd env var must not stop the loop.
-    """
-    global _tenant_tz_cached
-    if _tenant_tz_cached is not _TENANT_TZ_UNSET:
-        return _tenant_tz_cached
-    name = os.environ.get("CORTEX_TENANT_TZ", "").strip()
-    tz = None
-    if name:
-        try:
-            tz = ZoneInfo(name)
-        except Exception as e:
-            logging.getLogger("plugin.overseer.loop").warning(
-                "CORTEX_TENANT_TZ=%r is not a valid IANA zone (%s); "
-                "falling back to host-local time", name, e)
-    _tenant_tz_cached = tz
-    return tz
+    """ZoneInfo for CORTEX_TENANT_TZ, or None for host-local time."""
+    return T_clock.tenant_tz()
 
 
 class DailyBudget:

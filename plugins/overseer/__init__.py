@@ -3425,11 +3425,14 @@ class OverseerPlugin(Plugin):
     # filtered here (the gateway connector path has its own gate).
 
     # Local-day expression: prefer the structural local-with-offset
-    # twin column, fall back to the raw timestamp's date prefix.
+    # twin column; for rows without one, convert the UTC timestamp via
+    # SQLite 'localtime' (which follows the process TZ, keyed to the
+    # tenant by headless_main in cloud) instead of taking the raw UTC
+    # date prefix, so evening rows do not bucket into the next day.
     @staticmethod
     def _local_day_expr(col):
-        return ("substr(COALESCE(NULLIF(local_{c},''), {c}), 1, 10)"
-                .format(c=col))
+        return ("substr(COALESCE(NULLIF(local_{c},''), "
+                "datetime({c}, 'localtime')), 1, 10)".format(c=col))
 
     def _http_day_detail(self, payload):
         """GET /plugins/overseer/day?date=YYYY-MM-DD

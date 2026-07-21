@@ -48,7 +48,15 @@ def run_mobile_digest(*, core, db, llm, budget=None, log=None,
     if not rows:
         return out
 
-    today_local = datetime.now().astimezone().strftime("%Y-%m-%d")
+    # Owner's calendar day, not the container's: in a UTC container
+    # host-today outruns owner-today from evening on, which would let
+    # the IN-PROGRESS day pass the d < today_local guard and get
+    # digested half-finished (tenant-TZ pass, cloud P2 2026-07-20).
+    from temporal import tenant_tz
+    _tz = tenant_tz()
+    today_local = ((datetime.now(_tz) if _tz is not None
+                    else datetime.now().astimezone())
+                   .strftime("%Y-%m-%d"))
     done_through = str(db.get_overseer_state(STATE_KEY, "") or "")
     days = sorted({d for d in (_local_day(r) for r in rows) if d})
     todo = [d for d in days if d > done_through and d < today_local]

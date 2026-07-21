@@ -158,9 +158,9 @@ def source_hash(payload) -> str:
 
 
 def _iso_local_now() -> str:
-    """Local-time ISO with offset. Pi runs on America/Chicago."""
-    now = _dt.datetime.now().astimezone()
-    return now.isoformat(timespec="seconds")
+    """Owner-local ISO with offset (tenant TZ when set, else host)."""
+    from temporal import format_local_iso
+    return format_local_iso()
 
 
 MARKER = "## Generated below this line — edits above are preserved"

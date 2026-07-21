@@ -93,6 +93,19 @@ class WeatherPlugin(Plugin):
     # ── Lifecycle ────────────────────────────────────────────────
 
     def on_load(self) -> None:
+        # Cloud P2 (2026-07-20, Tory's decision): weather must NOT poll
+        # external APIs on a cloud boot unless explicitly enabled. The
+        # gate keys on CORTEX_WEATHER_ENABLED: unset keeps the Pi
+        # behavior (on), "0" disables; cloud deployments set 0 in the
+        # image and the owner opts in per deployment.
+        import os as _os
+        if _os.environ.get("CORTEX_WEATHER_ENABLED", "1").strip().lower() \
+                in ("0", "false", "no", "off"):
+            log.info("weather: disabled via CORTEX_WEATHER_ENABLED; "
+                     "no DB init, no polling, routes report disabled")
+            self._disabled = True
+            return
+        self._disabled = False
         cfg = self.api.config
         db_path = (Path(self.api.plugin_data) / "weather.db")
         self.weather_db = WeatherDB(db_path)
@@ -152,6 +165,11 @@ class WeatherPlugin(Plugin):
     # ── HTTP handlers ────────────────────────────────────────────
 
     def _http_status(self, payload):
+        if getattr(self, "_disabled", False):
+            # Deliberately off (CORTEX_WEATHER_ENABLED) — distinct from
+            # an init FAILURE so monitoring can tell them apart.
+            return {"ok": True, "disabled": True,
+                    "reason": "CORTEX_WEATHER_ENABLED"}
         if not self.weather_db:
             return {"ok": False, "error": "not initialized"}
         return {
@@ -282,6 +300,14 @@ class WeatherPlugin(Plugin):
 
     def _http_poll_now(self, payload):
         """Manual trigger — bypasses the cadence wait."""
+        if getattr(self, "_disabled", False) or not self.weather_db:
+            # Covers both disabled mode (weather_db stays None; the
+            # slug branch below would NoneType otherwise) and a real
+            # pre-init call.
+            return {"ok": False,
+                    "error": ("disabled via CORTEX_WEATHER_ENABLED"
+                              if getattr(self, "_disabled", False)
+                              else "not initialized")}
         slug = str((payload or {}).get("location") or "").strip()
         if not slug:
             # Poll all locations

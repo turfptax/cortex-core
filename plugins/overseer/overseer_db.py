@@ -7669,22 +7669,24 @@ class OverseerDB(CortexDB):
     # daily dispatch cap + audit fields are enforced in one place.
 
     def _local_day_start_iso(self) -> str:
-        """ISO timestamp of midnight-local-time, expressed as UTC.
-        Used by sibling_* methods so the daily cap calendar matches the
-        user's day (same convention as Slice 5.5's DailyBudget reset)."""
-        from datetime import datetime, timezone, timedelta
-        offset_min = 0
-        try:
-            raw = self.get_overseer_state("local_tz_offset_minutes")
-            if raw is not None:
-                offset_min = int(raw)
-        except Exception:
-            pass
-        now_local = (datetime.now(timezone.utc)
-                     + timedelta(minutes=offset_min))
+        """ISO timestamp of midnight in the OWNER's TZ, expressed as
+        UTC. Used by sibling_* methods so the daily cap calendar
+        matches the user's day (same convention as Slice 5.5's
+        DailyBudget reset).
+
+        Tenant-TZ pass (cloud P2, 2026-07-20): keyed on
+        temporal.tenant_tz() (CORTEX_TENANT_TZ, host-local fallback),
+        replacing the manual local_tz_offset_minutes state key, which
+        was a fixed offset that broke on DST and defaulted to 0 (=UTC
+        midnight) when unset."""
+        from datetime import datetime, timezone
+        from temporal import tenant_tz
+        tz = tenant_tz()
+        now_local = (datetime.now(tz) if tz is not None
+                     else datetime.now(timezone.utc).astimezone())
         day_start_local = now_local.replace(
             hour=0, minute=0, second=0, microsecond=0)
-        day_start_utc = day_start_local - timedelta(minutes=offset_min)
+        day_start_utc = day_start_local.astimezone(timezone.utc)
         return day_start_utc.strftime("%Y-%m-%d %H:%M:%S")
 
     def sibling_dispatch(self, *, prompt, created_by="overseer",

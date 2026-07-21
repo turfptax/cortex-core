@@ -27,7 +27,42 @@ ending on the Sunday it was generated.
 
 from __future__ import annotations
 
+import logging
+import os
 from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# Cloud migration P2 (2026-07-20): the tenant timezone resolver lives
+# HERE, not in loop.py, because loop imports temporal (the reverse
+# would be circular) and every "what time is it for the owner" answer
+# in the plugin flows through now_local() below. Cached at first use;
+# the env var does not change mid-process.
+_TENANT_TZ_UNSET = object()
+_tenant_tz_cached = _TENANT_TZ_UNSET
+
+
+def tenant_tz():
+    """ZoneInfo for CORTEX_TENANT_TZ, or None for host-local time.
+
+    None means "no tenant TZ configured, use host local" (the Pi,
+    where host TZ IS the owner's TZ). A bad TZ name logs one warning
+    and falls back to host-local rather than raising: a typo'd env
+    var must not stop the loop.
+    """
+    global _tenant_tz_cached
+    if _tenant_tz_cached is not _TENANT_TZ_UNSET:
+        return _tenant_tz_cached
+    name = os.environ.get("CORTEX_TENANT_TZ", "").strip()
+    tz = None
+    if name:
+        try:
+            tz = ZoneInfo(name)
+        except Exception as e:
+            logging.getLogger("plugin.overseer.temporal").warning(
+                "CORTEX_TENANT_TZ=%r is not a valid IANA zone (%s); "
+                "falling back to host-local time", name, e)
+    _tenant_tz_cached = tz
+    return tz
 
 
 def now_utc() -> datetime:
@@ -35,19 +70,29 @@ def now_utc() -> datetime:
 
 
 def now_local() -> datetime:
-    """Current time in the host's local TZ. Uses datetime.astimezone()
-    with no argument, which converts to the system local TZ."""
+    """Current time in the OWNER's TZ: CORTEX_TENANT_TZ when set, else
+    the host's local TZ (datetime.astimezone() with no argument).
+
+    This is the single root of "the owner's day" for the whole plugin:
+    period bounds, labels, 22:00 triggers, and local_* stamps all
+    derive from it, so keying it on the tenant TZ keeps every one of
+    them on the owner's calendar inside a UTC container."""
+    tz = tenant_tz()
+    if tz is not None:
+        return datetime.now(tz)
     return datetime.now(timezone.utc).astimezone()
 
 
 def format_local_iso(dt: datetime | None = None) -> str:
     """ISO 8601 with offset, like '2026-05-03T22:00:00-05:00'.
     Stored alongside UTC timestamps on temporal artifacts so 'Wed for
-    me' stays Wed even if the host TZ ever changes."""
+    me' stays Wed even if the host TZ ever changes. Naive datetimes
+    are interpreted in the owner's TZ (tenant when set, else host)."""
     if dt is None:
         dt = now_local()
     if dt.tzinfo is None:
-        dt = dt.astimezone()
+        tz = tenant_tz()
+        dt = dt.replace(tzinfo=tz) if tz is not None else dt.astimezone()
     return dt.isoformat(timespec="seconds")
 
 
