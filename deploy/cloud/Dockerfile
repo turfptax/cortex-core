@@ -17,7 +17,8 @@ FROM python:3.12-slim
 # pymssql (Azure SQL retires in this topology).
 RUN pip install --no-cache-dir \
     sqlite-vec requests httpx \
-    fastapi "uvicorn[standard]" mcp pydantic sqlalchemy
+    fastapi "uvicorn[standard]" mcp pydantic sqlalchemy \
+    python-multipart
 
 # Litestream for SQLite replication to Azure Blob.
 ADD https://github.com/benbjohnson/litestream/releases/download/v0.3.13/litestream-v0.3.13-linux-amd64.tar.gz /tmp/ls.tar.gz
