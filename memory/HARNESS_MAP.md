@@ -61,17 +61,26 @@ get_harness_map chat tool.
 
 - **Today**: daily brief, agenda, active projects, open question with
   answer-by-voice, "Cortex asks" Bell card (answer/dismiss +
-  rate-this feedback row), Talk button into voice.
+  rate-this feedback row), Talk button into voice; the sync chip
+  names WHICH pull/push kind failed instead of a bare "sync error".
 - **Bell** (OPT-9, 2026-07-27): permanent review surface for curator
   proposals (org placements, merges, extracted tasks); one-shot
   confirm per action; badge count on the tab bar; pulls over the
-  gateway snapshot kind bell_notifications.
+  gateway snapshot kind bell_notifications. Answered cards collapse
+  to a brief "Recorded: <action>" line; merge proposals carrying the
+  project pair ask which project survives and send the real
+  merge_apply {winner, loser} (pair absent = "Acknowledge review").
 - **Simples**: liquid planner; goals -> auto-placed blocks around
   calendar anchors; Day/Week/Month/Year views; block tap sheet.
-- **Projects** (OPT-9): org-grouped SectionList mirroring THE
-  hierarchy (organizations/projects/tasks snapshot pulls; wipe +
-  reinsert, offline edits preserved via pending_op REST replay);
-  detail shows real OPT tasks incl. accept/reject of proposed rows.
+- **Projects** (OPT-9; drill-down 2026-07-27): org-grouped
+  SectionList mirroring THE hierarchy (organizations/projects/tasks
+  snapshot pulls; wipe + reinsert, offline edits preserved via
+  pending_op REST replay). Org headers are the higher-order object:
+  collapsible sections, header tap opens the ORG PAGE (narrative from
+  the organizations mirror, rollup stats, member projects); project
+  detail keeps the task block; task rows open the TASK PAGE (status
+  chips, due/priority, details, provenance, queued-change marker,
+  accept / not-a-task for proposed rows).
 - **Voice**: the primary capture surface. On-device STT/TTS +
   OpenRouter tool loop (notes, journal, time logging, calendar,
   people notes, project stubs, web, ask-overseer), model presets,
@@ -82,8 +91,9 @@ get_harness_map chat tool.
   review + sync now), notification capture toggle, Pi config, Gateway
   cloud link. Sign in with Microsoft (OAuth 2.1 + PKCE, trusted-device
   hub scope, 30-day token, reconnect banner + re-auth on 401) or the
-  advanced paste-a-token path; a badge shows pending AI-connection
-  approvals.
+  advanced paste-a-token path; the OAuth flow runs against the
+  configured Gateway URL, so friend deploys sign in to their own
+  instance; a badge shows pending AI-connection approvals.
 - **AI Connections**: the owner's approval surface for external AIs
   (Grok, Claude, ChatGPT) connecting through the gateway. New ones
   land default-deny (pending); approve with a level (metadata / full),
