@@ -60,11 +60,18 @@ get_harness_map chat tool.
 ## Phone app (cortex-mobile, Expo/Android)
 
 - **Today**: daily brief, agenda, active projects, open question with
-  answer-by-voice, "The overseer asks" Bell card (answer/dismiss +
+  answer-by-voice, "Cortex asks" Bell card (answer/dismiss +
   rate-this feedback row), Talk button into voice.
+- **Bell** (OPT-9, 2026-07-27): permanent review surface for curator
+  proposals (org placements, merges, extracted tasks); one-shot
+  confirm per action; badge count on the tab bar; pulls over the
+  gateway snapshot kind bell_notifications.
 - **Simples**: liquid planner; goals -> auto-placed blocks around
   calendar anchors; Day/Week/Month/Year views; block tap sheet.
-- **Projects**: project list + detail from the synced corpus.
+- **Projects** (OPT-9): org-grouped SectionList mirroring THE
+  hierarchy (organizations/projects/tasks snapshot pulls; wipe +
+  reinsert, offline edits preserved via pending_op REST replay);
+  detail shows real OPT tasks incl. accept/reject of proposed rows.
 - **Voice**: the primary capture surface. On-device STT/TTS +
   OpenRouter tool loop (notes, journal, time logging, calendar,
   people notes, project stubs, web, ask-overseer), model presets,
